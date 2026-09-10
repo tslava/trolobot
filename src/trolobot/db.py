@@ -900,6 +900,37 @@ class Database:
             created_at=row["created_at"],
         )
 
+    async def messages_since(self, chat_id: int, since: int) -> list[MessageRow]:
+        """Человеческие сообщения чата с created_at >= since, хронологически.
+
+        Используется responder._collect_addressed_items для восстановления
+        накопленных обращений к боту после рестарта процесса (когда
+        _pending_info пуст) — по образцу recent_activity, но с полной строкой,
+        а не только (user_id, created_at).
+        """
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, tg_message_id, chat_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, is_bot, created_at FROM messages "
+            "WHERE chat_id = ? AND is_bot = 0 AND created_at >= ? ORDER BY created_at, id",
+            (chat_id, since),
+        )
+        rows = await cursor.fetchall()
+        return [
+            MessageRow(
+                id=row["id"],
+                tg_message_id=row["tg_message_id"],
+                chat_id=row["chat_id"],
+                user_id=row["user_id"],
+                display_name=row["display_name"],
+                text=row["text"],
+                reply_to_tg_message_id=row["reply_to_tg_message_id"],
+                is_bot=bool(row["is_bot"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
     async def bot_reply_by_tg_id(self, tg_message_id: int) -> BotReplyRow | None:
         conn = self._require_conn()
         cursor = await conn.execute(

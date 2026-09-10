@@ -1,10 +1,22 @@
-"""Реплей гейта (и, с ``--generate``, полного пайплайна) на выгрузке Telegram Desktop.
+"""Реплей гейта (и, с ``--generate``, полного пайплайна) на истории чата.
 
-``python -m trolobot.replay exports/result.json [--config config.yaml] [--seed 1]
+``python -m trolobot.replay <result.json|bot.db> [--config config.yaml] [--seed 1]
   [--bot-username otec_fedor_bot] [--bot-user-id 0] [--verbose]
+  [--from-db] [--chat-id ID] [--since YYYY-MM-DD] [--until YYYY-MM-DD]
   [--generate [--judge] [--max-calls 20]]``
 
-Без ``--generate`` прогоняет ``gate.should_consider`` по каждому сообщению экспорта
+``source`` — либо ``result.json`` (выгрузка Telegram Desktop), либо база самого бота
+(``bot.db``/``*.sqlite``/``*.sqlite3`` по расширению, либо любой путь с ``--from-db``) —
+для случаев, когда владелец не может выгрузить историю (в группе запрет на сохранение
+контента). Для базы читается таблица ``messages`` напрямую, одним read-only SELECT через
+sqlite3 URI ``mode=ro`` — без ``Database.connect()``/``migrate()``, живой файл и его WAL
+не трогаются. Чат выбирается ``--chat-id`` либо единственным ``chat_id`` в таблице
+(несколько — ошибка с подсказкой). Сообщения бота (``is_bot=1``) остаются в потоке;
+``--bot-user-id``, если не задан явно, берётся из их ``user_id`` автоматически.
+``--since``/``--until`` (локальная дата ``persona.timezone``) отсекают историю по обеим
+границам и работают для обоих источников.
+
+Без ``--generate`` прогоняет ``gate.should_consider`` по каждому сообщению истории
 с in-memory состоянием (без sqlite, ничего не отправляет и никуда не пишет). При PASS
 считает, что ответ отправлен — иначе дневные лимиты и кулдауны не проверить
 (см. PLAN.md, этап 2, "Реплей — здесь, а не в этапе 8").
@@ -40,11 +52,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import random
-from collections import deque
+import sqlite3
+from collections import Counter, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -70,8 +86,11 @@ from trolobot.sanitize import sanitize_display_name
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, local_date, local_dt
 
+logger = logging.getLogger(__name__)
+
 _TEXT_TRUNCATE_LEN = 120
 _TOP_DROP_REASONS = 5
+_DB_EXTENSIONS = {".db", ".sqlite", ".sqlite3"}
 
 # FilterContext.recent_replies — последние 50 реплик (CLAUDE.md, "Интерфейсы этапа 4"),
 # независимо от cfg.behaviour.recent_replies_memory, которым ограничен {recent_replies}
@@ -399,16 +418,147 @@ async def _generate_one(
     return _line(reply.text, ", ".join(reasons))
 
 
+def _is_db_source(source: Path, from_db: bool) -> bool:
+    return from_db or source.suffix.lower() in _DB_EXTENSIONS
+
+
+def _row_to_export_message(row: sqlite3.Row) -> ExportMessage | None:
+    """``messages`` row -> ``ExportMessage``, либо ``None`` при отсутствии обязательных
+    полей (не должно случаться на боевой базе, но реплей — не место падать из-за этого)."""
+    tg_message_id, user_id, created_at = row["tg_message_id"], row["user_id"], row["created_at"]
+    if tg_message_id is None or user_id is None or created_at is None:
+        logger.warning("replay: skipping db message row missing a required field: %r", tuple(row))
+        return None
+    reply_to = row["reply_to_tg_message_id"]
+    return ExportMessage(
+        tg_message_id=int(tg_message_id),
+        user_id=int(user_id),
+        display_name=str(row["display_name"] or ""),
+        text=str(row["text"] or ""),
+        reply_to_tg_message_id=int(reply_to) if reply_to is not None else None,
+        created_at=int(created_at),
+    )
+
+
+def _read_db_messages(db_path: Path, chat_id: int | None) -> tuple[list[ExportMessage], int]:
+    """Читает историю из базы бота: один read-only SELECT по ``messages``, без
+    ``Database``/``connect()``/``migrate()`` — sqlite3 URI ``mode=ro`` гарантирует, что
+    живой файл (и его WAL) не тронут.
+
+    Возвращает (сообщения, bot_user_id) — ``bot_user_id`` вычислен из строк с
+    ``is_bot=1`` (самый частый ``user_id`` среди них), 0 если таких строк нет;
+    вызывающий код использует его, только если ``--bot-user-id`` не задан явно.
+
+    ``chat_id=None`` -> берётся единственный ``chat_id`` из таблицы; несколько разных —
+    ``ValueError`` с подсказкой использовать ``--chat-id``.
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(f"{db_path}: файл базы не найден")
+
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        if chat_id is None:
+            id_rows = conn.execute("SELECT DISTINCT chat_id FROM messages").fetchall()
+            chat_ids = sorted({row[0] for row in id_rows if row[0] is not None})
+            if not chat_ids:
+                raise ValueError(f"{db_path}: таблица messages пуста")
+            if len(chat_ids) > 1:
+                raise ValueError(
+                    f"{db_path}: в messages несколько chat_id {chat_ids} — "
+                    "укажите, какой чат реплеить, через --chat-id <id>"
+                )
+            chat_id = chat_ids[0]
+
+        raw_rows = conn.execute(
+            "SELECT tg_message_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, created_at, is_bot "
+            "FROM messages WHERE chat_id = ? ORDER BY created_at, tg_message_id",
+            (chat_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    bot_ids = Counter(
+        int(row["user_id"]) for row in raw_rows if row["is_bot"] and row["user_id"] is not None
+    )
+    detected_bot_user_id = bot_ids.most_common(1)[0][0] if bot_ids else 0
+
+    messages: list[ExportMessage] = []
+    for row in raw_rows:
+        parsed = _row_to_export_message(row)
+        if parsed is not None:
+            messages.append(parsed)
+
+    return messages, detected_bot_user_id
+
+
+def _parse_date_arg(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid date {value!r}, ожидается YYYY-MM-DD") from exc
+
+
+def _filter_by_date_range(
+    messages: list[ExportMessage], tz: str, since: date | None, until: date | None
+) -> list[ExportMessage]:
+    """Отсекает сообщения вне [--since, --until] по локальной дате (persona.timezone).
+
+    ``since`` — с 00:00 этого дня включительно; ``until`` — по конец этого дня
+    включительно (до 00:00 следующего).
+    """
+    if since is not None:
+        since_ts = int(datetime.combine(since, time.min, tzinfo=ZoneInfo(tz)).timestamp())
+        messages = [m for m in messages if m.created_at >= since_ts]
+    if until is not None:
+        until_ts = int(
+            datetime.combine(until + timedelta(days=1), time.min, tzinfo=ZoneInfo(tz)).timestamp()
+        )
+        messages = [m for m in messages if m.created_at < until_ts]
+    return messages
+
+
+def _load_messages(args: argparse.Namespace, cfg: Config) -> tuple[list[ExportMessage], int]:
+    """Сообщения источника (``result.json`` либо база бота) + эффективный bot_user_id.
+
+    Для базы бота ``--bot-user-id``, если не задан (0), берётся автоматически из строк
+    ``is_bot=1``. ``--since``/``--until`` применяются к обоим источникам одинаково.
+    """
+    source = Path(args.source)
+    from_db = bool(getattr(args, "from_db", False))
+    chat_id = getattr(args, "chat_id", None)
+    bot_user_id = int(args.bot_user_id)
+
+    if _is_db_source(source, from_db):
+        messages, detected_bot_user_id = _read_db_messages(source, chat_id)
+        if bot_user_id == 0:
+            bot_user_id = detected_bot_user_id
+    else:
+        messages = parse_export(source, cfg.persona.timezone)
+
+    since = getattr(args, "since", None)
+    until = getattr(args, "until", None)
+    messages = _filter_by_date_range(messages, cfg.persona.timezone, since, until)
+    return messages, bot_user_id
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m trolobot.replay",
         description=(
             "Прогоняет гейт (и, с --generate, полный пайплайн генерации и выходного "
-            "фильтра) по экспорту Telegram Desktop (result.json). Ничего не отправляет "
-            "и не пишет в БД."
+            "фильтра) по истории чата — экспорту Telegram Desktop (result.json) либо "
+            "базе самого бота (bot.db/*.sqlite/*.sqlite3, или любой путь с --from-db). "
+            "Ничего не отправляет и не пишет в БД."
         ),
     )
-    parser.add_argument("export_path", type=Path, help="Путь к result.json из экспорта")
+    parser.add_argument(
+        "source",
+        type=Path,
+        help="Путь к result.json (экспорт) либо к bot.db/*.sqlite(3) (база бота)",
+    )
     parser.add_argument(
         "--config", type=Path, default=Path("config.yaml"), help="Путь к config.yaml"
     )
@@ -417,7 +567,38 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--bot-username", default="", help="Username бота без @ — для детекта упоминаний"
     )
     parser.add_argument(
-        "--bot-user-id", type=int, default=0, help="user_id бота в экспорте, 0 = неизвестен"
+        "--bot-user-id",
+        type=int,
+        default=0,
+        help=(
+            "user_id бота в источнике, 0 = неизвестен/автоопределение. Для базы бота, "
+            "если не задан, берётся автоматически из строк is_bot=1"
+        ),
+    )
+    parser.add_argument(
+        "--from-db",
+        action="store_true",
+        dest="from_db",
+        help="Трактовать source как базу бота, даже если расширение не .db/.sqlite/.sqlite3",
+    )
+    parser.add_argument(
+        "--chat-id",
+        type=int,
+        default=None,
+        dest="chat_id",
+        help="chat_id при чтении из базы бота — обязателен, если в messages несколько чатов",
+    )
+    parser.add_argument(
+        "--since",
+        type=_parse_date_arg,
+        default=None,
+        help="Не раньше этой локальной даты включительно (YYYY-MM-DD, persona.timezone)",
+    )
+    parser.add_argument(
+        "--until",
+        type=_parse_date_arg,
+        default=None,
+        help="Не позже этой локальной даты включительно (YYYY-MM-DD, persona.timezone)",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Печатать каждую PASS-строку отдельно"
@@ -467,7 +648,7 @@ async def _run_replay_async(args: argparse.Namespace) -> str:
         args.bot_username,
     }
 
-    export_messages = parse_export(Path(args.export_path), cfg.persona.timezone)
+    export_messages, effective_bot_user_id = _load_messages(args, cfg)
 
     rng = random.Random(args.seed)
     state = ReplayState(cfg.persona.timezone, cfg.behaviour.live_talk.window_min)
@@ -487,7 +668,7 @@ async def _run_replay_async(args: argparse.Namespace) -> str:
 
     try:
         for exported in export_messages:
-            is_bot = args.bot_user_id != 0 and exported.user_id == args.bot_user_id
+            is_bot = effective_bot_user_id != 0 and exported.user_id == effective_bot_user_id
             reply_to_bot = (
                 exported.reply_to_tg_message_id is not None
                 and exported.reply_to_tg_message_id in bot_message_ids

@@ -278,6 +278,7 @@ PLACES_NONE = "Про заведения тебя сейчас не спраши
 SITUATION_LATE = "Тебя не было рядом, ты отвлёкся на свои дела. Можешь это отыграть одной фразой, но не оправдывайся."
 SITUATION_MORNING = "Сейчас утро. Ночью тебя звали, ты спал. Ответь всем одной фразой, не по отдельности."
 SITUATION_SPONTANEOUS = "В чате тихо. Если есть что сказать про свои дела одной фразой — скажи. Нет — промолчи. Никого не зови и ничего не спрашивай."
+def situation_addressed(items: list[tuple[str, str]]) -> str   # (display_name, text) обращений (может быть несколько — схлопывание); 1 → "К тебе сейчас обратился {name}: «{text}». Отвечай на это сообщение, а не на разговор вокруг..."; >1 → маркированный список + "Ответь одной фразой: тому, кому есть что сказать, или всем сразу"; текст режется до 300 симв., разделители <<</>>> вырезаются, потолок 5 последних
 @dataclass class Reply: speak: bool; text: str
 def parse_reply(raw: str) -> Reply | None      # срез ```json-обёрток, json.loads, проверка типов; None при любом сбое
 
@@ -310,8 +311,13 @@ class Responder:
     # перепроверка детерминированных шагов гейта (panic/stop/muted/topic_cooldown/mention caps) через load_gate_state +
     # локальную функцию recheck() — БЕЗ dice и live; провал → filter_log send:recheck_<причина>, mark_pending_done;
     # иначе _respond(trigger, delay_sec = now - created_at, late = delay_sec > late_reply_threshold_sec).
+    # Обращений может накопиться несколько за время схлопывания одного pending — _pending_info хранит
+    # list[(display_name, text)], каждое схлопывание дописывает, не заменяет; _generate_and_send строит
+    # situation обращения из этого списка через prompt.situation_addressed (потолок 5), а не из аргумента
+    # situation вызывающего. После рестарта (список пуст) — _collect_addressed_items восстанавливает его из
+    # messages (created_at >= pending.created_at, реплай на бота/mentions_bot/name_trigger + сам триггер).
     async def _respond(self, *, trigger: Trigger | str, trigger_msg_id: int | None, user_id: int | None,
-                       situation: str, delay_sec: int) -> None
+                       situation: str, delay_sec: int, addressed_items: list[tuple[str, str]] | None = None) -> None
     # Генерация+отправка+счётчики — под одним asyncio.Lock на Responder; ambient/spontaneous перед вызовом модели
     # перечитывают last_ambient_at/ambient_count (send:recheck_ambient_*). Фоновые таски и циклы джобов обёрнуты
     # по образцу retention_loop: CancelledError пробрасывается, Exception логируется, цикл живёт дальше.

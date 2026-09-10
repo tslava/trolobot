@@ -898,6 +898,300 @@ async def test_reply_mode_depends_on_messages_after_and_delay(db: Database) -> N
         await llm.aclose()
 
 
+# --- 11b. Обращение: situation называет того, кто реально обратился, а не просто ---
+# --- "молчание" (живой баг: 30 сообщений контекста, модель отвечает на самое ---
+# --- заметное, а не на того, кто позвал). ---
+
+
+async def test_mention_reply_states_who_addressed_it(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("И тебе привет."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_message(
+            db,
+            tg_message_id=500,
+            user_id=5,
+            display_name="Дима",
+            text="@fedorbot как сам?",
+            created_at=DAY_NOW,
+        )
+        msg = _gate_message(
+            tg_message_id=500, user_id=5, text="@fedorbot как сам?", created_at=DAY_NOW
+        )
+        await responder.on_gate_pass(msg, Trigger.MENTION, "Дима")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        pending_id = (await db.load_pending())[0].id
+        await clock.run_until(responder._pending_tasks[pending_id])
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "К тебе сейчас обратился Дима: «@fedorbot как сам?»" in user_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_ambient_reply_has_no_addressed_situation_line(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_message(
+            db,
+            tg_message_id=501,
+            user_id=5,
+            display_name="Дима",
+            text="привет всем",
+            created_at=DAY_NOW,
+        )
+        msg = _gate_message(tg_message_id=501, user_id=5, text="привет всем", created_at=DAY_NOW)
+        await responder.on_gate_pass(msg, Trigger.AMBIENT, "Дима")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "К тебе сейчас обратился" not in user_content
+        assert "К тебе обратились:" not in user_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_mention_late_reply_has_both_addressed_and_late_situation(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Задумался о своём."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=502,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 3600,
+        )
+        # Обращение поставлено в этом же процессе -> _pending_info хранит пару.
+        responder._pending_info[pending_id] = [("Дима", "фёдор, ты там?")]
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=502,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 3600,
+            done_at=None,
+        )
+
+        await _drive(clock, responder._fire_pending(row))
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "К тебе сейчас обратился Дима: «фёдор, ты там?»" in user_content
+        assert SITUATION_LATE in user_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_restored_pending_takes_address_from_messages_after_restart(db: Database) -> None:
+    """После рестарта процесса _pending_info пуст -- имя и текст обращения
+    восстанавливаются из messages (message_by_tg_id по trigger_tg_message_id)."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ну да."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_message(
+            db,
+            tg_message_id=503,
+            user_id=5,
+            display_name="Дима",
+            text="фёдор, как сам?",
+            created_at=DAY_NOW - 30,
+        )
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=503,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 30,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=503,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 30,
+            done_at=None,
+        )
+        # Ни одной записи в _pending_info -- как будто процесс перезапустился между
+        # постановкой pending и его срабатыванием.
+        assert pending_id not in responder._pending_info
+
+        await _drive(clock, responder._fire_pending(row))
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "К тебе сейчас обратился Дима: «фёдор, как сам?»" in user_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_collapsed_mentions_list_all_addressers_in_situation(db: Database) -> None:
+    """Схлопывание дебаунс-буфера дописывает новое обращение к уже накопленным для
+    этого pending, а не заменяет его -- situation перечисляет всех обратившихся."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Всем привет."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        msg1 = _gate_message(
+            tg_message_id=520, user_id=5, text="фёдор, ты тут?", created_at=DAY_NOW
+        )
+        await responder._handle_debounced(Trigger.NAME, msg1, "Дима")
+
+        msg2 = _gate_message(
+            tg_message_id=521, user_id=6, text="федя, ты где", created_at=DAY_NOW + 2
+        )
+        await responder._handle_debounced(Trigger.NAME, msg2, "Оля")
+
+        pending_id = (await db.load_pending())[0].id
+        assert responder._pending_info[pending_id] == [
+            ("Дима", "фёдор, ты тут?"),
+            ("Оля", "федя, ты где"),
+        ]
+        await clock.run_until(responder._pending_tasks[pending_id])
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "К тебе обратились:" in user_content
+        assert "- Дима: «фёдор, ты тут?»" in user_content
+        assert "- Оля: «федя, ты где»" in user_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_restored_pending_collects_multiple_addresses_from_messages(db: Database) -> None:
+    """Восстановление после рестарта тоже собирает несколько обращений, не только
+    исходный триггер -- любое сообщение-реплай на бота или mention/name_trigger,
+    начиная с created_at постановки pending, тоже считается обращением."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Всем привет."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_message(
+            db,
+            tg_message_id=530,
+            user_id=5,
+            display_name="Дима",
+            text="@fedorbot как сам?",
+            created_at=DAY_NOW - 20,
+        )
+        await _insert_message(
+            db,
+            tg_message_id=531,
+            user_id=6,
+            display_name="Оля",
+            text="федя, ты тут?",
+            created_at=DAY_NOW - 10,
+        )
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=530,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 20,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=530,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 20,
+            done_at=None,
+        )
+
+        await _drive(clock, responder._fire_pending(row))
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "К тебе обратились:" in user_content
+        assert "- Дима: «@fedorbot как сам?»" in user_content
+        assert "- Оля: «федя, ты тут?»" in user_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_collect_addressed_items_caps_at_five(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_message(
+            db,
+            tg_message_id=540,
+            user_id=5,
+            display_name="Триггер",
+            text="федя, драсте",
+            created_at=DAY_NOW - 100,
+        )
+        for i in range(6):
+            await _insert_message(
+                db,
+                tg_message_id=541 + i,
+                user_id=10 + i,
+                display_name=f"Юзер{i}",
+                text="федя, привет",
+                created_at=DAY_NOW - 90 + i,
+            )
+        row = PendingRow(
+            id=999999,
+            trigger_tg_message_id=540,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 100,
+            done_at=None,
+        )
+
+        items = await responder._collect_addressed_items(row)
+
+        assert len(items) == 5
+        names = [name for name, _ in items]
+        assert "Триггер" not in names  # самый старый -- вытеснен потолком
+        assert "Юзер0" not in names
+        assert names == ["Юзер1", "Юзер2", "Юзер3", "Юзер4", "Юзер5"]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 # --- 12. Утренний джоб: два ночных -> один вызов, situation MORNING, обе отвечены ---
 
 

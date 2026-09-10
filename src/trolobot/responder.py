@@ -23,6 +23,19 @@
 ``display_name="Участник"`` — заглушка, а не настоящее сообщение. Для pending,
 поставленных в течение текущего процесса (не после рестарта), текст и имя
 есть в памяти (``_pending_info``) и используются как обычно.
+
+Обращений к боту, накопившихся за время дебаунс-схлопывания одного pending,
+может быть несколько (несколько человек написали, пока бот молчал) —
+``_pending_info`` хранит список пар ``(display_name, text)``, каждое новое
+схлопывание дописывает элемент, а не заменяет предыдущий. При генерации
+ответа на обращение (``_generate_and_send``) вся ``situation`` строится из
+этого списка через ``prompt.situation_addressed`` — так модель знает, кому
+именно отвечать, а не отвечает на самое заметное сообщение в окне контекста.
+Если список после рестарта пуст, ``_fire_pending_inner`` восстанавливает его
+из ``messages`` (``_collect_addressed_items``): все человеческие сообщения с
+``created_at >= pending.created_at``, отмеченные как обращение (реплай на
+сообщение бота, mention или имя-триггер) плюс сам исходный триггер, не более
+последних 5.
 """
 
 from __future__ import annotations
@@ -53,6 +66,7 @@ from trolobot.prompt import (
     build_messages,
     parse_reply,
     render_context,
+    situation_addressed,
 )
 from trolobot.timeutil import day_key, in_window, local_date, parse_hhmm, seconds_until, week_key
 
@@ -68,6 +82,10 @@ _TRIGGER_PRIORITY: dict[Trigger, int] = {
 }
 
 _ADDRESS_TRIGGER_VALUES = (Trigger.MENTION.value, Trigger.REPLY.value, Trigger.NAME.value)
+
+# Потолок на число обращений, из которых строится situation_addressed (и на сколько
+# восстанавливает _collect_addressed_items после рестарта) — не больше последних 5.
+_ADDRESSED_ITEMS_LIMIT = 5
 
 # Заведения подмешиваются только по запросу и только в обращениях (mention/reply/name);
 # ambient/spontaneous/morning никогда не получают блок мест — "не вклиниваться с
@@ -189,9 +207,11 @@ class Responder:
         self._debounce_buffer: list[tuple[Trigger, GateMessage, str]] = []
         self._debounce_task: asyncio.Task[None] | None = None
         self._pending_tasks: dict[int, asyncio.Task[None]] = {}
-        # pending_id -> (text, display_name); только для pending, поставленных в этом
-        # процессе. После рестарта заполняется по мере схлопывания новых обращений.
-        self._pending_info: dict[int, tuple[str, str]] = {}
+        # pending_id -> [(display_name, text), ...] — все обращения, накопленные за
+        # время жизни этого pending (схлопывание дописывает, не заменяет). Только для
+        # pending, поставленных в этом процессе; после рестарта список пуст и
+        # _fire_pending_inner восстанавливает его из БД (_collect_addressed_items).
+        self._pending_info: dict[int, list[tuple[str, str]]] = {}
         # Сериализует генерацию+отправку+счётчики одного Responder: без этого два PASS,
         # ждущих LLM параллельно, могли бы оба проскочить одну и ту же проверку бюджета.
         self._respond_lock = asyncio.Lock()
@@ -279,7 +299,10 @@ class Responder:
             new_due = now + fast_delay(cfg.behaviour, self.rng)
             new_due = self._apply_cooldown_floor(new_due, earliest)
             await self.db.update_pending_due(pending.id, new_due)
-            self._pending_info[pending.id] = (msg.text, display_name)
+            # Схлопывание: новое обращение дописывается к уже накопленным для этого
+            # pending, а не заменяет их (несколько человек могли написать боту, пока
+            # он ждал) — situation_addressed при генерации покажет их все.
+            self._pending_info.setdefault(pending.id, []).append((display_name, msg.text))
             row = PendingRow(
                 id=pending.id,
                 trigger_tg_message_id=pending.trigger_tg_message_id,
@@ -301,7 +324,7 @@ class Responder:
                 due_at=due,
                 created_at=now,
             )
-            self._pending_info[pending_id] = (msg.text, display_name)
+            self._pending_info[pending_id] = [(display_name, msg.text)]
             row = PendingRow(
                 id=pending_id,
                 trigger_tg_message_id=msg.tg_message_id,
@@ -385,7 +408,11 @@ class Responder:
         now = self._clock()
 
         if in_window(now, tz, cfg.behaviour.quiet_window):
-            text, display_name = self._pending_info.pop(row.id, ("", "Участник"))
+            items = self._pending_info.pop(row.id, None)
+            if items:
+                display_name, text = items[-1]
+            else:
+                display_name, text = "Участник", ""
             if not text:
                 logger.warning(
                     "night queue: pending %s restored without original text (restart), "
@@ -427,18 +454,67 @@ class Responder:
             )
             return
 
-        pending_text, _pending_display_name = self._pending_info.pop(row.id, ("", ""))
+        addressed_items = self._pending_info.pop(row.id, None)
+        if not addressed_items:
+            # Процесс перезапустился между постановкой pending и его срабатыванием —
+            # _pending_info пуст. Восстанавливаем накопленные обращения из messages.
+            addressed_items = await self._collect_addressed_items(row)
+        pending_text = addressed_items[-1][1] if addressed_items else ""
         await self.db.mark_pending_done(row.id, now)
         delay_sec = now - row.created_at
-        situation = SITUATION_LATE if delay_sec > cfg.behaviour.late_reply_threshold_sec else ""
         await self._respond(
             trigger=row.trigger,
             trigger_msg_id=row.trigger_tg_message_id,
             user_id=row.user_id,
-            situation=situation,
+            situation="",
             delay_sec=delay_sec,
             trigger_text=pending_text,
+            addressed_items=addressed_items,
         )
+
+    async def _collect_addressed_items(self, row: PendingRow) -> list[tuple[str, str]]:
+        """Восстанавливает обращения к боту для pending, потерянного при рестарте
+        (``_pending_info`` пуст — процесс перезапустился между постановкой pending и
+        его срабатыванием, накопленные в памяти пары (display_name, text) утрачены).
+
+        Берёт человеческие сообщения чата с ``created_at >= row.created_at`` (момент
+        постановки pending) и оставляет те, что похожи на обращение к боту: реплай на
+        сообщение бота (``bot_reply_by_tg_id`` не None), либо ``mentions_bot``, либо
+        ``name_trigger``. Исходный триггер (``row.trigger_tg_message_id``) добавляется
+        явно и всегда первым — debounce мог поставить его created_at чуть раньше
+        ``row.created_at`` (created_at pending — время постановки, не время исходного
+        сообщения), и тогда фильтр по created_at его бы не нашёл. Не более последних
+        ``_ADDRESSED_ITEMS_LIMIT`` элементов — обрезает и prompt.situation_addressed,
+        но дублируем здесь, чтобы не тащить в память лишнее на длинных схлопываниях."""
+        patterns = self.patterns_getter()
+        items: list[tuple[str, str]] = []
+        seen_ids: set[int] = set()
+
+        def _add(msg_row: MessageRow) -> None:
+            if msg_row.tg_message_id is None or msg_row.tg_message_id in seen_ids:
+                return
+            seen_ids.add(msg_row.tg_message_id)
+            items.append((msg_row.display_name or "", msg_row.text or ""))
+
+        trigger_msg = await self.db.message_by_tg_id(self.chat_id, row.trigger_tg_message_id)
+        if trigger_msg is not None:
+            _add(trigger_msg)
+
+        candidates = await self.db.messages_since(self.chat_id, row.created_at)
+        for candidate in candidates:
+            text = candidate.text or ""
+            addressed = False
+            if candidate.reply_to_tg_message_id is not None:
+                bot_reply = await self.db.bot_reply_by_tg_id(candidate.reply_to_tg_message_id)
+                addressed = bot_reply is not None
+            if not addressed and patterns.mentions_bot(text):
+                addressed = True
+            if not addressed and patterns.name_trigger(text) is not None:
+                addressed = True
+            if addressed:
+                _add(candidate)
+
+        return items[-_ADDRESSED_ITEMS_LIMIT:]
 
     async def _recheck(self, row: PendingRow, now: int, cfg: Config) -> str | None:
         """Только детерминированные шаги гейта (п.1-5, п.7 и лимиты обращений).
@@ -487,6 +563,7 @@ class Responder:
         situation: str,
         delay_sec: int,
         trigger_text: str = "",
+        addressed_items: list[tuple[str, str]] | None = None,
     ) -> None:
         try:
             await self._respond_inner(
@@ -496,6 +573,7 @@ class Responder:
                 situation=situation,
                 delay_sec=delay_sec,
                 trigger_text=trigger_text,
+                addressed_items=addressed_items,
             )
         except LLMError as exc:
             await self.db.insert_filter_log(
@@ -521,6 +599,7 @@ class Responder:
         situation: str,
         delay_sec: int,
         trigger_text: str = "",
+        addressed_items: list[tuple[str, str]] | None = None,
     ) -> None:
         # Один Responder генерирует и отправляет строго по одному ответу за раз: без
         # этого лока два PASS, ждущих LLM параллельно, могли бы оба проскочить одну и
@@ -559,6 +638,7 @@ class Responder:
                 delay_sec=delay_sec,
                 now=now,
                 trigger_text=trigger_text,
+                addressed_items=addressed_items,
             )
 
     async def _recheck_ambient_budget(self, cfg: Config, now: int) -> str | None:
@@ -595,6 +675,7 @@ class Responder:
         delay_sec: int,
         now: int,
         trigger_text: str = "",
+        addressed_items: list[tuple[str, str]] | None = None,
     ) -> None:
         if not cfg.llm.main_model:
             # LLM включён (есть openrouter_api_key), но модель ещё не задана —
@@ -631,6 +712,17 @@ class Responder:
         # Заведения: только по запросу в обращении (mention/reply/name), никогда для
         # ambient/spontaneous/morning ("не вклиниваться с рекомендацией сам").
         is_address = trigger_value in _ADDRESS_TRIGGER_VALUES
+        if is_address:
+            # Обращение (mention/reply/name) строит собственную situation из
+            # накопленных обращений (может быть несколько, если несколько людей
+            # написали боту за время дебаунс-схлопывания) вместо той, что передал
+            # вызывающий: без явного "к тебе обратился X" модель в 30-сообщениях
+            # окна контекста отвечает на самое заметное сообщение, а не на того,
+            # кто реально к ней обратился ("живой" баг, из-за которого это и
+            # добавлено). Поздний ответ по-прежнему добавляется отдельной строкой.
+            situation = situation_addressed(addressed_items) if addressed_items else ""
+            if delay_sec > cfg.behaviour.late_reply_threshold_sec:
+                situation = f"{situation}\n{SITUATION_LATE}" if situation else SITUATION_LATE
         places_triggered = is_address and self.patterns_getter().places_request(trigger_text)
         if places_triggered:
             place_rows = await self.db.places_all()

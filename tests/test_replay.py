@@ -6,14 +6,17 @@ run_replay() тянет за собой gate.py и patterns.py (пишутся �
 """
 
 import argparse
+import asyncio
 import importlib.util
 import json
+from datetime import date
 from pathlib import Path
 
 import httpx
 import pytest
 
 from trolobot import replay as replay_module
+from trolobot.db import Database
 from trolobot.gate_types import GateMessage, StateChange, Trigger
 from trolobot.replay import ReplayState, run_replay
 
@@ -182,7 +185,7 @@ def test_run_replay_produces_day_line_and_summary(tmp_path: Path) -> None:
     config_path = Path(__file__).resolve().parent.parent / "config.yaml"
 
     args = argparse.Namespace(
-        export_path=export_path,
+        source=export_path,
         config=config_path,
         seed=1,
         bot_username="otec_fedor_bot",
@@ -261,7 +264,7 @@ def test_run_replay_generate_prints_reply_and_verdict(
     monkeypatch.setattr(replay_module.httpx, "AsyncClient", fake_async_client)
 
     args = argparse.Namespace(
-        export_path=export_path,
+        source=export_path,
         config=config_path,
         seed=1,
         bot_username="otec_fedor_bot",
@@ -297,7 +300,7 @@ def test_run_replay_generate_without_api_key_raises_clear_error(
     _write_minimal_generate_config(config_path)
 
     args = argparse.Namespace(
-        export_path=export_path,
+        source=export_path,
         config=config_path,
         seed=1,
         bot_username="otec_fedor_bot",
@@ -396,7 +399,7 @@ def test_run_replay_generate_max_calls_counts_real_network_calls(
     monkeypatch.setattr(replay_module.httpx, "AsyncClient", fake_async_client)
 
     args = argparse.Namespace(
-        export_path=export_path,
+        source=export_path,
         config=config_path,
         seed=1,
         bot_username="otec_fedor_bot",
@@ -414,3 +417,134 @@ def test_run_replay_generate_max_calls_counts_real_network_calls(
     reported_calls = int(report.split("вызовов=")[1].split(",")[0])
     assert reported_calls == call_count
     assert reported_calls <= 4
+
+
+# --- run_replay: источник — база самого бота (bot.db), не только экспорт -----------
+
+
+async def _seed_bot_db(db_path: Path, tz: str) -> None:
+    """8 сообщений от двух людей + 1 от бота, на двух разных локальных сутках.
+
+    Владелец не всегда может выгрузить историю из Telegram Desktop (запрет на
+    сохранение контента в группе) — вместо этого реплей читает саму базу бота.
+    """
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo(tz)
+    day1 = datetime(2026, 9, 8, 18, 0, 0, tzinfo=zone)
+    day2 = datetime(2026, 9, 10, 18, 0, 0, tzinfo=zone)
+    authors = [(111, "Дима"), (222, "Аня")]
+
+    db = Database(db_path)
+    await db.connect()
+    try:
+        for i in range(4):
+            user_id, name = authors[i % 2]
+            await db.insert_message(
+                tg_message_id=i + 1,
+                chat_id=555,
+                user_id=user_id,
+                display_name=name,
+                text=f"день первый, сообщение {i + 1}",
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=int((day1 + timedelta(minutes=i)).timestamp()),
+            )
+        for i in range(4):
+            user_id, name = authors[i % 2]
+            await db.insert_message(
+                tg_message_id=i + 5,
+                chat_id=555,
+                user_id=user_id,
+                display_name=name,
+                text=f"день второй, сообщение {i + 1}",
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=int((day2 + timedelta(minutes=i)).timestamp()),
+            )
+        await db.insert_message(
+            tg_message_id=9,
+            chat_id=555,
+            user_id=999,
+            display_name="Отец Фёдор",
+            text="И тебе не хворать",
+            reply_to_tg_message_id=None,
+            is_bot=True,
+            created_at=int((day2 + timedelta(minutes=5)).timestamp()),
+        )
+    finally:
+        await db.close()
+
+
+def _seed_bot_db_sync(db_path: Path, tz: str) -> None:
+    asyncio.run(_seed_bot_db(db_path, tz))
+
+
+def _db_args(source: Path, **overrides: object) -> argparse.Namespace:
+    config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    base: dict[str, object] = {
+        "source": source,
+        "config": config_path,
+        "seed": 1,
+        "bot_username": "otec_fedor_bot",
+        "bot_user_id": 0,
+        "from_db": False,
+        "chat_id": None,
+        "since": None,
+        "until": None,
+        "verbose": False,
+        "generate": False,
+        "judge": False,
+        "max_calls": 20,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+@pytest.mark.skipif(
+    not _GATE_AND_PATTERNS_AVAILABLE,
+    reason="trolobot.gate и/или trolobot.patterns ещё не написаны",
+)
+def test_run_replay_from_bot_db_produces_day_line_and_summary(tmp_path: Path) -> None:
+    db_path = tmp_path / "bot.db"
+    _seed_bot_db_sync(db_path, TZ)
+
+    report = run_replay(_db_args(db_path))
+
+    assert "Итого:" in report
+    assert "2026-09-08" in report
+    assert "2026-09-10" in report
+
+
+@pytest.mark.skipif(
+    not _GATE_AND_PATTERNS_AVAILABLE,
+    reason="trolobot.gate и/или trolobot.patterns ещё не написаны",
+)
+def test_run_replay_from_bot_db_since_cuts_off_early_messages(tmp_path: Path) -> None:
+    db_path = tmp_path / "bot.db"
+    _seed_bot_db_sync(db_path, TZ)
+
+    report = run_replay(_db_args(db_path, since=date(2026, 9, 9)))
+
+    assert "2026-09-10" in report
+    assert "2026-09-08" not in report
+
+
+@pytest.mark.skipif(
+    not _GATE_AND_PATTERNS_AVAILABLE,
+    reason="trolobot.gate и/или trolobot.patterns ещё не написаны",
+)
+def test_run_replay_from_bot_db_does_not_modify_live_file(tmp_path: Path) -> None:
+    """Реплей читает базу бота read-only (sqlite3 URI mode=ro) — живой файл (и его
+    WAL) не должен меняться: ни размер, ни mtime."""
+    db_path = tmp_path / "bot.db"
+    _seed_bot_db_sync(db_path, TZ)
+
+    stat_before = db_path.stat()
+
+    run_replay(_db_args(db_path))
+
+    stat_after = db_path.stat()
+    assert stat_before.st_mtime_ns == stat_after.st_mtime_ns
+    assert stat_before.st_size == stat_after.st_size

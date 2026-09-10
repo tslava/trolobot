@@ -49,6 +49,23 @@ SITUATION_SPONTANEOUS = (
     "В чате тихо. Если есть что сказать про свои дела одной фразой — скажи. "
     "Нет — промолчи. Никого не зови и ничего не спрашивай."
 )
+# Одно обращение — короткая форма; несколько (накопились за схлопывание
+# дебаунс-буфера) — список с общей инструкцией: "живой тест" показал, что при
+# нескольких людях в контексте модель отвечает на самое заметное сообщение в
+# окне, а не на того, кто реально обратился, поэтому ситуация обязана прямо
+# перечислить всех обратившихся, а не только последнего.
+SITUATION_ADDRESSED_SINGLE = (
+    "К тебе сейчас обратился {name}: «{text}». "
+    "Отвечай на это сообщение, а не на разговор вокруг. Если отвечать нечего — speak=false."
+)
+SITUATION_ADDRESSED_MULTI_HEADER = "К тебе обратились:"
+SITUATION_ADDRESSED_MULTI_FOOTER = (
+    "Ответь одной фразой: тому, кому есть что сказать, или всем сразу. "
+    "На разговор вокруг не отвечай."
+)
+
+_ADDRESSED_TEXT_MAX_LEN = 300
+_ADDRESSED_ITEMS_MAX = 5
 
 _RECENT_REPLIES_EMPTY = "(пока не было)"
 _DATA_DISCLAIMER = (
@@ -76,6 +93,46 @@ _SLOT_RE = re.compile(r"\{(age|few_shot|context|recent_replies|places|situation)
 
 def _strip_fake_delimiters(text: str) -> str:
     return _GT_RUN_RE.sub(" ", _LT_RUN_RE.sub(" ", text))
+
+
+def _clean_addressed_text(text: str) -> str:
+    return _strip_fake_delimiters(text).strip()[:_ADDRESSED_TEXT_MAX_LEN]
+
+
+def situation_addressed(items: list[tuple[str, str]]) -> str:
+    """Ситуация «к тебе обратился(-ись)» из накопленных обращений (display_name, text).
+
+    ``items`` — все обращения, накопившиеся к моменту срабатывания отложенного
+    ответа (схлопывание дебаунс-буфера может собрать несколько обращений от
+    разных людей за время задержки), в хронологическом порядке. Только
+    последние ``_ADDRESSED_ITEMS_MAX`` используются — вызывающий (responder.py)
+    уже должен был обрезать список сам, но обрезаем и здесь на всякий случай.
+
+    Одно обращение — короткая форма (SITUATION_ADDRESSED_SINGLE, подстановка
+    через .replace, не re.sub/format: тут только два слота и они не могут
+    провоцировать повторную подстановку друг друга). Несколько — маркированный
+    список с общей инструкцией (SITUATION_ADDRESSED_MULTI_*).
+
+    Имя и текст каждого обращения — недоверенный ввод участника: разделители
+    ``<<<``/``>>>`` вырезаются тем же способом, что и в build_messages, а текст
+    обрезается до 300 символов, чтобы не раздувать промпт длинной репликой.
+    Пустой ``items`` -> пустая строка (значит, ситуацию добавлять не нужно).
+    """
+    trimmed = items[-_ADDRESSED_ITEMS_MAX:]
+    cleaned = [
+        (_strip_fake_delimiters(name).strip(), _clean_addressed_text(text))
+        for name, text in trimmed
+    ]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        name, text = cleaned[0]
+        return SITUATION_ADDRESSED_SINGLE.replace("{name}", name).replace("{text}", text)
+
+    lines = [SITUATION_ADDRESSED_MULTI_HEADER]
+    lines.extend(f"- {name}: «{text}»" for name, text in cleaned)
+    lines.append(SITUATION_ADDRESSED_MULTI_FOOTER)
+    return "\n".join(lines)
 
 
 def render_context(rows: list[MessageRow]) -> str:
