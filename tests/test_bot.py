@@ -519,3 +519,50 @@ async def test_gate_error_does_not_break_message_write(
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
     assert "gate failed" in errors[0].message
+
+
+class _FakeResponder:
+    """Подделка Responder: только записывает вызовы on_gate_pass."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, object, str]] = []
+
+    async def on_gate_pass(self, msg: object, trigger: object, display_name: str) -> None:
+        self.calls.append((msg, trigger, display_name))
+
+
+async def test_gate_pass_without_trigger_logs_error_and_skips_responder(
+    db: Database, config: Config, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Инвариант "PASS всегда несёт trigger" защищён явной проверкой, а не assert:
+    если гейт всё же вернул PASS без trigger, хендлер логирует ошибку и просто не
+    зовёт responder, вместо падения на AssertionError."""
+    import trolobot.bot as bot_module
+    from trolobot.gate_types import Decision, Verdict
+
+    def fake_should_consider(*_args: object, **_kwargs: object) -> Decision:
+        return Decision(verdict=Verdict.PASS, trigger=None, reason="pass:mention")
+
+    monkeypatch.setattr(bot_module, "should_consider", fake_should_consider)
+
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    deps = _deps(db, config, settings=settings)
+    fake_responder = _FakeResponder()
+    deps.responder = fake_responder  # type: ignore[assignment]
+    router = build_router(deps)
+    handler = router.message.handlers[0].callback
+
+    message = _message(from_user=_user(user_id=5, first_name="Дима"), text="привет", date=DAY)
+
+    with caplog.at_level(logging.ERROR, logger="trolobot.bot"):
+        await handler(message)
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "gate pass without trigger" in errors[0].message
+    assert fake_responder.calls == []
+
+    # Сообщение всё равно записано и залогировано как pass — гейт отработал штатно,
+    # сломан только trigger.
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("pass:mention") == 1

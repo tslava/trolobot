@@ -21,6 +21,7 @@ from trolobot.gate import should_consider
 from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Verdict
 from trolobot.patterns import Patterns
+from trolobot.responder import Responder
 from trolobot.sanitize import media_placeholder, normalize_text, sanitize_display_name
 from trolobot.settings import Settings
 
@@ -41,6 +42,7 @@ class Deps:
     reserved_names: set[str]
     patterns: Patterns
     rng: random.Random
+    responder: Responder | None = None
 
 
 def build_router(deps: Deps) -> Router:
@@ -170,7 +172,19 @@ def build_router(deps: Deps) -> Router:
                     shadow=False,
                     created_at=now,
                 )
-                logger.info("gate pass: %s (%s)", decision.trigger, text[:_LOG_TEXT_MAX_LEN])
+                if decision.trigger is None:
+                    # Инвариант гейта: PASS всегда несёт trigger (see gate.py). Если
+                    # он всё же None — конфигурация гейта сломана, а не повод уронить
+                    # хендлер: логируем и просто не зовём responder на этом сообщении.
+                    logger.error(
+                        "gate pass without trigger: message %s reason=%s",
+                        gate_message.tg_message_id,
+                        decision.reason,
+                    )
+                elif deps.responder is not None:
+                    await deps.responder.on_gate_pass(gate_message, decision.trigger, display_name)
+                else:
+                    logger.info("gate pass: %s (%s)", decision.trigger, text[:_LOG_TEXT_MAX_LEN])
         except Exception:
             # Ошибка гейта не должна ронять хендлер: сообщение уже записано в messages.
             logger.exception("gate failed for message %s", gate_message.tg_message_id)

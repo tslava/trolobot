@@ -55,6 +55,9 @@ llm:
   daily_budget_usd: 2.0                # по usage.cost из ответа; сверх — молчит до конца суток
   circuit_errors: 5                    # ошибок подряд → пауза
   circuit_pause_min: 30
+  # fallback-цены за 1M токенов; используются, только если провайдер не вернул usage.cost
+  price_in_usd_per_1m: 5.0
+  price_out_usd_per_1m: 25.0
 
 places:
   min_rating: 4.2

@@ -151,6 +151,9 @@ class LlmConfig(BaseModel):
     daily_budget_usd: float = Field(default=2.0, ge=0.0, le=1000.0)
     circuit_errors: int = Field(default=5, ge=1, le=100)
     circuit_pause_min: int = Field(default=30, ge=0, le=1440)
+    # Fallback-цены за 1M токенов: используются, только если провайдер не вернул usage.cost.
+    price_in_usd_per_1m: float = Field(default=5.0, ge=0.0)
+    price_out_usd_per_1m: float = Field(default=25.0, ge=0.0)
 
 
 class PlacesConfig(BaseModel):

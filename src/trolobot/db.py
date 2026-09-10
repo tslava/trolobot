@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib.resources
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -46,6 +46,28 @@ class PurgeStats:
     pending_replies: int
     filter_log_texts: int
     state_keys: int
+
+
+@dataclass(frozen=True, slots=True)
+class PendingRow:
+    id: int
+    trigger_tg_message_id: int
+    user_id: int
+    trigger: str
+    due_at: int
+    created_at: int
+    done_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class NightRow:
+    id: int
+    tg_message_id: int
+    user_id: int
+    display_name: str
+    text: str
+    created_at: int
+    answered_at: int | None
 
 
 def _state_key_date_suffix(key: str) -> str | None:
@@ -381,3 +403,199 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [(str(row["reason"]), int(row["cnt"])) for row in rows]
+
+    async def recent_bot_replies(self, limit: int) -> list[str]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT text FROM bot_replies ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        texts = [str(row["text"]) for row in rows]
+        texts.reverse()
+        return texts
+
+    async def insert_bot_reply(
+        self,
+        *,
+        tg_message_id: int,
+        reply_to_tg_message_id: int | None,
+        trigger: str,
+        trigger_tg_message_id: int | None,
+        text: str,
+        prompt_version: int,
+        few_shot_version: int,
+        delay_sec: int,
+        created_at: int,
+    ) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO bot_replies "
+                "(tg_message_id, reply_to_tg_message_id, trigger, trigger_tg_message_id, text, "
+                "prompt_version, few_shot_version, delay_sec, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tg_message_id,
+                    reply_to_tg_message_id,
+                    trigger,
+                    trigger_tg_message_id,
+                    text,
+                    prompt_version,
+                    few_shot_version,
+                    delay_sec,
+                    created_at,
+                ),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_bot_reply: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def increment_state(self, key: str, by: int = 1) -> int:
+        """Атомарный read-modify-write int-счётчика в state, весь под write_lock.
+
+        Не переиспользует get_state/set_state: их собственный захват write_lock
+        (asyncio.Lock не реентерабелен) привёл бы к дедлоку внутри уже взятого лока.
+        """
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("SELECT value FROM state WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            current = int(row["value"]) if row is not None else 0
+            new_value = current + by
+            await conn.execute(
+                "INSERT INTO state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(new_value)),
+            )
+            await conn.commit()
+            return new_value
+
+    async def add_state_float(self, key: str, by: float) -> float:
+        """Атомарный read-modify-write float-счётчика в state, хранится как str(value)."""
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("SELECT value FROM state WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            current = float(row["value"]) if row is not None else 0.0
+            new_value = current + by
+            await conn.execute(
+                "INSERT INTO state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(new_value)),
+            )
+            await conn.commit()
+            return new_value
+
+    async def insert_pending(
+        self,
+        *,
+        trigger_tg_message_id: int,
+        user_id: int,
+        trigger: str,
+        due_at: int,
+        created_at: int,
+    ) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO pending_replies "
+                "(trigger_tg_message_id, user_id, trigger, due_at, created_at, done_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL)",
+                (trigger_tg_message_id, user_id, trigger, due_at, created_at),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_pending: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def update_pending_due(self, pending_id: int, due_at: int) -> None:
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "UPDATE pending_replies SET due_at = ? WHERE id = ?", (due_at, pending_id)
+            )
+            await conn.commit()
+
+    async def mark_pending_done(self, pending_id: int, done_at: int) -> None:
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "UPDATE pending_replies SET done_at = ? WHERE id = ?", (done_at, pending_id)
+            )
+            await conn.commit()
+
+    async def load_pending(self) -> list[PendingRow]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, trigger_tg_message_id, user_id, trigger, due_at, created_at, done_at "
+            "FROM pending_replies WHERE done_at IS NULL ORDER BY due_at, id"
+        )
+        rows = await cursor.fetchall()
+        return [
+            PendingRow(
+                id=row["id"],
+                trigger_tg_message_id=row["trigger_tg_message_id"],
+                user_id=row["user_id"],
+                trigger=row["trigger"],
+                due_at=row["due_at"],
+                created_at=row["created_at"],
+                done_at=row["done_at"],
+            )
+            for row in rows
+        ]
+
+    async def night_unanswered(self) -> list[NightRow]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, tg_message_id, user_id, display_name, text, created_at, answered_at "
+            "FROM night_queue WHERE answered_at IS NULL ORDER BY created_at, id"
+        )
+        rows = await cursor.fetchall()
+        return [
+            NightRow(
+                id=row["id"],
+                tg_message_id=row["tg_message_id"],
+                user_id=row["user_id"],
+                display_name=row["display_name"],
+                text=row["text"],
+                created_at=row["created_at"],
+                answered_at=row["answered_at"],
+            )
+            for row in rows
+        ]
+
+    async def mark_night_answered(self, ids: Sequence[int], answered_at: int) -> None:
+        if not ids:
+            return
+        conn = self._require_conn()
+        async with self._write_lock:
+            placeholders = ",".join("?" for _ in ids)
+            await conn.execute(
+                f"UPDATE night_queue SET answered_at = ? WHERE id IN ({placeholders})",
+                (answered_at, *ids),
+            )
+            await conn.commit()
+
+    async def messages_after(self, chat_id: int, tg_message_id: int) -> int:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM messages "
+            "WHERE chat_id = ? AND tg_message_id > ? AND is_bot = 0",
+            (chat_id, tg_message_id),
+        )
+        row = await cursor.fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
+    async def last_message_at(self, chat_id: int) -> int | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT MAX(created_at) AS max_created_at FROM messages "
+            "WHERE chat_id = ? AND is_bot = 0",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None or row["max_created_at"] is None:
+            return None
+        return int(row["max_created_at"])

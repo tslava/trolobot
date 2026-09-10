@@ -627,3 +627,358 @@ async def test_filter_log_summary_sorted_by_count_desc_then_reason(tmp_path: Pat
         ]
     finally:
         await db.close()
+
+
+async def test_insert_bot_reply_returns_rowid_and_stores_fields(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        row_id = await db.insert_bot_reply(
+            tg_message_id=100,
+            reply_to_tg_message_id=42,
+            trigger="mention",
+            trigger_tg_message_id=42,
+            text="привет",
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=5,
+            created_at=1000,
+        )
+        assert row_id > 0
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT tg_message_id, reply_to_tg_message_id, trigger, trigger_tg_message_id, "
+            "text, prompt_version, few_shot_version, delay_sec, created_at "
+            "FROM bot_replies WHERE id = ?",
+            (row_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert dict(row) == {
+            "tg_message_id": 100,
+            "reply_to_tg_message_id": 42,
+            "trigger": "mention",
+            "trigger_tg_message_id": 42,
+            "text": "привет",
+            "prompt_version": 1,
+            "few_shot_version": 1,
+            "delay_sec": 5,
+            "created_at": 1000,
+        }
+    finally:
+        await db.close()
+
+
+async def test_recent_bot_replies_chronological_order_and_limit(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        for i in range(5):
+            await db.insert_bot_reply(
+                tg_message_id=i,
+                reply_to_tg_message_id=None,
+                trigger="ambient",
+                trigger_tg_message_id=None,
+                text=f"reply-{i}",
+                prompt_version=1,
+                few_shot_version=1,
+                delay_sec=0,
+                created_at=1000 + i,
+            )
+
+        replies = await db.recent_bot_replies(3)
+        assert replies == ["reply-2", "reply-3", "reply-4"]
+
+        all_replies = await db.recent_bot_replies(100)
+        assert all_replies == [f"reply-{i}" for i in range(5)]
+    finally:
+        await db.close()
+
+
+async def test_increment_state_default_and_accumulation(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.get_state("mention_count:2026-01-01") is None
+
+        first = await db.increment_state("mention_count:2026-01-01")
+        assert first == 1
+        assert await db.get_state("mention_count:2026-01-01") == "1"
+
+        second = await db.increment_state("mention_count:2026-01-01", by=4)
+        assert second == 5
+        assert await db.get_state("mention_count:2026-01-01") == "5"
+    finally:
+        await db.close()
+
+
+async def test_increment_state_concurrent_50_times_gives_exactly_50(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        results = await asyncio.gather(
+            *(db.increment_state("llm_calls:2026-01-01") for _ in range(50))
+        )
+
+        assert sorted(results) == list(range(1, 51))
+        assert await db.get_state("llm_calls:2026-01-01") == "50"
+    finally:
+        await db.close()
+
+
+async def test_add_state_float_accumulates_and_round_trips_parsing(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.get_state("llm_spent_usd:2026-01-01") is None
+
+        first = await db.add_state_float("llm_spent_usd:2026-01-01", 0.1)
+        assert first == pytest.approx(0.1)
+
+        second = await db.add_state_float("llm_spent_usd:2026-01-01", 0.2)
+        assert second == pytest.approx(0.3)
+
+        stored = await db.get_state("llm_spent_usd:2026-01-01")
+        assert stored is not None
+        # Накопленное значение должно оставаться парсибельным float() без исключений,
+        # даже когда сумма даёт длинную дробь (0.1 + 0.2 != 0.3 в двоичной арифметике).
+        assert float(stored) == pytest.approx(second)
+    finally:
+        await db.close()
+
+
+async def test_insert_pending_update_and_mark_done(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=10,
+            user_id=1,
+            trigger="mention",
+            due_at=2000,
+            created_at=1000,
+        )
+        assert pending_id > 0
+
+        await db.update_pending_due(pending_id, 2500)
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT due_at, done_at FROM pending_replies WHERE id = ?", (pending_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["due_at"] == 2500
+        assert row["done_at"] is None
+
+        await db.mark_pending_done(pending_id, 3000)
+        cursor = await conn.execute(
+            "SELECT done_at FROM pending_replies WHERE id = ?", (pending_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["done_at"] == 3000
+    finally:
+        await db.close()
+
+
+async def test_load_pending_excludes_done_and_orders_by_due_at(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        done_id = await db.insert_pending(
+            trigger_tg_message_id=1, user_id=1, trigger="mention", due_at=1500, created_at=1000
+        )
+        await db.mark_pending_done(done_id, 1600)
+
+        later_id = await db.insert_pending(
+            trigger_tg_message_id=2, user_id=1, trigger="reply", due_at=3000, created_at=1000
+        )
+        earlier_id = await db.insert_pending(
+            trigger_tg_message_id=3, user_id=1, trigger="name", due_at=2000, created_at=1000
+        )
+
+        pending = await db.load_pending()
+        assert [p.id for p in pending] == [earlier_id, later_id]
+        assert all(p.done_at is None for p in pending)
+        assert pending[0].trigger == "name"
+        assert pending[0].due_at == 2000
+    finally:
+        await db.close()
+
+
+async def test_night_unanswered_orders_by_created_at_and_excludes_answered(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        answered_id = await db.enqueue_night(
+            tg_message_id=1, user_id=1, display_name="A", text="answered", created_at=900
+        )
+        await db.mark_night_answered([answered_id], 950)
+
+        later_id = await db.enqueue_night(
+            tg_message_id=2, user_id=2, display_name="B", text="later", created_at=2000
+        )
+        earlier_id = await db.enqueue_night(
+            tg_message_id=3, user_id=3, display_name="C", text="earlier", created_at=1000
+        )
+
+        unanswered = await db.night_unanswered()
+        assert [row.id for row in unanswered] == [earlier_id, later_id]
+        assert all(row.answered_at is None for row in unanswered)
+        assert unanswered[0].text == "earlier"
+    finally:
+        await db.close()
+
+
+async def test_mark_night_answered_batch_update(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        id_a = await db.enqueue_night(
+            tg_message_id=1, user_id=1, display_name="A", text="a", created_at=1000
+        )
+        id_b = await db.enqueue_night(
+            tg_message_id=2, user_id=2, display_name="B", text="b", created_at=1001
+        )
+        id_c = await db.enqueue_night(
+            tg_message_id=3, user_id=3, display_name="C", text="c", created_at=1002
+        )
+
+        await db.mark_night_answered([id_a, id_b], 2000)
+
+        remaining = await db.night_unanswered()
+        assert [row.id for row in remaining] == [id_c]
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute("SELECT id, answered_at FROM night_queue ORDER BY id")
+        rows = {row["id"]: row["answered_at"] for row in await cursor.fetchall()}
+        assert rows == {id_a: 2000, id_b: 2000, id_c: None}
+    finally:
+        await db.close()
+
+
+async def test_mark_night_answered_empty_list_is_noop(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        row_id = await db.enqueue_night(
+            tg_message_id=1, user_id=1, display_name="A", text="a", created_at=1000
+        )
+
+        await db.mark_night_answered([], 2000)
+
+        unanswered = await db.night_unanswered()
+        assert [row.id for row in unanswered] == [row_id]
+        assert unanswered[0].answered_at is None
+    finally:
+        await db.close()
+
+
+async def test_messages_after_counts_only_after_id_and_excludes_bot(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_message(
+            tg_message_id=10,
+            chat_id=1,
+            user_id=1,
+            display_name="A",
+            text="before",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1000,
+        )
+        await db.insert_message(
+            tg_message_id=20,
+            chat_id=1,
+            user_id=2,
+            display_name="B",
+            text="after-human",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1001,
+        )
+        await db.insert_message(
+            tg_message_id=21,
+            chat_id=1,
+            user_id=99,
+            display_name="Bot",
+            text="after-bot",
+            reply_to_tg_message_id=None,
+            is_bot=True,
+            created_at=1002,
+        )
+        # другой чат не должен считаться
+        await db.insert_message(
+            tg_message_id=30,
+            chat_id=2,
+            user_id=3,
+            display_name="C",
+            text="other chat",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1003,
+        )
+
+        assert await db.messages_after(1, 10) == 1
+        assert await db.messages_after(1, 20) == 0
+        assert await db.messages_after(1, 0) == 2
+    finally:
+        await db.close()
+
+
+async def test_last_message_at_ignores_bot_and_other_chats(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.last_message_at(1) is None
+
+        await db.insert_message(
+            tg_message_id=1,
+            chat_id=1,
+            user_id=1,
+            display_name="A",
+            text="first",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1000,
+        )
+        await db.insert_message(
+            tg_message_id=2,
+            chat_id=1,
+            user_id=99,
+            display_name="Bot",
+            text="later-bot",
+            reply_to_tg_message_id=None,
+            is_bot=True,
+            created_at=5000,
+        )
+        await db.insert_message(
+            tg_message_id=3,
+            chat_id=1,
+            user_id=2,
+            display_name="B",
+            text="second",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=2000,
+        )
+        await db.insert_message(
+            tg_message_id=4,
+            chat_id=2,
+            user_id=3,
+            display_name="C",
+            text="other chat, later",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=9000,
+        )
+
+        assert await db.last_message_at(1) == 2000
+    finally:
+        await db.close()
