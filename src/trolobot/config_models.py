@@ -95,9 +95,12 @@ class BehaviourConfig(BaseModel):
 
     spontaneous: SpontaneousConfig = Field(default_factory=SpontaneousConfig)
 
-    mention_cooldown_sec: int = Field(default=180, ge=0, le=86400)
-    mention_chat_cooldown_sec: int = Field(default=300, ge=0, le=86400)
-    mention_daily_cap: int = Field(default=20, ge=0, le=200)
+    # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает
+    # ответ, кулдаун только сдвигает due_at на этапе responder (earliest).
+    mention_cooldown_sec: int = Field(default=60, ge=0, le=86400)
+    mention_chat_cooldown_sec: int = Field(default=90, ge=0, le=86400)
+    # Пока ребята наигрываются; потом снизить.
+    mention_daily_cap: int = Field(default=50, ge=0, le=200)
     reply_as_reply_after_sec: int = Field(default=300, ge=0, le=86400)
 
     debounce_sec: tuple[int, int] = (3, 7)
@@ -150,7 +153,9 @@ class LlmConfig(BaseModel):
     judge_model: str = "openai/gpt-5.4-nano"
     timeout_sec: int = Field(default=30, ge=1, le=120)
     max_tokens: int = Field(default=200, ge=1, le=4000)
-    daily_calls_cap: int = Field(default=60, ge=0, le=1000)
+    # 50 обращений + 3 ambient + утро + "просто так" ≈ 55 основных вызовов и
+    # столько же судьи ≈ 110, потолок 150 с запасом.
+    daily_calls_cap: int = Field(default=150, ge=0, le=1000)
     daily_budget_usd: float = Field(default=2.0, ge=0.0, le=1000.0)
     circuit_errors: int = Field(default=5, ge=1, le=100)
     circuit_pause_min: int = Field(default=30, ge=0, le=1440)

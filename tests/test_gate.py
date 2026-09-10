@@ -369,42 +369,31 @@ def test_address_mention_cap_boundary_pass() -> None:
     assert decision.reason == "pass:name"
 
 
-def test_address_mention_chat_cooldown_drops() -> None:
+def test_address_passes_with_active_chat_cooldown() -> None:
+    # Решение владельца: прямое обращение никогда не отбрасывается кулдауном —
+    # кулдаун по чату сдвигает ответ (этап 3, responder.py), гейт его не проверяет.
     cfg = make_cfg(mention_chat_cooldown_sec=300)
     state = make_state(last_mention_reply_at=DAY - 100)
-    decision = default_call(msg=make_msg(text="Федя, привет"), state=state, cfg=cfg)
-    assert decision.verdict == Verdict.DROP
-    assert decision.reason == "gate:mention_chat_cooldown"
-
-
-def test_address_mention_chat_cooldown_expired_passes() -> None:
-    cfg = make_cfg(mention_chat_cooldown_sec=300)
-    state = make_state(last_mention_reply_at=DAY - 300)  # ровно на границе -> не блокирует
     decision = default_call(msg=make_msg(text="Федя, привет"), state=state, cfg=cfg)
     assert decision.verdict == Verdict.PASS
     assert decision.reason == "pass:name"
 
 
-def test_address_mention_user_cooldown_drops() -> None:
+def test_address_passes_with_active_user_cooldown() -> None:
+    # Аналогично для кулдауна по человеку (mention_cooldown_sec).
     cfg = make_cfg(mention_cooldown_sec=180)
     state = make_state(last_mention_reply_at_user=DAY - 50)
     decision = default_call(msg=make_msg(text="Федя, привет"), state=state, cfg=cfg)
-    assert decision.verdict == Verdict.DROP
-    assert decision.reason == "gate:mention_user_cooldown"
-
-
-def test_address_mention_user_cooldown_expired_passes() -> None:
-    cfg = make_cfg(mention_cooldown_sec=180)
-    state = make_state(last_mention_reply_at_user=DAY - 180)  # граница -> не блокирует
-    decision = default_call(msg=make_msg(text="Федя, привет"), state=state, cfg=cfg)
     assert decision.verdict == Verdict.PASS
+    assert decision.reason == "pass:name"
 
 
-def test_address_chat_cooldown_checked_before_user_cooldown() -> None:
+def test_address_passes_with_both_cooldowns_active() -> None:
     cfg = make_cfg(mention_chat_cooldown_sec=300, mention_cooldown_sec=180)
     state = make_state(last_mention_reply_at=DAY - 100, last_mention_reply_at_user=DAY - 50)
     decision = default_call(msg=make_msg(text="Федя, привет"), state=state, cfg=cfg)
-    assert decision.reason == "gate:mention_chat_cooldown"
+    assert decision.verdict == Verdict.PASS
+    assert decision.reason == "pass:name"
 
 
 # ---------------------------------------------------------------------------

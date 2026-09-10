@@ -176,8 +176,11 @@ def should_consider(msg: GateMessage, state: GateState, cfg: Config, patterns: P
                     now: int, rng: random.Random) -> Decision
 # Причины: gate:is_bot, gate:panic, gate:stop, gate:muted, gate:topic (+ StateChange topic_cooldown_until),
 # gate:topic_cooldown, gate:injection, gate:night_queued (verdict QUEUE_NIGHT), gate:mention_cap,
-# gate:mention_chat_cooldown, gate:mention_user_cooldown, gate:night, gate:logistics, gate:not_live,
-# gate:ambient_cap, gate:ambient_cooldown, gate:dice; pass:mention / pass:reply / pass:name / pass:ambient.
+# gate:night, gate:logistics, gate:not_live, gate:ambient_cap, gate:ambient_cooldown, gate:dice;
+# pass:mention / pass:reply / pass:name / pass:ambient.
+# Прямое обращение (шаг 6) никогда не дропается кулдауном (mention_chat_cooldown_sec/mention_cooldown_sec) —
+# решение владельца: только ночь и mention_daily_cap могут его остановить, кулдаун сдвигает due_at
+# на этапе 3 (responder.py), не проверяется гейтом вовсе.
 # Приоритет триггера обращения: reply > mention > name. Счётчики (mention_count, ambient_count) гейт НЕ меняет —
 # их инкрементит отправка (этап 3). Единственный StateChange гейта — topic_cooldown_until.
 # Живой разговор: len(state.recent) >= min_messages и len({r.user_id}) >= min_people; recent уже отфильтрован
@@ -295,9 +298,13 @@ class Responder:
                  chat_id: int, bot_user_id: int, clock: Callable[[], int] = lambda: int(time.time()))
     async def on_gate_pass(self, msg: GateMessage, trigger: Trigger, display_name: str) -> None
     # AMBIENT: дебаунс (один asyncio.Task на чат; новый PASS в окне — сброс таймера) → _respond(trigger=ambient, delay 0).
-    # Обращение: если есть pending для чата с done_at NULL — схлопывание: update_pending_due(now + fast_delay), новый
-    # триггер не создаёт вторую задачу; иначе insert_pending(due = now + pick_delay(urgent=patterns.urgent(text)))
-    # и asyncio-таймер. Дебаунс для обращений тоже применяется до постановки задержки (3–7 с).
+    # Обращение: earliest = max(last_mention_reply_at + mention_chat_cooldown_sec, last_mention_reply_at:<user> +
+    # mention_cooldown_sec) по значениям из state (None → 0) — гейт кулдаун уже не проверяет (решение владельца:
+    # обращение никогда не отбрасывается кулдауном), сдвиг делает responder. Если есть pending для чата с
+    # done_at NULL — схлопывание: update_pending_due(max(now + fast_delay, earliest + randint(5,30))), новый
+    # триггер не создаёт вторую задачу; иначе insert_pending(due = max(now + pick_delay(urgent=patterns.urgent(text)),
+    # earliest + randint(5,30))) и asyncio-таймер; сдвиг из-за кулдауна — лог INFO "mention delayed by cooldown until".
+    # Дебаунс для обращений тоже применяется до постановки задержки (3–7 с).
     async def _fire_pending(self, row: PendingRow) -> None
     # В момент due: если in_window(quiet) → перенести в night_queue (enqueue_night) и mark_pending_done, filter_log send:night;
     # перепроверка детерминированных шагов гейта (panic/stop/muted/topic_cooldown/mention caps) через load_gate_state +

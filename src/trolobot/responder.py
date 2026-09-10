@@ -272,10 +272,12 @@ class Responder:
 
         cfg = self.cfg_getter()
         now = self._clock()
+        earliest = await self._mention_earliest_due(cfg, msg.user_id, now)
         pending_rows = await self.db.load_pending()
         if pending_rows:
             pending = pending_rows[0]
             new_due = now + fast_delay(cfg.behaviour, self.rng)
+            new_due = self._apply_cooldown_floor(new_due, earliest)
             await self.db.update_pending_due(pending.id, new_due)
             self._pending_info[pending.id] = (msg.text, display_name)
             row = PendingRow(
@@ -291,6 +293,7 @@ class Responder:
         else:
             urgent = self.patterns_getter().urgent(msg.text)
             due = now + pick_delay(cfg.behaviour, self.rng, urgent=urgent)
+            due = self._apply_cooldown_floor(due, earliest)
             pending_id = await self.db.insert_pending(
                 trigger_tg_message_id=msg.tg_message_id,
                 user_id=msg.user_id,
@@ -309,6 +312,32 @@ class Responder:
                 done_at=None,
             )
             self._schedule_pending_timer(row, due)
+
+    async def _mention_earliest_due(self, cfg: Config, user_id: int, now: int) -> int:
+        """Кулдаун обращения превращён в задержку, не в отказ (решение владельца,
+        CLAUDE.md/PLAN.md этап 3): гейт (шаг 6) больше не дропает по кулдауну, вместо
+        этого ответ на обращение не может уйти раньше ``earliest`` — максимума из
+        кулдауна по чату и кулдауна по автору. Значения last_*_at читаются из state
+        напрямую (по образцу ``_recheck_ambient_budget``); отсутствующее -> 0, что на
+        шкале unix-времени всегда меньше ``now`` и поэтому не сдвигает ничего."""
+        behaviour = cfg.behaviour
+        last_chat_raw = await self.db.get_state("last_mention_reply_at")
+        last_chat = int(last_chat_raw) if last_chat_raw is not None else 0
+        last_user_raw = await self.db.get_state(f"last_mention_reply_at:{user_id}")
+        last_user = int(last_user_raw) if last_user_raw is not None else 0
+        return max(
+            last_chat + behaviour.mention_chat_cooldown_sec,
+            last_user + behaviour.mention_cooldown_sec,
+        )
+
+    def _apply_cooldown_floor(self, due: int, earliest: int) -> int:
+        """due, не раньше earliest; если пришлось сдвинуть — небольшой случайный
+        разброс сверху earliest (5-30с), чтобы все сдвинутые ответы не били в одну
+        секунду, и лог INFO про сдвиг."""
+        if due < earliest:
+            due = earliest + self.rng.randint(5, 30)
+            logger.info("mention delayed by cooldown until %s", due)
+        return due
 
     # ------------------------------------------------------------------ #
     # Таймер и срабатывание pending.
@@ -417,13 +446,11 @@ class Responder:
         Кубик (п.11) и живой разговор (п.9) намеренно не перепроверяются — иначе
         перепроверка срезала бы большинство уже одобренных ambient-реплик.
 
-        mention_chat_cooldown/mention_user_cooldown (гейт, шаг 6) тоже намеренно не
-        перепроверяются здесь: схлопывание в _handle_debounced гарантирует, что на
-        чат в любой момент живёт не более одного pending-обращения (второй PASS
-        сдвигает due_at того же pending, а не создаёт второй), а last_mention_reply_at
-        меняет только этот же _respond после отправки — то есть пока этот pending
-        не сработал, ни last_mention_reply_at, ни last_mention_reply_at:<user> измениться
-        не могли.
+        Кулдаун обращения (по чату и по человеку) не перепроверяется здесь — гейт
+        (шаг 6) его вообще не проверяет: решение владельца сделало кулдаун задержкой,
+        а не отказом. По построению due_at этого pending уже не раньше earliest
+        (см. _mention_earliest_due/_apply_cooldown_floor в _handle_debounced_inner),
+        так что к моменту срабатывания кулдаун уже не может быть нарушен.
         """
         synthetic = GateMessage(
             chat_id=self.chat_id,

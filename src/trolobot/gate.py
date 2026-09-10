@@ -14,9 +14,13 @@
 6.  прямое обращение (reply > mention > name):
     ночь                                     -> QUEUE_NIGHT ``gate:night_queued``
     дневной лимит обращений                  -> DROP ``gate:mention_cap``
-    кулдаун чата                             -> DROP ``gate:mention_chat_cooldown``
-    кулдаун автора                           -> DROP ``gate:mention_user_cooldown``
     иначе                                    -> PASS ``pass:<trigger>``
+
+    Прямое обращение никогда не отбрасывается кулдауном (решение владельца):
+    кулдаун по чату и по человеку (``mention_chat_cooldown_sec``/``mention_cooldown_sec``)
+    здесь не проверяется вовсе — гейт всегда пропускает обращение дальше, а
+    сам кулдаун превращается в задержку ответа на этапе 3 (``responder.py``,
+    ``earliest`` в постановке/схлопывании pending).
 7.  ночь (без обращения)                     -> DROP ``gate:night``
 8.  логистика                                -> DROP ``gate:logistics``
 9.  не живой разговор                        -> DROP ``gate:not_live``
@@ -73,22 +77,18 @@ def _direct_address_decision(
     now: int,
     trigger: Trigger,
 ) -> Decision:
-    """Шаг 6: свой бюджет для прямого обращения, логистика и live-talk его не касаются."""
+    """Шаг 6: свой бюджет для прямого обращения, логистика и live-talk его не касаются.
+
+    Кулдаун по чату (``mention_chat_cooldown_sec``) и по человеку
+    (``mention_cooldown_sec``) сюда больше не заходит: решение владельца — прямое
+    обращение никогда не отбрасывается кулдауном, только дневной потолок и ночь.
+    Кулдаун сдвигает момент ответа, а не отменяет его — это делает ``responder.py``
+    (``earliest`` при постановке/схлопывании pending)."""
     behaviour = cfg.behaviour
     if in_window(now, cfg.persona.timezone, behaviour.quiet_window):
         return Decision(verdict=Verdict.QUEUE_NIGHT, trigger=trigger, reason="gate:night_queued")
     if state.mention_count_today >= behaviour.mention_daily_cap:
         return _drop("gate:mention_cap")
-    if (
-        state.last_mention_reply_at is not None
-        and state.last_mention_reply_at + behaviour.mention_chat_cooldown_sec > now
-    ):
-        return _drop("gate:mention_chat_cooldown")
-    if (
-        state.last_mention_reply_at_user is not None
-        and state.last_mention_reply_at_user + behaviour.mention_cooldown_sec > now
-    ):
-        return _drop("gate:mention_user_cooldown")
     return Decision(verdict=Verdict.PASS, trigger=trigger, reason=f"pass:{trigger.value}")
 
 

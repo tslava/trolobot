@@ -217,6 +217,23 @@ class FixedRandom:
         return self._value
 
 
+class MinRandom:
+    """Подделка random.Random, детерминированно отдающая минимум диапазона: .random()
+    -> 0.0 (всегда первый, самый быстрый бакет задержки), .randint(lo, hi) -> lo,
+    .uniform(lo, hi) -> lo. Нужна тестам кулдауна-как-задержки (earliest), чтобы
+    базовая (без сдвига) задержка была минимально возможной и надёжно проверяла
+    срабатывание/несрабатывание сдвига due_at."""
+
+    def random(self) -> float:
+        return 0.0
+
+    def randint(self, lo: int, hi: int) -> int:
+        return lo
+
+    def uniform(self, lo: float, hi: float) -> float:
+        return lo
+
+
 class FakePromptStore:
     """Подделка stores.PromptStore: подмена системного промпта/few-shot и их версий.
 
@@ -259,7 +276,7 @@ def _make_responder(
     clock: FakeClock,
     *,
     seed: int = 0,
-    rng: random.Random | FixedRandom | None = None,
+    rng: random.Random | FixedRandom | MinRandom | None = None,
     judge: Judge | None = None,
     prompt_store: FakePromptStore | None = None,
 ) -> Responder:
@@ -458,6 +475,122 @@ async def test_second_mention_collapses_pending_without_duplicate(db: Database) 
         assert pending_after_2[0].due_at - (DAY_NOW + 2) <= fast_hi
         assert responder._pending_tasks[pending_id] is not task1  # старый таймер заменён
 
+        assert calls == []  # генерация ещё не случилась
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 3b. Кулдаун обращения (решение владельца) не отбрасывает ответ, а сдвигает ---
+# --- due_at не раньше earliest = max(last_mention_reply_at + chat_cooldown, ---
+# --- last_mention_reply_at:<user> + user_cooldown). ---
+
+
+async def test_mention_without_active_cooldown_uses_normal_bucket_delay(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        # Нет ни last_mention_reply_at, ни last_mention_reply_at:<user> — earliest
+        # мал (0 + cooldown), due не сдвигается, задержка как обычно (первый бакет).
+        msg = _gate_message(tg_message_id=10, user_id=5, text="фёдор, как сам?", created_at=DAY_NOW)
+        await responder.on_gate_pass(msg, Trigger.NAME, "Дима")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        rows = await db.load_pending()
+        assert len(rows) == 1
+        fast_lo = cfg.behaviour.reply_delay_buckets[0].range_sec[0]
+        assert rows[0].due_at - rows[0].created_at == fast_lo
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_second_mention_after_reply_delayed_until_chat_cooldown_elapses(
+    db: Database,
+) -> None:
+    """Второе обращение через 20с после отправленного ответа при активном
+    mention_chat_cooldown_sec=90: новый pending получает due >= last_reply_at + 90
+    (а не обычную короткую задержку), и при срабатывании ответ всё равно
+    отправляется — кулдаун больше не отбрасывает обращение, только откладывает."""
+    cfg = _config()
+    assert cfg.behaviour.mention_chat_cooldown_sec == 90
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ1."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        msg1 = _gate_message(tg_message_id=10, user_id=5, text="фёдор, привет", created_at=DAY_NOW)
+        await responder.on_gate_pass(msg1, Trigger.NAME, "Дима")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        pending_rows = await db.load_pending()
+        assert len(pending_rows) == 1
+        pending_id = pending_rows[0].id
+        await clock.run_until(responder._pending_tasks[pending_id])
+
+        assert len(bot.sent) == 1
+        last_reply_raw = await db.get_state("last_mention_reply_at")
+        assert last_reply_raw is not None
+        last_reply_at = int(last_reply_raw)
+
+        # Второе обращение — от другого человека, 20с после отправленного ответа.
+        clock.value = float(last_reply_at + 20)
+        msg2 = _gate_message(
+            tg_message_id=11, user_id=6, text="федя, ты где", created_at=last_reply_at + 20
+        )
+        await responder.on_gate_pass(msg2, Trigger.NAME, "Оля")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        pending_rows_2 = await db.load_pending()
+        assert len(pending_rows_2) == 1
+        assert pending_rows_2[0].due_at >= last_reply_at + cfg.behaviour.mention_chat_cooldown_sec
+
+        task2 = responder._pending_tasks[pending_rows_2[0].id]
+        await clock.run_until(task2)
+        assert len(bot.sent) == 2  # кулдаун отложил, но не отбросил
+        assert len(calls) == 2
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_collapse_does_not_move_due_earlier_than_cooldown_floor(db: Database) -> None:
+    """Схлопывание (update_pending_due) тоже подчиняется earliest: даже быстрый
+    бакет не может утащить due_at раньше конца активного кулдауна по чату."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        # Симулируем недавний ответ на обращение — кулдаун по чату ещё активен.
+        await db.set_state("last_mention_reply_at", str(DAY_NOW - 10))
+        earliest = DAY_NOW - 10 + cfg.behaviour.mention_chat_cooldown_sec
+
+        msg1 = _gate_message(tg_message_id=20, user_id=5, text="фёдор, ты тут?", created_at=DAY_NOW)
+        await responder._handle_debounced(Trigger.NAME, msg1, "Дима")
+
+        pending_after_1 = await db.load_pending()
+        assert len(pending_after_1) == 1
+        pending_id = pending_after_1[0].id
+        assert pending_after_1[0].due_at >= earliest
+
+        msg2 = _gate_message(
+            tg_message_id=21, user_id=6, text="федя, ты где", created_at=DAY_NOW + 2
+        )
+        await responder._handle_debounced(Trigger.NAME, msg2, "Оля")
+
+        pending_after_2 = await db.load_pending()
+        assert len(pending_after_2) == 1
+        assert pending_after_2[0].id == pending_id  # схлопнулось, не вторая задача
+        assert pending_after_2[0].due_at >= earliest
         assert calls == []  # генерация ещё не случилась
     finally:
         await responder.shutdown()
