@@ -1,0 +1,129 @@
+"""load_config: реальный config.yaml, overrides, ошибки, возраст."""
+
+from datetime import date
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from trolobot.config import flatten_config, load_config
+from trolobot.config_models import BehaviourConfig, Config, ReplyDelayBucket
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = REPO_ROOT / "config.yaml"
+
+
+def test_load_real_config_without_errors() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    assert isinstance(cfg, Config)
+    assert cfg.persona.name == "Фёдор"
+    assert cfg.persona.display_name == "Отец Фёдор"
+    assert cfg.behaviour.daily_cap == 3
+    assert cfg.filters.shadow is True
+    assert "Lidl" in cfg.filters.places_whitelist
+
+
+def test_config_builds_with_defaults_without_yaml() -> None:
+    cfg = Config()
+
+    assert cfg.persona.birth_date == date(1974, 4, 12)
+    assert cfg.behaviour.ambient_probability == 0.15
+
+
+def test_override_changes_value_and_coerces_int() -> None:
+    cfg = load_config(CONFIG_PATH, {"behaviour.daily_cap": "7"})
+
+    assert cfg.behaviour.daily_cap == 7
+    assert isinstance(cfg.behaviour.daily_cap, int)
+
+
+def test_override_coerces_float() -> None:
+    cfg = load_config(CONFIG_PATH, {"behaviour.ambient_probability": "0.42"})
+
+    assert cfg.behaviour.ambient_probability == pytest.approx(0.42)
+
+
+def test_override_bool_and_list() -> None:
+    cfg = load_config(
+        CONFIG_PATH,
+        {
+            "filters.shadow": "false",
+            "persona.name_triggers": "[федя, дед]",
+        },
+    )
+
+    assert cfg.filters.shadow is False
+    assert cfg.persona.name_triggers == ["федя", "дед"]
+
+
+def test_nested_override() -> None:
+    cfg = load_config(CONFIG_PATH, {"behaviour.live_talk.min_people": "5"})
+
+    assert cfg.behaviour.live_talk.min_people == 5
+
+
+def test_invalid_override_value_raises_value_error_with_key() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        load_config(CONFIG_PATH, {"behaviour.daily_cap": "not-a-number"})
+
+    assert "behaviour.daily_cap" in str(exc_info.value)
+
+
+def test_invalid_override_out_of_range_raises() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        load_config(CONFIG_PATH, {"behaviour.ambient_probability": "2.5"})
+
+    assert "behaviour.ambient_probability" in str(exc_info.value)
+
+
+def test_unknown_override_key_raises_value_error_with_key() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        load_config(CONFIG_PATH, {"behaviour.no_such_key": "1"})
+
+    assert "behaviour.no_such_key" in str(exc_info.value)
+
+
+def test_unknown_override_section_raises() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        load_config(CONFIG_PATH, {"nope.daily_cap": "1"})
+
+    assert "nope.daily_cap" in str(exc_info.value)
+
+
+def test_reply_delay_bucket_weights_must_sum_to_one() -> None:
+    with pytest.raises(ValidationError):
+        BehaviourConfig(
+            reply_delay_buckets=[
+                ReplyDelayBucket(weight=0.5, range_sec=(30, 180)),
+                ReplyDelayBucket(weight=0.2, range_sec=(180, 900)),
+            ]
+        )
+
+
+def test_reply_delay_bucket_weights_within_tolerance_ok() -> None:
+    cfg = BehaviourConfig(
+        reply_delay_buckets=[
+            ReplyDelayBucket(weight=0.61, range_sec=(30, 180)),
+            ReplyDelayBucket(weight=0.3, range_sec=(180, 900)),
+            ReplyDelayBucket(weight=0.09, range_sec=(900, 3600)),
+        ]
+    )
+    assert len(cfg.reply_delay_buckets) == 3
+
+
+def test_persona_age() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    assert cfg.persona.age(date(2026, 9, 10)) == 52
+    assert cfg.persona.age(date(2026, 4, 11)) == 51
+    assert cfg.persona.age(date(2026, 4, 12)) == 52
+
+
+def test_flatten_config_roundtrip_keys() -> None:
+    cfg = load_config(CONFIG_PATH)
+    flat = flatten_config(cfg)
+
+    assert flat["behaviour.daily_cap"] == "3"
+    assert flat["persona.name"] == "Фёдор"
+    assert flat["filters.shadow"] == "true"

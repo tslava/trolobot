@@ -1,0 +1,68 @@
+persona:
+  name: Фёдор
+  display_name: Отец Фёдор     # имя профиля в Telegram
+  name_triggers: [фёдор, федор, федя, федь, отец, отче, батюшка, дед]  # обращение без @
+  birth_date: 1974-04-12      # возраст считается на лету, стареет вместе с чатом
+  arrived_poznan: 2006
+  district: Wilda             # уточнить, он будет его защищать
+  timezone: Europe/Warsaw
+
+behaviour:
+  quiet_window: ["02:00", "07:00"]     # полная тишина, включая прямые обращения
+  morning_reply_window: ["07:00", "08:00"]  # одна реплика всем, кто звал ночью; момент случайный внутри окна
+
+  # ambient — сам заговаривает, только в живой разговор
+  live_talk:                           # что считается живым разговором
+    min_messages: 3
+    min_people: 2
+    window_min: 10
+  ambient_probability: 0.15            # шанс на сообщение внутри живого разговора
+  chat_cooldown_min: 25                # между ambient-репликами
+  daily_cap: 3                         # ambient и «просто так» вместе, в сутки; сутки по timezone
+
+  # просто так — пишет сам, без повода, когда в чате тихо
+  spontaneous:
+    per_week: 2
+    window: ["10:00", "22:00"]
+    min_quiet_hours: 3                 # никто не писал столько часов
+
+  # прямые обращения — отдельный бюджет
+  mention_cooldown_sec: 180            # на человека
+  mention_chat_cooldown_sec: 300       # на чат
+  mention_daily_cap: 20                # обращений в сутки, сверх — молчит
+  reply_as_reply_after_sec: 300        # реплаем, если прошло больше или писали другие
+
+  debounce_sec: [3, 7]                 # копит очередь сообщений перед ответом
+  reply_delay_buckets:                 # задержка ответа на обращение
+    - {weight: 0.6, range_sec: [30, 180]}
+    - {weight: 0.3, range_sec: [180, 900]}
+    - {weight: 0.1, range_sec: [900, 3600]}
+  urgent_max_delay_sec: 180            # если в сообщении «сегодня/сейчас/куда идём»
+  late_reply_threshold_sec: 600        # свыше — можно отыграть паузу в реплике
+  context_window: 30
+  recent_replies_memory: 20
+  topic_cooldown_min: 45               # после срабатывания стоп-листа на входе
+  message_retention_days: 30           # messages и candidate_text старше — удаляются
+
+llm:
+  provider: openrouter                 # OpenAI-совместимый API, ключ в .env
+  main_model: ""                       # id модели в OpenRouter, выбрать на этапе 3
+  judge_model: ""                      # маленькая и дешёвая, этап 4
+  timeout_sec: 30
+  max_tokens: 200
+  # защита бюджета (плюс credit limit на самом ключе в кабинете OpenRouter — без него не выкатывать)
+  daily_calls_cap: 60                  # попыток вызова в сутки, судья считается; худший день ~50
+  daily_budget_usd: 2.0                # по usage.cost из ответа; сверх — молчит до конца суток
+  circuit_errors: 5                    # ошибок подряд → пауза
+  circuit_pause_min: 30
+
+places:
+  min_rating: 4.2
+  min_reviews: 50          # НЕ 100 — порог отсекает как раз его места
+  require_operational: true
+  cache_ttl_days: 30       # раз в месяц перегнать скриптом наполнения
+  max_per_reply: 2
+
+filters:
+  shadow: true              # true = фильтры логируют, но не режут ответ (щадящий старт)
+  places_whitelist: [Lidl, OLX, Biedronka, Żabka, Allegro]  # бытовые бренды, не заведения из раздела 7

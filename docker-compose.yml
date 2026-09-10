@@ -1,0 +1,13 @@
+services:
+  bot:
+    image: ghcr.io/${GHCR_OWNER:-owner}/trolobot:${IMAGE_TAG:-latest}
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
