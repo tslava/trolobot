@@ -176,6 +176,20 @@ class PlacesConfig(BaseModel):
     require_operational: bool = True
     cache_ttl_days: int = Field(default=30, ge=1, le=3650)
     max_per_reply: int = Field(default=2, ge=0, le=20)
+    # Запросы для офлайн-наполнения кэша (places_fill.py, PLAN.md этап 5, п.1).
+    # Дефолт — заготовленные запросы из CLAUDE.md, "Интерфейсы этапа 5".
+    queries: list[str] = Field(
+        default_factory=lambda: [
+            "craft beer pub Poznań",
+            "cichy pub Poznań",
+            "piwo rzemieślnicze Poznań",
+            "pub Wilda Poznań",
+            "pub Jeżyce Poznań",
+            "kawiarnia planszówki Poznań",
+            "restauracja Kórnik",
+            "Puszczykowo bar",
+        ]
+    )
 
 
 _TOPIC_STOP_DEFAULT = [

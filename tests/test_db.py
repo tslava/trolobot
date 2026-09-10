@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from trolobot.db import Database
+from trolobot.db import Database, PlaceRow
 from trolobot.gate_types import StateChange
 
 EXPECTED_TABLES = {
@@ -1388,5 +1388,172 @@ async def test_bot_reply_by_tg_id_found_and_missing(tmp_path: Path) -> None:
         assert row.trigger == "mention"
         assert row.tg_message_id == 555
         assert row.trigger_tg_message_id == 42
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------------------------------- #
+# places (этап 5): upsert_place / places_all / places_names
+# --------------------------------------------------------------------------- #
+
+
+def _place_row(
+    place_id: str,
+    name: str,
+    *,
+    district: str = "Wilda",
+    category: str = "craft",
+    rating: float = 4.6,
+    reviews: int = 100,
+    price_level: int | None = 2,
+    quiet: bool = False,
+    fact: str = "тихо",
+    operational: bool = True,
+    refreshed_at: int = 1_700_000_000,
+) -> PlaceRow:
+    return PlaceRow(
+        place_id=place_id,
+        name=name,
+        district=district,
+        category=category,
+        rating=rating,
+        reviews=reviews,
+        price_level=price_level,
+        quiet=quiet,
+        fact=fact,
+        operational=operational,
+        refreshed_at=refreshed_at,
+    )
+
+
+async def test_upsert_place_inserts_and_updates_by_place_id(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "FARBY", rating=4.8, quiet=True))
+        rows = await db.places_all()
+        assert len(rows) == 1
+        assert rows[0].place_id == "p1"
+        assert rows[0].name == "FARBY"
+        assert rows[0].rating == 4.8
+        assert rows[0].quiet is True
+        assert rows[0].operational is True
+
+        # Тот же place_id -> UPDATE, не второй ряд.
+        await db.upsert_place(_place_row("p1", "FARBY", rating=4.9, quiet=False, fact="дёшево"))
+        rows = await db.places_all()
+        assert len(rows) == 1
+        assert rows[0].rating == 4.9
+        assert rows[0].quiet is False
+        assert rows[0].fact == "дёшево"
+    finally:
+        await db.close()
+
+
+async def test_upsert_place_price_level_none(tmp_path: Path) -> None:
+    """price_level ненадёжен у Google и иногда отсутствует (PLAN.md, этап 5, п.4)."""
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "Piwnica", price_level=None))
+        rows = await db.places_all()
+        assert rows[0].price_level is None
+    finally:
+        await db.close()
+
+
+async def test_places_all_operational_only_default_true(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "Открыто", operational=True))
+        await db.upsert_place(_place_row("p2", "Закрыто", operational=False))
+
+        operational = await db.places_all()
+        assert [r.name for r in operational] == ["Открыто"]
+
+        everything = await db.places_all(operational_only=False)
+        assert {r.name for r in everything} == {"Открыто", "Закрыто"}
+    finally:
+        await db.close()
+
+
+async def test_places_all_ordered_by_name(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "Wściekły Chmiel"))
+        await db.upsert_place(_place_row("p2", "BRO"))
+        await db.upsert_place(_place_row("p3", "Deja Vu"))
+
+        rows = await db.places_all()
+        assert [r.name for r in rows] == ["BRO", "Deja Vu", "Wściekły Chmiel"]
+    finally:
+        await db.close()
+
+
+async def test_places_names_only_operational(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "FARBY", operational=True))
+        await db.upsert_place(_place_row("p2", "Закрытый бар", operational=False))
+
+        assert await db.places_names() == ["FARBY"]
+    finally:
+        await db.close()
+
+
+# --------------------------------------------------------------------------- #
+# mark_places_not_seen (код-ревью, places_fill.py после прогона с Google)
+# --------------------------------------------------------------------------- #
+
+
+async def test_mark_places_not_seen_marks_missing_leaves_seen_and_manual(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "Остался"))
+        await db.upsert_place(_place_row("p2", "Пропал"))
+        await db.upsert_place(_place_row("manual:0:ручное", "Ручное Место"))
+
+        marked = await db.mark_places_not_seen(["p1"], now=2_000_000_000)
+
+        assert marked == 1
+        by_id = {row.place_id: row for row in await db.places_all(operational_only=False)}
+        assert by_id["p1"].operational is True
+        assert by_id["p2"].operational is False
+        assert by_id["p2"].refreshed_at == 2_000_000_000
+        assert by_id["manual:0:ручное"].operational is True
+    finally:
+        await db.close()
+
+
+async def test_mark_places_not_seen_empty_seen_ids_marks_all_non_manual(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "Пропал"))
+        await db.upsert_place(_place_row("manual:0:ручное", "Ручное Место"))
+
+        marked = await db.mark_places_not_seen([], now=2_000_000_000)
+
+        assert marked == 1
+        by_id = {row.place_id: row for row in await db.places_all(operational_only=False)}
+        assert by_id["p1"].operational is False
+        assert by_id["manual:0:ручное"].operational is True
+    finally:
+        await db.close()
+
+
+async def test_mark_places_not_seen_already_not_operational_not_recounted(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_place(_place_row("p1", "Уже закрыто", operational=False))
+
+        marked = await db.mark_places_not_seen([], now=2_000_000_000)
+
+        assert marked == 0
     finally:
         await db.close()

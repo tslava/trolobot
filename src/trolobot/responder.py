@@ -45,6 +45,7 @@ from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
 from trolobot.patterns import Patterns
+from trolobot.places import render_places_block, select_places
 from trolobot.prompt import (
     SITUATION_LATE,
     SITUATION_MORNING,
@@ -67,6 +68,14 @@ _TRIGGER_PRIORITY: dict[Trigger, int] = {
 }
 
 _ADDRESS_TRIGGER_VALUES = (Trigger.MENTION.value, Trigger.REPLY.value, Trigger.NAME.value)
+
+# Заведения подмешиваются только по запросу и только в обращениях (mention/reply/name);
+# ambient/spontaneous/morning никогда не получают блок мест — "не вклиниваться с
+# рекомендацией сам" (PLAN.md, этап 5). Когда запрос сработал, записываемый trigger
+# (bot_replies.trigger / filter_log.reason) подменяется на "places" (CLAUDE.md,
+# "Интерфейсы этапа 5") — бюджет обращений (mention_count/last_mention_reply_at) при
+# этом считается как для исходного trigger_value, is_address не меняется.
+_PLACES_TRIGGER = "places"
 
 _TYPING_ACTION = "typing"
 _TYPING_STEP_SEC = 4.0
@@ -592,13 +601,25 @@ class Responder:
         few_shot = self.prompt_store.few_shot_text()
         age = cfg.persona.age(local_date(now, tz))
 
+        # Заведения: только по запросу в обращении (mention/reply/name), никогда для
+        # ambient/spontaneous/morning ("не вклиниваться с рекомендацией сам").
+        is_address = trigger_value in _ADDRESS_TRIGGER_VALUES
+        places_triggered = is_address and self.patterns_getter().places_request(trigger_text)
+        if places_triggered:
+            place_rows = await self.db.places_all()
+            selected_places = select_places(place_rows, cfg.places, trigger_text, self.rng)
+            places_block = render_places_block(selected_places)
+        else:
+            places_block = ""
+        record_trigger = _PLACES_TRIGGER if places_triggered else trigger_value
+
         messages = build_messages(
             system_prompt,
             age=age,
             few_shot=few_shot,
             context=context,
             recent_replies=recent_replies,
-            places="",
+            places=places_block,
             situation=situation,
         )
 
@@ -636,12 +657,15 @@ class Responder:
         muted_names = list((await self.db.display_names(list(muted_ids))).values())
         participant_names = _unique_participant_names(context_rows)
         bot_names = [cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers]
+        # Всегда (не только для триггера "places") — белый список regex:venue/regex:latin
+        # должен знать реальные заведения независимо от того, спрашивали про них сейчас.
+        places_names = await self.db.places_names()
 
         filter_ctx = FilterContext(
             cfg=cfg,
             recent_replies=filter_recent_replies,
             context_rows=context_rows,
-            places_names=[],
+            places_names=places_names,
             participant_names=participant_names,
             bot_names=bot_names,
             muted_names=muted_names,
@@ -672,7 +696,6 @@ class Responder:
                 logger.info("cut: %s", ", ".join(reasons))
                 return
 
-        is_address = trigger_value in _ADDRESS_TRIGGER_VALUES
         reply_to_message_id: int | None = None
         if is_address and trigger_msg_id is not None:
             after_count = await self.db.messages_after(self.chat_id, trigger_msg_id)
@@ -688,7 +711,7 @@ class Responder:
         await self.db.insert_bot_reply(
             tg_message_id=sent.message_id,
             reply_to_tg_message_id=reply_to_message_id,
-            trigger=trigger_value,
+            trigger=record_trigger,
             trigger_tg_message_id=trigger_msg_id,
             text=reply.text,
             prompt_version=self.prompt_store.prompt_version(),
@@ -716,7 +739,7 @@ class Responder:
             candidate_text=reply.text,
             verdict="pass",
             stage="send",
-            reason=f"send:{trigger_value}",
+            reason=f"send:{record_trigger}",
             shadow=False,
             created_at=now,
         )

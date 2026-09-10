@@ -515,6 +515,68 @@ def build_commands_router(deps: Deps) -> Router
 # роутер команд включается первым. Settings.admin_user_id == 0 → команды владельца отключены, WARNING.
 ```
 
+## Интерфейсы этапа 5 — заведения
+
+Требования — PLAN.md этап 5 целиком (офлайн-наполнение, фильтры, сжатие отзывов в `fact` с валидацией
+и ручным просмотром, `quiet` руками, рантайм: только по запросу, максимум 2 места, модель только
+формулирует, источник не палить) и CHARACTER.md раздел 7 (стартовый список, правило двойного стандарта).
+
+```python
+# db.py — добавить:
+@dataclass class PlaceRow: place_id, name, district, category, rating, reviews, price_level, quiet, fact, operational, refreshed_at
+async def upsert_place(self, row: PlaceRow) -> None
+async def places_all(self, *, operational_only: bool = True) -> list[PlaceRow]
+async def places_names(self) -> list[str]          # для белого списка фильтра (только operational)
+async def mark_places_not_seen(self, seen_ids: Sequence[str], now: int) -> int
+# operational=0, refreshed_at=now для всех place_id вне seen_ids, кроме "manual:*" (--manual-only,
+# Google их не находит никогда). Возвращает число помеченных строк. Зовётся places_fill.py после
+# настоящего прогона с Google (не --dry-run, не --manual-only) — CLAUDE.md ниже, places_fill.py.
+
+# places.py — рантайм, чистые функции
+def select_places(rows: list[PlaceRow], cfg: PlacesConfig, request_text: str, rng: random.Random) -> list[PlaceRow]
+# фильтр: operational, rating >= min_rating, reviews >= min_reviews; если в запросе есть «тихо/спокойно/поговорить/посидеть» —
+# только quiet=1; если упомянут район (Wilda/Вильда, Jeżyce/Ежице, Stare Miasto/старый город/центр, ...) — сначала он;
+# «за город/съездить/природа» — category outskirts; иначе любые. Из подходящих — rng.sample до max_per_reply. Пусто → [].
+def render_places_block(rows: list[PlaceRow]) -> str
+# "Заведения, о которых ты можешь сказать (ты там бывал, других не называешь):\n- <name>, <district>, <category>, <fact>\n..."
+# Пустой список → prompt.PLACES_NONE. Часы работы не выводятся никогда (их нет в PlaceRow).
+def validate_fact(raw: str) -> str | None      # только кириллица, пробелы, запятая, дефис; ≤ 40 символов; иначе None
+
+# places_manual.yaml (корень) — ручные поля, которых Google не знает: по name (без учёта регистра):
+#   - name: Klubokawiarnia LALKA
+#     quiet: true
+#     category: craft | cheap | outskirts | pub
+#     district: Jeżyce            # переопределяет то, что вернул Google, если задано
+# Стартовый список — из CHARACTER.md раздел 7, quiet по таблице.
+
+# places_fill.py — офлайн CLI: `python -m trolobot.places_fill [--dry-run] [--no-llm] [--queries q1;q2] [--manual places_manual.yaml]`
+# Google Places API (New): POST https://places.googleapis.com/v1/places:searchText с заголовками X-Goog-Api-Key и
+# X-Goog-FieldMask (places.id,places.displayName,places.rating,places.userRatingCount,places.priceLevel,places.businessStatus,
+# places.formattedAddress,places.reviews,places.primaryType), тело {"textQuery": q, "languageCode": "pl", "regionCode": "PL",
+# "locationBias": {"circle": {"center": {"latitude": 52.4064, "longitude": 16.9252}, "radius": 15000}}}.
+# Запросы по умолчанию — cfg.places.queries (добавить в PlacesConfig: list[str], дефолт: "craft beer pub Poznań",
+# "cichy pub Poznań", "piwo rzemieślnicze Poznań", "pub Wilda Poznań", "pub Jeżyce Poznań", "kawiarnia planszówki Poznań",
+# "restauracja Kórnik", "Puszczykowo bar"). Фильтр: businessStatus == OPERATIONAL, rating >= min_rating, userRatingCount >= min_reviews.
+# district — из formattedAddress по словарю районов, иначе "Poznań". category — из manual, иначе по тексту отзывов/типа:
+# «cheap/tanio/fair prices» → cheap; Kórnik/Puszczykowo/Strzeszyn в адресе → outskirts; иначе craft/pub по primaryType.
+# fact: отзывы (до 5) → один LLM-вызов (main_model, max_tokens 40): «Сжать в одну характеристику места по-русски, 2–4 слова,
+# только кириллица, без названий и цифр: тихо / шумно по выходным / терраса / дёшево / настолки ...» → validate_fact;
+# None → fact пустой и WARNING. --no-llm → fact пустой. Отзывы в БД НЕ пишутся.
+# quiet — только из manual (иначе 0). Вывод: таблица всех мест «name | district | category | rating/reviews | quiet | fact | статус»
+# и напоминание проверить fact руками; --dry-run — без записи. Ключ — Settings.google_places_key, нет → понятная ошибка.
+# Совпадение с ручной записью (find_manual_override) — по границам слов (CLAUDE.md выше, "код-ревью"), не по подстроке;
+# применённая ручная запись — лог INFO «manual override: <manual name> → <google name>» и статус "manual" в таблице отчёта.
+# После настоящего прогона с Google (не --dry-run, не --manual-only) все place_id, которые были в places, но не
+# встретились в этом прогоне (не в seen), помечаются operational=0 (db.mark_places_not_seen) — кроме "manual:*".
+
+# responder.py — интеграция: если trigger — обращение (mention/reply/name) и patterns.places_request(trigger_text) →
+# rows = select_places(db.places_all(), cfg.places, trigger_text, rng); places_block = render_places_block(rows);
+# trigger в bot_replies/filter_log = "places" (вместо mention/reply/name). Для ambient/spontaneous/morning блок мест не подмешивается
+# никогда («не вклиниваться с рекомендацией сам»). FilterContext.places_names = db.places_names() всегда (для regex:venue).
+
+# tests/test_injections.py — строка про отзыв Google с командой: снять skip, проверить через validate_fact.
+```
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

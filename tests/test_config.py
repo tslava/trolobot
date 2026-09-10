@@ -13,6 +13,7 @@ from trolobot.config_models import (
     Config,
     FiltersConfig,
     LlmConfig,
+    PlacesConfig,
     ReplyDelayBucket,
 )
 
@@ -53,6 +54,17 @@ def test_load_real_config_filters_pattern_lists() -> None:
     assert "Klubokawiarnia LALKA" in cfg.filters.known_places
     assert "działka" in cfg.filters.polish_words
     assert "urząd" in cfg.filters.polish_words
+
+
+def test_load_real_config_places_queries_match_defaults() -> None:
+    # config.yaml дублирует дефолтные queries places_fill.py (CLAUDE.md, "Интерфейсы
+    # этапа 5") — эта проверка ловит расхождение, если один из файлов поправили без другого.
+    cfg = load_config(CONFIG_PATH)
+    default_places = PlacesConfig()
+
+    assert cfg.places.queries == default_places.queries
+    assert "restauracja Kórnik" in cfg.places.queries
+    assert "Puszczykowo bar" in cfg.places.queries
 
 
 def test_config_builds_with_defaults_without_yaml() -> None:

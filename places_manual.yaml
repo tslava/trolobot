@@ -1,0 +1,94 @@
+# Ручные поля для кэша заведений (places_fill.py, CLAUDE.md/PLAN.md этап 5).
+#
+# Google не знает, можно ли где-то поговорить (quiet) и заведения категории
+# определяет ненадёжно (price_level; см. PLAN.md, этап 5, п.4) — эти поля
+# проставляются здесь руками и переопределяют то, что вернул Google.
+#
+# Сопоставление с результатом Google — по полю name: без учёта регистра, точным
+# совпадением с displayName ИЛИ вхождением name в displayName (places_fill.py).
+#
+# category: craft | cheap | outskirts | pub
+# district: переопределяет то, что places_fill.py определил по formattedAddress,
+#           если задано; для --manual-only это единственный источник district.
+#
+# Стартовый список — CHARACTER.md, раздел 7, quiet по таблице.
+
+- name: Piwna Stopa
+  quiet: false
+  category: craft
+  district: Stare Miasto
+
+- name: Dom Piwa
+  quiet: true
+  category: craft
+  district: Stare Miasto
+
+- name: Deja Vu
+  quiet: false
+  category: pub
+  district: Stare Miasto
+
+- name: Jeżycówka
+  quiet: true
+  category: cheap
+  district: Jeżyce
+
+- name: Klubokawiarnia LALKA
+  quiet: true
+  category: pub
+  district: Jeżyce
+
+- name: FARBY
+  quiet: true
+  category: cheap
+  district: Wilda
+
+- name: Piwnica
+  quiet: true
+  category: cheap
+  district: Wilda
+
+- name: Wściekły Chmiel
+  quiet: false
+  category: craft
+  district: Stare Miasto
+
+- name: Lot Chmiela
+  quiet: false
+  category: craft
+  district: Stare Miasto
+
+- name: BRO
+  quiet: true
+  category: craft
+  district: centrum
+
+- name: Ministerstwo Browaru
+  quiet: false
+  category: craft
+  district: Stare Miasto
+
+# Окрестности — «куда съездить и посидеть», не выпить (CHARACTER.md, раздел 7).
+# Google не вернёт эти три записи по названию: имя ниже — заглушка на район,
+# а не название конкретного заведения. ДОБИТЬ РУКАМИ — после первого прогона
+# places_fill.py по запросам "restauracja Kórnik"/"Puszczykowo bar" найти
+# реальные заведения в каждом районе и заменить name на их фактическое
+# название (и убрать эту запись-заглушку, если она больше не нужна).
+
+# ДОБИТЬ РУКАМИ: заменить на реальное заведение в Kórniku.
+- name: Kórnik
+  quiet: true
+  category: outskirts
+  district: Kórnik
+
+# ДОБИТЬ РУКАМИ: заменить на реальное заведение в Puszczykowie.
+- name: Puszczykowo
+  quiet: true
+  category: outskirts
+  district: Puszczykowo
+
+# ДОБИТЬ РУКАМИ: заменить на реальное заведение у Jezioro Strzeszyńskie.
+- name: Jezioro Strzeszyńskie
+  quiet: true
+  category: outskirts
+  district: Strzeszyn

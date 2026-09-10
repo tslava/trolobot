@@ -91,6 +91,28 @@ class VersionRow:
     created_at: int
 
 
+@dataclass(frozen=True, slots=True)
+class PlaceRow:
+    """Одна строка таблицы places (schema.sql, PLAN.md этап 5).
+
+    price_level — из Google, ненадёжен и иногда отсутствует (PLAN.md, п.4),
+    поэтому int | None. quiet и fact проставляются руками/скриптом наполнения
+    (places_fill.py), а не Google — quiet всегда bool.
+    """
+
+    place_id: str
+    name: str
+    district: str
+    category: str
+    rating: float
+    reviews: int
+    price_level: int | None
+    quiet: bool
+    fact: str
+    operational: bool
+    refreshed_at: int
+
+
 def _state_key_date_suffix(key: str) -> str | None:
     """Суффикс после последнего ':' или None, если двоеточия в ключе нет."""
     if ":" not in key:
@@ -914,3 +936,102 @@ class Database:
         cursor = await conn.execute("SELECT body_yaml FROM few_shot_versions")
         rows = await cursor.fetchall()
         return [str(row["body_yaml"]) for row in rows]
+
+    # -- этап 5: заведения ---------------------------------------------------
+
+    async def upsert_place(self, row: PlaceRow) -> None:
+        """UPSERT по place_id (заполнение кэша, places_fill.py — другой агент)."""
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "INSERT INTO places "
+                "(place_id, name, district, category, rating, reviews, price_level, quiet, "
+                "fact, operational, refreshed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(place_id) DO UPDATE SET "
+                "name = excluded.name, district = excluded.district, "
+                "category = excluded.category, rating = excluded.rating, "
+                "reviews = excluded.reviews, price_level = excluded.price_level, "
+                "quiet = excluded.quiet, fact = excluded.fact, "
+                "operational = excluded.operational, refreshed_at = excluded.refreshed_at",
+                (
+                    row.place_id,
+                    row.name,
+                    row.district,
+                    row.category,
+                    row.rating,
+                    row.reviews,
+                    row.price_level,
+                    int(row.quiet),
+                    row.fact,
+                    int(row.operational),
+                    row.refreshed_at,
+                ),
+            )
+            await conn.commit()
+
+    async def places_all(self, *, operational_only: bool = True) -> list[PlaceRow]:
+        """Все заведения, по name. operational_only=True (дефолт) — только рабочие."""
+        conn = self._require_conn()
+        query = (
+            "SELECT place_id, name, district, category, rating, reviews, price_level, "
+            "quiet, fact, operational, refreshed_at FROM places"
+        )
+        params: tuple[object, ...] = ()
+        if operational_only:
+            query += " WHERE operational = ?"
+            params = (1,)
+        query += " ORDER BY name"
+        cursor = await conn.execute(query, params)
+        rows = await cursor.fetchall()
+        return [
+            PlaceRow(
+                place_id=row["place_id"],
+                name=row["name"],
+                district=row["district"],
+                category=row["category"],
+                rating=row["rating"],
+                reviews=row["reviews"],
+                price_level=row["price_level"],
+                quiet=bool(row["quiet"]),
+                fact=row["fact"] or "",
+                operational=bool(row["operational"]),
+                refreshed_at=row["refreshed_at"],
+            )
+            for row in rows
+        ]
+
+    async def places_names(self) -> list[str]:
+        """Названия только рабочих заведений — белый список для filters.py."""
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT name FROM places WHERE operational = 1 ORDER BY name")
+        rows = await cursor.fetchall()
+        return [str(row["name"]) for row in rows]
+
+    async def mark_places_not_seen(self, seen_ids: Sequence[str], now: int) -> int:
+        """После прогона places_fill.py с Google — гасит места, которые были
+        operational, но в этом прогоне не встретились (закрылись, отфильтровались
+        по rating/reviews или просто не попали ни в один запрос): operational=0,
+        refreshed_at=now. Записи ``--manual-only`` (place_id с префиксом "manual:")
+        Google не находит никогда, поэтому они не тронуты независимо от seen_ids.
+        Возвращает число помеченных строк.
+        """
+        conn = self._require_conn()
+        async with self._write_lock:
+            if seen_ids:
+                placeholders = ",".join("?" for _ in seen_ids)
+                query = (
+                    "UPDATE places SET operational = 0, refreshed_at = ? "
+                    f"WHERE operational = 1 AND place_id NOT LIKE 'manual:%' "
+                    f"AND place_id NOT IN ({placeholders})"
+                )
+                params: tuple[object, ...] = (now, *seen_ids)
+            else:
+                query = (
+                    "UPDATE places SET operational = 0, refreshed_at = ? "
+                    "WHERE operational = 1 AND place_id NOT LIKE 'manual:%'"
+                )
+                params = (now,)
+            cursor = await conn.execute(query, params)
+            await conn.commit()
+            return cursor.rowcount

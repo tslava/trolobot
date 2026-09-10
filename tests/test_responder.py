@@ -35,13 +35,13 @@ import pytest
 
 from trolobot import filters as filters_module
 from trolobot.config_models import Config
-from trolobot.db import Database, PendingRow
+from trolobot.db import Database, PendingRow, PlaceRow
 from trolobot.filters import FilterContext, FilterVerdict
 from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
 from trolobot.patterns import Patterns
-from trolobot.prompt import SITUATION_LATE, SITUATION_MORNING
+from trolobot.prompt import PLACES_NONE, SITUATION_LATE, SITUATION_MORNING
 from trolobot.responder import Responder
 from trolobot.timeutil import day_key, in_window
 
@@ -1573,6 +1573,249 @@ async def test_main_model_set_hot_enables_llm_on_next_respond(db: Database) -> N
         assert len(calls) == 1
         assert len(bot.sent) == 1
         assert bot.sent[0][1] == "Бывает."
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 22. Этап 5: заведения — интеграция в _generate_and_send ---
+
+
+def _place_row(
+    place_id: str,
+    name: str,
+    *,
+    district: str = "Wilda",
+    category: str = "craft",
+    rating: float = 4.6,
+    reviews: int = 100,
+    quiet: bool = False,
+    fact: str = "тихо",
+    operational: bool = True,
+) -> PlaceRow:
+    return PlaceRow(
+        place_id=place_id,
+        name=name,
+        district=district,
+        category=category,
+        rating=rating,
+        reviews=reviews,
+        price_level=2,
+        quiet=quiet,
+        fact=fact,
+        operational=operational,
+        refreshed_at=DAY_NOW,
+    )
+
+
+async def test_places_request_in_mention_picks_quiet_place_and_marks_trigger_places(
+    db: Database,
+) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Есть одно место, тихое."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    await db.upsert_place(_place_row("p1", "Тихий Дворик", quiet=True, fact="тихо"))
+    await db.upsert_place(_place_row("p2", "Шумный Бар", quiet=False, fact="шумно"))
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=10,
+                user_id=5,
+                situation="",
+                delay_sec=5,
+                trigger_text="Федя, посоветуй куда сходить тихо",
+            ),
+        )
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "Тихий Дворик" in user_content
+        assert "Шумный Бар" not in user_content
+
+        assert len(bot.sent) == 1
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == "places"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_places_block_absent_for_ambient_even_with_places_request_text(
+    db: Database,
+) -> None:
+    """Ambient/spontaneous/morning никогда не получают блок мест — даже если
+    trigger_text (на ambient обычно пустой, но контракт явный: "никогда") похож
+    на запрос про места."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    await db.upsert_place(_place_row("p1", "Тихий Дворик", quiet=True))
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=11,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, посоветуй куда сходить тихо",
+            ),
+        )
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "Тихий Дворик" not in user_content
+        assert PLACES_NONE in user_content
+
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == Trigger.AMBIENT.value
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_no_places_request_text_keeps_original_trigger_and_places_none(
+    db: Database,
+) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("И тебе привет."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    await db.upsert_place(_place_row("p1", "Тихий Дворик", quiet=True))
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=12,
+                user_id=5,
+                situation="",
+                delay_sec=5,
+                trigger_text="Федя, как сам?",
+            ),
+        )
+
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert PLACES_NONE in user_content
+
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == Trigger.MENTION.value
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_places_request_with_empty_places_table_uses_places_none_and_marks_trigger(
+    db: Database,
+) -> None:
+    """Код-ревью: обращение с places_request, но таблица places пуста -- в
+    user-сообщении всё равно PLACES_NONE (не пустая строка), а trigger в
+    bot_replies остаётся "places" -- запрос был про места, даже если сказать
+    нечего."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Даже не знаю, куда сходить."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=16,
+                user_id=5,
+                situation="",
+                delay_sec=5,
+                trigger_text="Федя, посоветуй куда сходить",
+            ),
+        )
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert PLACES_NONE in user_content
+
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == "places"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_filter_context_places_names_passes_real_place_through_venue_regex(
+    db: Database,
+) -> None:
+    """FilterContext.places_names всегда заполняется из db.places_names() — реальное
+    заведение из таблицы не режется regex:venue, даже когда trigger не про места."""
+    cfg = _config()
+    cfg.filters.shadow = False
+    # "Zielony Kot" намеренно не входит ни в filters.known_places, ни в
+    # filters.places_whitelist по умолчанию — это проверяет именно places_names.
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Был вчера в Zielony Kot."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    await db.upsert_place(_place_row("p1", "Zielony Kot"))
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=13, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Был вчера в Zielony Kot."
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_filter_context_places_names_still_cuts_fabricated_venue(
+    db: Database,
+) -> None:
+    """Выдуманное заведение (не из places, не из known_places/whitelist) режется
+    regex:venue, несмотря на то что places_names теперь непустой список."""
+    cfg = _config()
+    cfg.filters.shadow = False
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Был вчера в Fikcyjny Bar."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    await db.upsert_place(_place_row("p1", "Zielony Kot"))
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=14, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        assert bot.sent == []
+        logs = await db.filter_log_summary(DAY_NOW - 10)
+        assert any(reason == "regex:venue" for reason, _count in logs)
     finally:
         await responder.shutdown()
         await llm.aclose()

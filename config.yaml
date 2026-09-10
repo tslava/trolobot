@@ -65,6 +65,16 @@ places:
   require_operational: true
   cache_ttl_days: 30       # раз в месяц перегнать скриптом наполнения
   max_per_reply: 2
+  # запросы для офлайн-наполнения кэша (places_fill.py), можно переопределить --queries
+  queries:
+    - craft beer pub Poznań
+    - cichy pub Poznań
+    - piwo rzemieślnicze Poznań
+    - pub Wilda Poznań
+    - pub Jeżyce Poznań
+    - kawiarnia planszówki Poznań
+    - restauracja Kórnik
+    - Puszczykowo bar
 
 filters:
   shadow: true              # true = фильтры логируют, но не режут ответ (щадящий старт)
