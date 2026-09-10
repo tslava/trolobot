@@ -104,6 +104,10 @@ def build_router(deps: Deps) -> Router:
         else:
             user_id = user.id
             display_name = sanitize_display_name(user.full_name, user.id, deps.reserved_names)
+            # Имя из невидимых символов или одних эмодзи даёт «Участник N»; если есть
+            # юзернейм — он понятнее и людям в контексте, и модели.
+            if display_name.startswith("Участник ") and user.username:
+                display_name = sanitize_display_name(user.username, user.id, deps.reserved_names)
             is_bot = user.is_bot
 
         if deps.patterns_getter().injection(display_name) is not None:
