@@ -161,11 +161,144 @@ class PlacesConfig(BaseModel):
     max_per_reply: int = Field(default=2, ge=0, le=20)
 
 
+_TOPIC_STOP_DEFAULT = [
+    r"\bвойн[а-я]*",
+    r"\bукраин[а-я]*",
+    r"\bросси[а-я]*",
+    r"\bрф\b",
+    r"\bобстрел[а-я]*",
+    r"\bфронт[а-я]*",
+    r"\bмобилизац[а-я]*",
+    r"\bпутин[а-я]*",
+    r"\bзеленск[а-я]*",
+    r"\bтрамп(а|у|ом|е|ы)?\b",
+    r"\bвыбор(ы|ов|ах|ам)\b",
+    r"\bсанкци[а-я]*",
+    r"\bпис\b",
+    r"\bpis\b",
+    r"\bтуск[а-я]*",
+    r"\bконфедерац[а-я]*",
+    r"\bмигрант[а-я]*",
+    r"\bбеженц[а-я]*",
+    r"\bизраил[а-я]*",
+    r"\bпалестин[а-я]*",
+    r"\bсектор газа",
+    r"\bцерк[а-я]*",
+    r"\bкостёл[а-я]*",
+    r"\bкостел[а-я]*",
+    r"\bаборт[а-я]*",
+    r"\bлгбт\b",
+    r"\bнациз[а-я]*",
+    r"\bфашис[а-я]*",
+]
+
+_INJECTION_MARKERS_DEFAULT = [
+    r"забудь (инструкции|правила|всё)",
+    r"\bигнорируй (все|всё|предыдущ\w*|инструкци\w*|правил\w*)\b",
+    r"\bты теперь (бот|пират|ассистент|помощник|нейросеть|другой человек"
+    r"|другой персонаж|играешь роль)\b",
+    r"системн\w+ промпт",
+    r"повтори за мной",
+    r"скажи дословно",
+    r"напиши слово",
+    r"ignore (previous|all)",
+    r"как языковая модель",
+    r"\bпредставь,? что ты\b",
+    r"\bпритворись\b",
+    r"\bиграй роль\b",
+]
+
+_LOGISTICS_DEFAULT = [
+    r"\b\d{1,2}[:.]\d{2}\b",
+    r"\bв (семь|восемь|девять|десять|шесть|пять|четыре|три|два)\b(?! раз)",
+    r"\bв час\b(?! пик)",
+    r"\bво сколько\b",
+    r"\bкто (идёт|идет|будет|со мной)\b",
+    r"\bя пас\b",
+    r"\bвстречаемся\b",
+    r"\bгде (собираемся|встречаемся)\b",
+    r"\bкто в (пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среду|четверг"
+    r"|пятницу|субботу|воскресенье|выходные)\b",
+    r"\bподтянусь\b",
+    r"\bбуду через\b",
+]
+
+_URGENT_DEFAULT = [
+    r"\bсегодня\b",
+    r"\bсейчас\b",
+    r"\bчерез час\b",
+    r"\bкуда идём\b",
+    r"\bкуда идем\b",
+    r"\bты где\b",
+]
+
+_PLACES_REQUEST_DEFAULT = [
+    r"\bкуда сходить\b",
+    r"\bпосоветуй",
+    r"\bгде посидеть\b",
+    r"\bгде выпить\b",
+    r"\bкакой бар\b",
+    r"\bпаб\b",
+    r"\bпивнух",
+    r"\bкуда съездить\b",
+]
+
+_MODEL_TALK_DEFAULT = [
+    r"языковая модель",
+    r"нейросет\w*",
+    r"инструкци\w*",
+    r"промпт\w*",
+    r"\bИИ\b",
+    r"OpenAI",
+    r"Anthropic",
+    r"OpenRouter",
+]
+
+_ASSISTANT_MARKERS_DEFAULT = [
+    "важно отметить",
+    "стоит учесть",
+    "рекомендую",
+    "могу помочь",
+    "дай знать",
+    "надеюсь это поможет",
+    "во-первых",
+    "конечно!",
+    "отличный вопрос",
+    "если у тебя есть вопросы",
+]
+
+_REGEX_LIST_FIELDS = (
+    "topic_stop",
+    "injection_markers",
+    "logistics",
+    "urgent",
+    "places_request",
+    "model_talk",
+)
+
+
 class FiltersConfig(BaseModel):
     shadow: bool = True
     places_whitelist: list[str] = Field(
         default_factory=lambda: ["Lidl", "OLX", "Biedronka", "Żabka", "Allegro"]
     )
+    topic_stop: list[str] = Field(default_factory=lambda: list(_TOPIC_STOP_DEFAULT))
+    injection_markers: list[str] = Field(default_factory=lambda: list(_INJECTION_MARKERS_DEFAULT))
+    logistics: list[str] = Field(default_factory=lambda: list(_LOGISTICS_DEFAULT))
+    urgent: list[str] = Field(default_factory=lambda: list(_URGENT_DEFAULT))
+    places_request: list[str] = Field(default_factory=lambda: list(_PLACES_REQUEST_DEFAULT))
+    model_talk: list[str] = Field(default_factory=lambda: list(_MODEL_TALK_DEFAULT))
+    assistant_markers: list[str] = Field(default_factory=lambda: list(_ASSISTANT_MARKERS_DEFAULT))
+
+    @field_validator(*_REGEX_LIST_FIELDS)
+    @classmethod
+    def _validate_regex_list(cls, value: list[str]) -> list[str]:
+        for pattern in value:
+            try:
+                re.compile(pattern, re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"invalid regex pattern {pattern!r}: {exc}") from exc
+        return value
 
 
 class Config(BaseModel):

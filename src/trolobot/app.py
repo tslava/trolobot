@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import sys
 
 from aiogram import Bot, Dispatcher
@@ -14,6 +15,7 @@ from trolobot.config import load_config
 from trolobot.config_models import Config
 from trolobot.db import Database
 from trolobot.few_shot import load_few_shot
+from trolobot.patterns import Patterns
 from trolobot.retention import retention_loop
 from trolobot.settings import Settings
 
@@ -74,12 +76,19 @@ async def main() -> None:
             me.username or "",
         } - {""}
 
+        # TODO(этап 6): Patterns зависит от config (filters, name_triggers) и от username
+        # бота — при горячей перезагрузке конфига (config_overrides) его нужно пересобирать
+        # вместе с ConfigHolder.set(), иначе гейт продолжит работать по старым паттернам.
+        patterns = Patterns(config.filters, config.persona.name_triggers, me.username or "")
+
         deps = Deps(
             settings=settings,
             config_getter=holder.get,
             db=db,
             bot_user_id=me.id,
             reserved_names=reserved_names,
+            patterns=patterns,
+            rng=random.Random(),
         )
 
         dispatcher = Dispatcher()

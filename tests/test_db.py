@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from trolobot.db import Database
+from trolobot.gate_types import StateChange
 
 EXPECTED_TABLES = {
     "messages",
@@ -391,3 +392,238 @@ async def test_methods_before_connect_raise_runtime_error(tmp_path: Path) -> Non
     db = Database(tmp_path / "bot.db")
     with pytest.raises(RuntimeError):
         await db.get_state("panic")
+
+
+async def test_insert_filter_log_returns_rowid(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        row_id = await db.insert_filter_log(
+            trigger_tg_message_id=1,
+            candidate_text=None,
+            verdict="drop",
+            stage="gate",
+            reason="gate:night",
+            shadow=False,
+            created_at=1000,
+        )
+        assert row_id > 0
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT trigger_tg_message_id, candidate_text, verdict, stage, reason, shadow, "
+            "created_at FROM filter_log WHERE id = ?",
+            (row_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert dict(row) == {
+            "trigger_tg_message_id": 1,
+            "candidate_text": None,
+            "verdict": "drop",
+            "stage": "gate",
+            "reason": "gate:night",
+            "shadow": 0,
+            "created_at": 1000,
+        }
+    finally:
+        await db.close()
+
+
+async def test_muted_user_ids(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.muted_user_ids() == frozenset()
+
+        conn = db._conn
+        assert conn is not None
+        await conn.execute(
+            "INSERT INTO muted_users (user_id, display_name, muted_by, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (1, "A", 99, 1000),
+        )
+        await conn.execute(
+            "INSERT INTO muted_users (user_id, display_name, muted_by, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (2, "B", 99, 1000),
+        )
+        await conn.commit()
+
+        assert await db.muted_user_ids() == frozenset({1, 2})
+    finally:
+        await db.close()
+
+
+async def test_recent_activity_filters_bot_since_and_chat(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        since = 1000
+
+        # не-бот в окне -> попадает
+        await db.insert_message(
+            tg_message_id=1,
+            chat_id=1,
+            user_id=10,
+            display_name="A",
+            text="hi",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1000,
+        )
+        # бот -> исключается
+        await db.insert_message(
+            tg_message_id=2,
+            chat_id=1,
+            user_id=999,
+            display_name="Bot",
+            text="hi",
+            reply_to_tg_message_id=None,
+            is_bot=True,
+            created_at=1001,
+        )
+        # старше since -> исключается
+        await db.insert_message(
+            tg_message_id=3,
+            chat_id=1,
+            user_id=11,
+            display_name="B",
+            text="old",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=999,
+        )
+        # другой чат -> исключается
+        await db.insert_message(
+            tg_message_id=4,
+            chat_id=2,
+            user_id=12,
+            display_name="C",
+            text="other chat",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1002,
+        )
+        # второй в окне, позже -> попадает, порядок по created_at
+        await db.insert_message(
+            tg_message_id=5,
+            chat_id=1,
+            user_id=13,
+            display_name="D",
+            text="hi2",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1003,
+        )
+
+        activity = await db.recent_activity(1, since)
+        assert [(a.user_id, a.created_at) for a in activity] == [(10, 1000), (13, 1003)]
+    finally:
+        await db.close()
+
+
+async def test_enqueue_night_returns_rowid(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        row_id = await db.enqueue_night(
+            tg_message_id=5,
+            user_id=1,
+            display_name="A",
+            text="привет ночью",
+            created_at=1000,
+        )
+        assert row_id > 0
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT tg_message_id, user_id, display_name, text, created_at, answered_at "
+            "FROM night_queue WHERE id = ?",
+            (row_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert dict(row) == {
+            "tg_message_id": 5,
+            "user_id": 1,
+            "display_name": "A",
+            "text": "привет ночью",
+            "created_at": 1000,
+            "answered_at": None,
+        }
+    finally:
+        await db.close()
+
+
+async def test_apply_state_changes_upsert_and_delete_in_one_batch(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.set_state("to_delete", "1")
+        await db.set_state("to_update", "old")
+
+        await db.apply_state_changes(
+            [
+                StateChange(key="to_delete", value=None),
+                StateChange(key="to_update", value="new"),
+                StateChange(key="brand_new", value="v"),
+            ]
+        )
+
+        assert await db.get_state("to_delete") is None
+        assert await db.get_state("to_update") == "new"
+        assert await db.get_state("brand_new") == "v"
+    finally:
+        await db.close()
+
+
+async def test_apply_state_changes_empty_iterable_is_noop(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.set_state("untouched", "1")
+
+        await db.apply_state_changes([])
+
+        assert await db.get_state("untouched") == "1"
+    finally:
+        await db.close()
+
+
+async def test_filter_log_summary_sorted_by_count_desc_then_reason(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        since = 1000
+        entries = [
+            ("gate:night", 3, since + 1),
+            ("gate:night", 3, since + 2),
+            ("gate:night", 3, since + 3),
+            ("gate:topic", 2, since + 1),
+            ("gate:topic", 2, since + 2),
+            ("gate:ambient_cap", 2, since + 1),
+            ("gate:ambient_cap", 2, since + 2),
+            ("gate:is_bot", 1, since - 1),  # раньше since -> не считается
+        ]
+        for reason, _count, created_at in entries:
+            await db.insert_filter_log(
+                trigger_tg_message_id=None,
+                candidate_text=None,
+                verdict="drop",
+                stage="gate",
+                reason=reason,
+                shadow=False,
+                created_at=created_at,
+            )
+
+        summary = await db.filter_log_summary(since)
+        assert summary == [
+            ("gate:night", 3),
+            ("gate:ambient_cap", 2),
+            ("gate:topic", 2),
+        ]
+    finally:
+        await db.close()

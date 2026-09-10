@@ -1,5 +1,6 @@
 """load_config: реальный config.yaml, overrides, ошибки, возраст."""
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from trolobot.config import flatten_config, load_config
-from trolobot.config_models import BehaviourConfig, Config, ReplyDelayBucket
+from trolobot.config_models import BehaviourConfig, Config, FiltersConfig, ReplyDelayBucket
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "config.yaml"
@@ -22,6 +23,24 @@ def test_load_real_config_without_errors() -> None:
     assert cfg.behaviour.daily_cap == 3
     assert cfg.filters.shadow is True
     assert "Lidl" in cfg.filters.places_whitelist
+
+
+def test_load_real_config_filters_pattern_lists() -> None:
+    cfg = load_config(CONFIG_PATH)
+    default_filters = FiltersConfig()
+
+    assert cfg.filters.topic_stop == default_filters.topic_stop
+    assert cfg.filters.injection_markers == default_filters.injection_markers
+    assert cfg.filters.logistics == default_filters.logistics
+    assert cfg.filters.urgent == default_filters.urgent
+    assert cfg.filters.places_request == default_filters.places_request
+    assert cfg.filters.model_talk == default_filters.model_talk
+    assert cfg.filters.assistant_markers == default_filters.assistant_markers
+
+    assert r"\bсектор газа" in cfg.filters.topic_stop
+    assert r"\bпис\b" in cfg.filters.topic_stop
+    assert r"\b\d{1,2}[:.]\d{2}\b" in cfg.filters.logistics
+    assert "конечно!" in cfg.filters.assistant_markers
 
 
 def test_config_builds_with_defaults_without_yaml() -> None:
@@ -127,3 +146,34 @@ def test_flatten_config_roundtrip_keys() -> None:
     assert flat["behaviour.daily_cap"] == "3"
     assert flat["persona.name"] == "Фёдор"
     assert flat["filters.shadow"] == "true"
+
+
+# --- FiltersConfig: валидация регулярок -------------------------------------------
+
+_INVALID_REGEX = "\\bвойн[а-я*"  # незакрытая скобка/класс символов
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["topic_stop", "injection_markers", "logistics", "urgent", "places_request", "model_talk"],
+)
+def test_invalid_regex_in_filters_field_raises_with_pattern_text(field_name: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        FiltersConfig(**{field_name: [_INVALID_REGEX]})
+
+    assert _INVALID_REGEX in str(exc_info.value)
+
+
+def test_invalid_regex_in_real_config_via_override_raises() -> None:
+    override_value = f"[{json.dumps(_INVALID_REGEX, ensure_ascii=False)}]"
+    with pytest.raises(ValueError) as exc_info:
+        load_config(CONFIG_PATH, {"filters.topic_stop": override_value})
+
+    assert _INVALID_REGEX in str(exc_info.value)
+
+
+def test_assistant_markers_are_not_validated_as_regex() -> None:
+    # assistant_markers — фразы, а не регулярки: строка с "особыми" символами regex
+    # (например незакрытая скобка) не должна валиться на валидаторе.
+    cfg = FiltersConfig(assistant_markers=["(это не закрытая скобка"])
+    assert cfg.assistant_markers == ["(это не закрытая скобка"]

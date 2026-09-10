@@ -192,11 +192,18 @@ CREATE TABLE filter_log (            -- каждый отказ на любой 
 (этап 3), после старта процесс подхватывает и то и другое. Теряется только
 дебаунс-окно в 3–7 секунд, если рестарт попал ровно в него.
 
+Механика: `deploy/deploy.sh` не хранится на хосте, а каждый раз приезжает через stdin
+(`ssh bot@host "bash -s -- sha-xxx" < deploy/deploy.sh`), ключ деплоя ограничен
+forced-command `deploy/deploy-only.sh`, который пропускает ровно эту форму команды.
+Хвост: `docker-compose.yml` на хост попадает один раз скриптом `deploy/setup-host.sh`,
+CI его не обновляет. Пока compose меняется редко, это руками; если начнёт меняться —
+`deploy.sh` должен нести compose внутри себя (heredoc, склеенный в workflow).
+
 ### Секреты
 
 | Где | Что |
 |---|---|
-| GitHub Secrets | `SSH_HOST`, `SSH_USER`, `SSH_KEY` |
+| GitHub Secrets | `SSH_HOST`, `SSH_USER`, `SSH_KEY`, `SSH_KNOWN_HOSTS` |
 | VPS, один раз руками | `docker login ghcr.io` read-only PAT (`read:packages`), либо пакет публичный |
 | `.env` на VPS | `BOT_TOKEN`, `OPENROUTER_API_KEY`, `GOOGLE_PLACES_KEY`, `ADMIN_USER_ID`, `ALLOWED_CHAT_ID` |
 
@@ -205,7 +212,8 @@ CREATE TABLE filter_log (            -- каждый отказ на любой 
 ### Требования к хосту
 
 - Отдельный пользователь `bot`, ключ с ограничением по команде, root-логин по SSH выключен.
-- `data/` в volume, бэкап `bot.db` на отдельный диск раз в неделю.
+- `data/` в volume, бэкап `bot.db` на отдельный диск раз в неделю (том Hetzner,
+  монтируется руками в `/opt/trolobot/backups`; до этого бэкап лежит на том же диске).
 - Миграции выполняются на старте контейнера, идемпотентно.
 - `restart: unless-stopped` в compose.
 - **Ничего не слушает наружу.** Long polling входящих портов не требует, а веб-панели

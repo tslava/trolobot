@@ -137,6 +137,89 @@ async def main() -> None
 # Graceful shutdown по SIGTERM/SIGINT: отменить таски, закрыть БД.
 ```
 
+## Интерфейсы этапа 2 — гейт и реплей
+
+Типы гейта уже написаны: `gate_types.py` (Trigger, Verdict, GateMessage, RecentActivity,
+GateState, StateChange, Decision, PatternsLike). Локальное время: `timeutil.py`
+(local_date, day_key, week_key, in_window, seconds_until). Их не менять без согласования.
+
+```python
+# config_models.py — FiltersConfig расширяется списками регулярок из CHARACTER.md раздел 6:
+class FiltersConfig(BaseModel):
+    shadow: bool = True
+    places_whitelist: list[str]
+    topic_stop: list[str]          # стоп-лист тем, regex по границам слов
+    injection_markers: list[str]   # маркеры команд, гейт 5a
+    logistics: list[str]           # логистический фильтр: время, «кто идёт», «я пас», ...
+    urgent: list[str]              # «сегодня», «сейчас», «через час», «куда идём», «ты где» (этап 3)
+    places_request: list[str]      # «куда сходить», «посоветуй», «где посидеть», ... (этап 5)
+    model_talk: list[str]          # маркеры модели, выходной фильтр (этап 4)
+    assistant_markers: list[str]   # маркеры ассистента (этап 4)
+# Дефолты — из карточки, config.yaml их дублирует. Все регулярки компилируются с re.IGNORECASE.
+
+# patterns.py — компиляция один раз, чистые методы. Реализует PatternsLike.
+class Patterns:
+    def __init__(self, filters: FiltersConfig, name_triggers: list[str], bot_username: str) -> None
+    def topic_stop(self, text) -> str | None      # сработавший паттерн (pattern.pattern) или None
+    def injection(self, text) -> str | None
+    def logistics(self, text) -> str | None
+    def name_trigger(self, text) -> str | None    # триггеры по границам слов, IGNORECASE
+    def mentions_bot(self, text) -> bool          # "@username" по границе слова, IGNORECASE
+    def urgent(self, text) -> bool
+    def places_request(self, text) -> bool
+    def model_talk(self, text) -> str | None
+    def assistant_marker(self, text) -> str | None
+# Границы слов для кириллицы: \b в Python работает с Unicode — достаточно. Пустой список — метод всегда None/False.
+
+# gate.py — чистая функция, порядок шагов ровно как в PLAN.md этап 2 (0 — в хендлере, 1–5, 5a, 6–11)
+def should_consider(msg: GateMessage, state: GateState, cfg: Config, patterns: PatternsLike,
+                    now: int, rng: random.Random) -> Decision
+# Причины: gate:is_bot, gate:panic, gate:stop, gate:muted, gate:topic (+ StateChange topic_cooldown_until),
+# gate:topic_cooldown, gate:injection, gate:night_queued (verdict QUEUE_NIGHT), gate:mention_cap,
+# gate:mention_chat_cooldown, gate:mention_user_cooldown, gate:night, gate:logistics, gate:not_live,
+# gate:ambient_cap, gate:ambient_cooldown, gate:dice; pass:mention / pass:reply / pass:name / pass:ambient.
+# Приоритет триггера обращения: reply > mention > name. Счётчики (mention_count, ambient_count) гейт НЕ меняет —
+# их инкрементит отправка (этап 3). Единственный StateChange гейта — topic_cooldown_until.
+# Живой разговор: len(state.recent) >= min_messages и len({r.user_id}) >= min_people; recent уже отфильтрован
+# вызывающим по окну и is_bot=0 и включает текущее сообщение.
+# Сутки и окна — через timeutil с cfg.persona.timezone.
+
+# db.py — добавить:
+async def insert_filter_log(self, *, trigger_tg_message_id: int | None, candidate_text: str | None,
+                            verdict: str, stage: str, reason: str, shadow: bool, created_at: int) -> int
+async def muted_user_ids(self) -> frozenset[int]
+async def recent_activity(self, chat_id: int, since: int) -> list[RecentActivity]   # is_bot=0, created_at >= since, asc
+async def enqueue_night(self, *, tg_message_id: int, user_id: int, display_name: str, text: str, created_at: int) -> int
+async def apply_state_changes(self, changes: Iterable[StateChange]) -> None          # под write_lock, одной транзакцией
+async def filter_log_summary(self, since: int) -> list[tuple[str, int]]              # (stage:reason, count) desc — для /why
+
+# gate_state.py
+async def load_gate_state(db: Database, cfg: Config, msg: GateMessage, now: int) -> GateState
+# ключи state: panic ("1"/отсутствует), stop_until, topic_cooldown_until, last_mention_reply_at,
+# last_mention_reply_at:<user_id>, last_ambient_at, day_key("mention_count"), day_key("ambient_count").
+# recent = db.recent_activity(chat_id, now - live_talk.window_min*60).
+
+# bot.py — после insert_message: собрать GateMessage (reply_to_bot = reply_to_message.from_user.id == bot_user_id;
+# is_bot из from_user; text как записан), load_gate_state, should_consider(rng=deps.rng), apply_state_changes,
+# затем: DROP -> insert_filter_log(stage="gate"); QUEUE_NIGHT -> enqueue_night + insert_filter_log;
+# PASS -> insert_filter_log(verdict="pass", reason="pass:<trigger>") и лог INFO "gate pass". Ответа нет до этапа 3.
+# Deps получает patterns: Patterns и rng: random.Random.
+
+# export_parser.py — экспорт Telegram Desktop (result.json): messages[] с type=="message", id, date (ISO без tz —
+# трактовать как persona.timezone), from, from_id ("user123"/"channel123"), text (str или список str|{type,text}),
+# reply_to_message_id, photo/media_type/sticker_emoji/file. Служебные (type=="service") пропускать.
+@dataclass class ExportMessage: tg_message_id: int; user_id: int; display_name: str; text: str;
+                                reply_to_tg_message_id: int | None; created_at: int
+def parse_export(path: Path, tz: str) -> list[ExportMessage]   # text через normalize_text либо media_placeholder-аналог
+
+# replay.py — `python -m trolobot.replay exports/result.json [--config config.yaml] [--seed 1] [--bot-username x]
+#   [--bot-user-id N] [--verbose]`
+# Прогоняет гейт по экспорту с in-memory состоянием: для PASS считает, что ответ отправлен (инкремент
+# mention_count/ambient_count, last_*_at = created_at) — иначе лимиты не проверить. Ничего не отправляет,
+# в БД не пишет. Вывод: по дням таблица «дата | сообщений | pass по триггерам | drop по причинам (топ-5)»,
+# в конце итог и средние в сутки; --verbose печатает каждое PASS с текстом сообщения.
+```
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

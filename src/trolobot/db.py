@@ -10,12 +10,15 @@ from __future__ import annotations
 import asyncio
 import importlib.resources
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import aiosqlite
+
+from trolobot.gate_types import RecentActivity, StateChange
 
 # Номерные миграции поверх исходной схемы (user_version == 1). Пока их нет —
 # schema.sql уже описывает всю схему этапов 1 и 6. Ключ — целевая версия,
@@ -277,3 +280,104 @@ class Database:
                 filter_log_texts=filter_log_texts_cleared,
                 state_keys=state_keys_deleted,
             )
+
+    async def insert_filter_log(
+        self,
+        *,
+        trigger_tg_message_id: int | None,
+        candidate_text: str | None,
+        verdict: str,
+        stage: str,
+        reason: str,
+        shadow: bool,
+        created_at: int,
+    ) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO filter_log "
+                "(trigger_tg_message_id, candidate_text, verdict, stage, reason, shadow, "
+                "created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trigger_tg_message_id,
+                    candidate_text,
+                    verdict,
+                    stage,
+                    reason,
+                    int(shadow),
+                    created_at,
+                ),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_filter_log: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def muted_user_ids(self) -> frozenset[int]:
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT user_id FROM muted_users")
+        rows = await cursor.fetchall()
+        return frozenset(int(row["user_id"]) for row in rows)
+
+    async def recent_activity(self, chat_id: int, since: int) -> list[RecentActivity]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT user_id, created_at FROM messages "
+            "WHERE chat_id = ? AND is_bot = 0 AND created_at >= ? "
+            "ORDER BY created_at, id",
+            (chat_id, since),
+        )
+        rows = await cursor.fetchall()
+        return [
+            RecentActivity(user_id=row["user_id"], created_at=row["created_at"]) for row in rows
+        ]
+
+    async def enqueue_night(
+        self,
+        *,
+        tg_message_id: int,
+        user_id: int,
+        display_name: str,
+        text: str,
+        created_at: int,
+    ) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO night_queue "
+                "(tg_message_id, user_id, display_name, text, created_at, answered_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL)",
+                (tg_message_id, user_id, display_name, text, created_at),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("enqueue_night: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def apply_state_changes(self, changes: Iterable[StateChange]) -> None:
+        conn = self._require_conn()
+        async with self._write_lock:
+            applied = False
+            for change in changes:
+                applied = True
+                if change.value is None:
+                    await conn.execute("DELETE FROM state WHERE key = ?", (change.key,))
+                else:
+                    await conn.execute(
+                        "INSERT INTO state (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (change.key, change.value),
+                    )
+            if applied:
+                await conn.commit()
+
+    async def filter_log_summary(self, since: int) -> list[tuple[str, int]]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT reason, COUNT(*) AS cnt FROM filter_log WHERE created_at >= ? "
+            "GROUP BY reason ORDER BY cnt DESC, reason",
+            (since,),
+        )
+        rows = await cursor.fetchall()
+        return [(str(row["reason"]), int(row["cnt"])) for row in rows]

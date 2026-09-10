@@ -1,12 +1,14 @@
-"""aiogram Router и хендлер сообщений одного чата (PLAN.md, этап 1).
+"""aiogram Router и хендлер сообщений одного чата (PLAN.md, этапы 1-2).
 
-Хендлер только логирует и пишет в БД. Ничего не отвечает, команды не обрабатывает —
-это принципиально для этапа 1, см. CLAUDE.md, раздел "Чего не делать".
+Хендлер пишет сообщение в БД, затем прогоняет его через гейт (should_consider) и
+логирует вердикт. Ничего не отвечает в чат — это принципиально до этапа 3, см.
+CLAUDE.md, раздел "Чего не делать".
 """
 
 from __future__ import annotations
 
 import logging
+import random
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -15,6 +17,10 @@ from aiogram.types import Message
 
 from trolobot.config_models import Config
 from trolobot.db import Database
+from trolobot.gate import should_consider
+from trolobot.gate_state import load_gate_state
+from trolobot.gate_types import GateMessage, Verdict
+from trolobot.patterns import Patterns
 from trolobot.sanitize import media_placeholder, normalize_text, sanitize_display_name
 from trolobot.settings import Settings
 
@@ -33,6 +39,8 @@ class Deps:
     db: Database
     bot_user_id: int
     reserved_names: set[str]
+    patterns: Patterns
+    rng: random.Random
 
 
 def build_router(deps: Deps) -> Router:
@@ -88,6 +96,7 @@ def build_router(deps: Deps) -> Router:
             message.reply_to_message.message_id if message.reply_to_message is not None else None
         )
 
+        created_at = int(message.date.timestamp())
         await deps.db.insert_message(
             tg_message_id=message.message_id,
             chat_id=message.chat.id,
@@ -96,8 +105,74 @@ def build_router(deps: Deps) -> Router:
             text=text,
             reply_to_tg_message_id=reply_to_tg_message_id,
             is_bot=is_bot,
-            created_at=int(message.date.timestamp()),
+            created_at=created_at,
         )
         logger.info("%s: %s", display_name, text[:_LOG_TEXT_MAX_LEN])
+
+        reply_to_bot = (
+            message.reply_to_message is not None
+            and message.reply_to_message.from_user is not None
+            and message.reply_to_message.from_user.id == deps.bot_user_id
+        )
+        gate_message = GateMessage(
+            chat_id=message.chat.id,
+            tg_message_id=message.message_id,
+            user_id=user_id,
+            is_bot=is_bot,
+            text=text,
+            reply_to_bot=reply_to_bot,
+            created_at=created_at,
+        )
+
+        try:
+            cfg = deps.config_getter()
+            now = gate_message.created_at
+            state = await load_gate_state(deps.db, cfg, gate_message, now)
+            decision = should_consider(gate_message, state, cfg, deps.patterns, now, deps.rng)
+            await deps.db.apply_state_changes(decision.state_changes)
+
+            if decision.verdict is Verdict.DROP:
+                await deps.db.insert_filter_log(
+                    trigger_tg_message_id=gate_message.tg_message_id,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="gate",
+                    reason=decision.reason,
+                    shadow=False,
+                    created_at=now,
+                )
+                logger.debug("gate drop: %s (%s)", decision.reason, gate_message.tg_message_id)
+            elif decision.verdict is Verdict.QUEUE_NIGHT:
+                await deps.db.enqueue_night(
+                    tg_message_id=gate_message.tg_message_id,
+                    user_id=user_id,
+                    display_name=display_name,
+                    text=text,
+                    created_at=now,
+                )
+                await deps.db.insert_filter_log(
+                    trigger_tg_message_id=gate_message.tg_message_id,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="gate",
+                    reason=decision.reason,
+                    shadow=False,
+                    created_at=now,
+                )
+                logger.info("night queued: %s (%s)", decision.trigger, text[:_LOG_TEXT_MAX_LEN])
+            else:
+                await deps.db.insert_filter_log(
+                    trigger_tg_message_id=gate_message.tg_message_id,
+                    candidate_text=None,
+                    verdict="pass",
+                    stage="gate",
+                    reason=decision.reason,
+                    shadow=False,
+                    created_at=now,
+                )
+                logger.info("gate pass: %s (%s)", decision.trigger, text[:_LOG_TEXT_MAX_LEN])
+        except Exception:
+            # Ошибка гейта не должна ронять хендлер: сообщение уже записано в messages.
+            logger.exception("gate failed for message %s", gate_message.tg_message_id)
 
     return router
