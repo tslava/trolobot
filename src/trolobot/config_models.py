@@ -10,6 +10,9 @@ from datetime import date, time
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+# OpenRouter model id: "provider/model", например "openai/gpt-4o-mini" или
+# "anthropic/claude-3.5-sonnet:beta" — используется и llm.main_model, и llm.judge_model.
+_MODEL_ID_RE = re.compile(r"^[\w.-]+/[\w.:-]+$")
 
 
 def _validate_hhmm(value: str) -> str:
@@ -154,6 +157,17 @@ class LlmConfig(BaseModel):
     # Fallback-цены за 1M токенов: используются, только если провайдер не вернул usage.cost.
     price_in_usd_per_1m: float = Field(default=5.0, ge=0.0)
     price_out_usd_per_1m: float = Field(default=25.0, ge=0.0)
+
+    @field_validator("main_model", "judge_model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
 
 
 class PlacesConfig(BaseModel):

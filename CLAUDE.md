@@ -425,6 +425,96 @@ class Judge:
 # bot.py: display_name, в котором patterns.injection(...) срабатывает, заменяется на «Участник N» до записи в БД.
 ```
 
+## Интерфейсы этапа 6 — управление из телеграма
+
+Требования — PLAN.md этап 6 целиком: команды в чате для всех, команды в личке только владельцу,
+горячая перезагрузка конфига, аудит, версии промпта и few-shot, валидация `/set`, приёмка.
+
+```python
+# db.py — добавить:
+async def set_override(self, key: str, value: str, changed_by: int, now: int) -> str | None   # UPSERT + строка в config_audit, вернуть старое
+async def delete_override(self, key: str, changed_by: int, now: int) -> str | None            # DELETE + аудит
+async def add_mute(self, user_id: int, display_name: str, muted_by: int, now: int) -> None
+async def remove_mute(self, user_id: int) -> bool
+async def last_bot_replies(self, n: int) -> list[BotReplyRow]      # id, tg_message_id, trigger, text, prompt_version, few_shot_version, delay_sec, created_at; новые первыми
+async def prompt_versions(self) -> list[VersionRow]                # version, note, active, created_at
+async def active_prompt(self) -> tuple[int, str] | None            # (version, body)
+async def add_prompt_version(self, body: str, note: str, now: int) -> int   # новая версия становится active, остальные active=0
+async def activate_prompt(self, version: int) -> bool
+async def active_few_shot(self) -> tuple[int, str] | None          # (version, body_yaml)
+async def add_few_shot_version(self, body_yaml: str, note: str, now: int) -> int
+async def activate_few_shot(self, version: int) -> bool
+async def message_by_tg_id(self, chat_id: int, tg_message_id: int) -> MessageRow | None
+async def bot_reply_by_tg_id(self, tg_message_id: int) -> BotReplyRow | None
+
+# stores.py — состояние, которое меняется на горячую
+class ConfigStore:
+    def __init__(self, path: Path, db: Database) -> None
+    async def load(self) -> Config                     # yaml + overrides из БД → self.current; пересобрать Patterns
+    def get(self) -> Config
+    def patterns(self) -> Patterns                     # пересобирается при каждом load()
+    def set_bot_username(self, username: str) -> None
+    async def set(self, key: str, raw_value: str, changed_by: int, now: int) -> tuple[str | None, str]   # (old, new)
+    # разрешены только ключи под behaviour., llm., places., filters.; persona.* — ValueError «persona меняется в yaml».
+    # Валидация: load_config(path, overrides + {key: raw}) — pydantic бросает → ValueError с текстом ошибки, override не пишется.
+    async def unset(self, key: str, changed_by: int, now: int) -> str | None
+    def flat(self) -> list[tuple[str, str, bool]]      # (ключ, значение, переопределён ли) для /get
+class PromptStore:
+    def __init__(self, db: Database, prompt_path: Path, few_shot_path: Path) -> None
+    async def load(self) -> None
+    # сид: тело из файла сравнивается с active в БД (после strip); нет версий → версия 1 из файла; отличается → новая версия
+    # с note "seed from file"; иначе — активная из БД. То же для few_shot.yaml. Дальше источник истины — БД.
+    def system_prompt(self) -> str;  def prompt_version(self) -> int
+    def few_shot_text(self) -> str;  def few_shot_version(self) -> int      # рендер через render_few_shot из body_yaml
+    async def rollback_prompt(self, version: int) -> bool
+    async def add_example(self, name: str, user: str, text: str, now: int) -> int   # новая версия few_shot = активная + пара
+    async def remove_example(self, index: int, now: int) -> int                      # index с 1 с конца (/ex rm 1 — последний)
+    def examples(self) -> list[FewShot]
+
+# Responder: вместо prompt_template/few_shot_getter/prompt_version/few_shot_version получает prompt_store: PromptStore
+# и читает всё через него на каждом _respond. patterns_getter = config_store.patterns, cfg_getter = config_store.get.
+# Judge получает prompt-шаблон судьи как раньше (файл), он не версионируется.
+
+# commands.py — Router с командами; включается в Dispatcher ПЕРЕД основным роутером сообщений
+def build_commands_router(deps: Deps) -> Router
+# Deps дополняется: config_store, prompt_store, responder (может быть None), bot_username.
+# Deps.patterns — НЕ объект, а patterns_getter: Callable[[], Patterns] (config_store.patterns): иначе /set filters.* не долетает до гейта.
+# LLMClient/Judge/Responder создаются при наличии ключа независимо от main_model/judge_model; пустая main_model →
+# filter_log llm:no_model на каждом ответе, включение через /set без рестарта. Stores — под asyncio.Lock.
+# Хендлеры фильтруют сами: chat.id == allowed_chat_id — команды чата; chat.type == "private" и from_user.id == admin_user_id —
+# команды владельца; всё остальное — молча игнорировать (return). Ответы — plain text, без клавиатур, без markdown
+# (parse_mode=None), не длиннее 3500 символов (обрезать с «…»).
+# Команды чата (все участники):
+#   /stop            state stop_until = now + 24h; ответ в чат «Ок.» реплаем? Нет — молча, без ответа: «без вопросов, без обсуждения».
+#                    Только лог INFO и запись в config_audit (key="stop", changed_by).
+#   /mute            без реплая — мьют самого отправителя (доступно всем); реплаем на другого — только владелец;
+#                    цель владелец/бот — ничего. @username не поддерживается (username не храним), только реплай/text_mention.
+#                    Без ответа в чат. Аудит config_audit key="mute:<user_id>".
+#   /unmute          без реплая — снять с себя (любой); реплаем на другого — только владелец. Аудит "unmute:<user_id>".
+#   Суффикс @имя: если не равен bot_username — команда не исполняется. Команда в caption распознаётся как текстовая.
+#   /panic, /resume тоже пишутся в config_audit ("panic", "resume").
+#   /ex add          только владелец, реплаем на сообщение бота: пара (сообщение-триггер из bot_replies.trigger_tg_message_id →
+#                    messages.text и display_name, ответ бота) → prompt_store.add_example. Без ответа в чат (чтобы не палить).
+# Команды владельца в личке:
+#   /panic           state panic="1"; ответ «Паника. Бот молчит до /resume.»
+#   /resume          delete panic и stop_until; «Продолжаем.»
+#   /status          кратко: panic/stop, версии, модели, shadow, счётчики дня (ambient/mention/llm_calls/llm_spent), pending, night_queue
+#   /last [n]        n по умолчанию 5, максимум 20: «HH:MM dd.mm | trigger | p<ver>/f<ver> | +<delay>s | текст»
+#   /why [hours]     сводка filter_log_summary(now - hours*3600), по умолчанию 1: «gate:not_live 14\nregex:length 2 ...»
+#   /get [prefix]    flat() с пометкой * у переопределённых; с prefix — только ключи, начинающиеся с него
+#   /set k v         ConfigStore.set → «k: old → new»; ошибка → текст ошибки
+#   /unset k         → «k: сброшен к <default>»
+#   /prompt          «версия N (активная), всего M» + первые 1500 символов тела; /prompt full — целиком (обрезка 3500)
+#   /rollback N      activate_prompt → «промпт: версия N»
+#   /ex last [n]     последние n примеров (по умолчанию 5) в формате «Имя: текст → {"speak":..}»
+#   /ex rm [n]       удалить n-й с конца (по умолчанию 1) → новая версия
+# Неизвестная команда в личке от владельца — список команд. Любая команда не от владельца в личке — молчание.
+# Команды в чате в messages НЕ записываются и через гейт НЕ идут (роутер команд стоит раньше; после обработки propagation
+# останавливается). Команды с ошибкой (нет реплая у /mute) — молча игнорировать в чате, ответить текстом в личке.
+# app.py: ConfigStore/PromptStore создаются до Bot; после get_me — set_bot_username; Responder и Judge берут getters из stores;
+# роутер команд включается первым. Settings.admin_user_id == 0 → команды владельца отключены, WARNING.
+```
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

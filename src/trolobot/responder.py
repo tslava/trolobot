@@ -86,6 +86,11 @@ _ERROR_RETRY_SEC = 60.0
 # в самом промпте генерации.
 _FILTER_RECENT_REPLIES_LIMIT = 50
 
+# llm.main_model может быть пустым (LLM включён на горячую только ключом OpenRouter,
+# модель ставится позже через /set) — WARNING про это не чаще раза в 10 минут, иначе
+# каждый PASS в чате без модели заспамит лог.
+_NO_MODEL_WARN_INTERVAL_SEC = 600
+
 
 def _unique_participant_names(context_rows: list[MessageRow]) -> list[str]:
     """Уникальные display_name не-ботов из context_rows, в порядке первого появления."""
@@ -114,6 +119,20 @@ class _BotLike(Protocol):
     async def send_chat_action(self, chat_id: int, action: str) -> object: ...
 
 
+class _PromptStoreLike(Protocol):
+    """Узкий протокол вместо ``stores.PromptStore`` (CLAUDE.md, "Интерфейсы этапа 6").
+
+    Читается заново на каждом ``_respond`` — не кэшируется в конструкторе — чтобы
+    горячая правка промпта/few-shot (``/rollback``, ``/ex add``) подхватывалась
+    следующим же ответом без рестарта процесса.
+    """
+
+    def system_prompt(self) -> str: ...
+    def prompt_version(self) -> int: ...
+    def few_shot_text(self) -> str: ...
+    def few_shot_version(self) -> int: ...
+
+
 def _trigger_value(trigger: Trigger | str) -> str:
     return trigger.value if isinstance(trigger, Trigger) else str(trigger)
 
@@ -138,10 +157,7 @@ class Responder:
         llm: LLMClient,
         judge: Judge | None = None,
         patterns_getter: Callable[[], Patterns],
-        prompt_template: str,
-        few_shot_getter: Callable[[], str],
-        prompt_version: int,
-        few_shot_version: int,
+        prompt_store: _PromptStoreLike,
         rng: random.Random,
         chat_id: int,
         bot_user_id: int,
@@ -154,10 +170,7 @@ class Responder:
         self.llm = llm
         self.judge = judge
         self.patterns_getter = patterns_getter
-        self.prompt_template = prompt_template
-        self.few_shot_getter = few_shot_getter
-        self.prompt_version = prompt_version
-        self.few_shot_version = few_shot_version
+        self.prompt_store = prompt_store
         self.rng = rng
         self.chat_id = chat_id
         self.bot_user_id = bot_user_id
@@ -173,6 +186,9 @@ class Responder:
         # Сериализует генерацию+отправку+счётчики одного Responder: без этого два PASS,
         # ждущих LLM параллельно, могли бы оба проскочить одну и ту же проверку бюджета.
         self._respond_lock = asyncio.Lock()
+        # Таймстемп (в шкале clock()/now) последнего WARNING про пустой llm.main_model —
+        # throttle на _NO_MODEL_WARN_INTERVAL_SEC, чтобы не спамить лог на каждый PASS.
+        self._last_no_model_warn_at: int | None = None
 
     # ------------------------------------------------------------------ #
     # Приём PASS от гейта: дебаунс, схлопывание, постановка pending.
@@ -544,15 +560,40 @@ class Responder:
         now: int,
         trigger_text: str = "",
     ) -> None:
+        if not cfg.llm.main_model:
+            # LLM включён (есть openrouter_api_key), но модель ещё не задана —
+            # это не ошибка вызова, а нормальное состояние до первого /set
+            # llm.main_model. Молчание, без похода в сеть.
+            await self.db.insert_filter_log(
+                trigger_tg_message_id=trigger_msg_id,
+                candidate_text=None,
+                verdict="cut",
+                stage="llm",
+                reason="llm:no_model",
+                shadow=False,
+                created_at=now,
+            )
+            if (
+                self._last_no_model_warn_at is None
+                or now - self._last_no_model_warn_at >= _NO_MODEL_WARN_INTERVAL_SEC
+            ):
+                self._last_no_model_warn_at = now
+                logger.warning("llm.main_model не задан, ответ не сгенерирован")
+            return
+
         context_rows = await self.db.recent_messages(self.chat_id, cfg.behaviour.context_window)
         recent_replies_list = await self.db.recent_bot_replies(cfg.behaviour.recent_replies_memory)
         context = render_context(context_rows)
         recent_replies = "\n".join(recent_replies_list)
-        few_shot = self.few_shot_getter()
+        # Читаем промпт/few-shot из prompt_store заново на каждом _respond, а не
+        # кэшируем в конструкторе: /rollback и /ex add должны подхватываться
+        # следующим же ответом, без рестарта Responder.
+        system_prompt = self.prompt_store.system_prompt()
+        few_shot = self.prompt_store.few_shot_text()
         age = cfg.persona.age(local_date(now, tz))
 
         messages = build_messages(
-            self.prompt_template,
+            system_prompt,
             age=age,
             few_shot=few_shot,
             context=context,
@@ -605,7 +646,7 @@ class Responder:
             bot_names=bot_names,
             muted_names=muted_names,
             patterns=self.patterns_getter(),
-            system_prompt=self.prompt_template,
+            system_prompt=system_prompt,
             trigger_text=trigger_text,
             now=now,
         )
@@ -650,8 +691,8 @@ class Responder:
             trigger=trigger_value,
             trigger_tg_message_id=trigger_msg_id,
             text=reply.text,
-            prompt_version=self.prompt_version,
-            few_shot_version=self.few_shot_version,
+            prompt_version=self.prompt_store.prompt_version(),
+            few_shot_version=self.prompt_store.few_shot_version(),
             delay_sec=delay_sec,
             created_at=now,
         )

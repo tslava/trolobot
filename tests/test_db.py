@@ -1034,3 +1034,359 @@ async def test_last_message_at_ignores_bot_and_other_chats(tmp_path: Path) -> No
         assert await db.last_message_at(1) == 2000
     finally:
         await db.close()
+
+
+# -- этап 6: управление из телеграма ------------------------------------------
+
+
+async def test_set_override_writes_value_and_audit_row_returns_old_none(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        old = await db.set_override("behaviour.daily_cap", "5", changed_by=42, now=1000)
+        assert old is None
+        assert await db.get_overrides() == {"behaviour.daily_cap": "5"}
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT key, old_value, new_value, changed_by, created_at FROM config_audit"
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        assert rows == [
+            {
+                "key": "behaviour.daily_cap",
+                "old_value": None,
+                "new_value": "5",
+                "changed_by": 42,
+                "created_at": 1000,
+            }
+        ]
+    finally:
+        await db.close()
+
+
+async def test_set_override_twice_returns_previous_value_and_audits_both(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.set_override("behaviour.daily_cap", "5", changed_by=1, now=1000)
+        old = await db.set_override("behaviour.daily_cap", "7", changed_by=1, now=1001)
+
+        assert old == "5"
+        assert await db.get_overrides() == {"behaviour.daily_cap": "7"}
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute("SELECT old_value, new_value FROM config_audit ORDER BY id")
+        rows = [dict(r) for r in await cursor.fetchall()]
+        assert rows == [
+            {"old_value": None, "new_value": "5"},
+            {"old_value": "5", "new_value": "7"},
+        ]
+    finally:
+        await db.close()
+
+
+async def test_delete_override_removes_value_and_audits_new_value_null(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.set_override("behaviour.daily_cap", "5", changed_by=1, now=1000)
+
+        old = await db.delete_override("behaviour.daily_cap", changed_by=2, now=2000)
+        assert old == "5"
+        assert await db.get_overrides() == {}
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT key, old_value, new_value, changed_by, created_at FROM config_audit ORDER BY id"
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        assert rows[-1] == {
+            "key": "behaviour.daily_cap",
+            "old_value": "5",
+            "new_value": None,
+            "changed_by": 2,
+            "created_at": 2000,
+        }
+    finally:
+        await db.close()
+
+
+async def test_delete_override_missing_key_returns_none_but_still_audits(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        old = await db.delete_override("behaviour.daily_cap", changed_by=1, now=1000)
+        assert old is None
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute("SELECT COUNT(*) AS cnt FROM config_audit")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["cnt"] == 1
+    finally:
+        await db.close()
+
+
+async def test_audit_stop_writes_row_with_null_old_and_new(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.audit_stop("stop", changed_by=7, now=1234)
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT key, old_value, new_value, changed_by, created_at FROM config_audit"
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        assert rows == [
+            {
+                "key": "stop",
+                "old_value": None,
+                "new_value": None,
+                "changed_by": 7,
+                "created_at": 1234,
+            }
+        ]
+        # config_overrides никак не затрагивается
+        assert await db.get_overrides() == {}
+    finally:
+        await db.close()
+
+
+async def test_add_mute_and_remove_mute(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.muted_user_ids() == frozenset()
+
+        await db.add_mute(10, "Дима", muted_by=1, now=1000)
+        assert await db.muted_user_ids() == frozenset({10})
+
+        # повторный add_mute того же user_id обновляет строку, а не дублирует
+        await db.add_mute(10, "Дмитрий", muted_by=2, now=2000)
+        assert await db.muted_user_ids() == frozenset({10})
+
+        removed = await db.remove_mute(10)
+        assert removed is True
+        assert await db.muted_user_ids() == frozenset()
+
+        removed_again = await db.remove_mute(10)
+        assert removed_again is False
+    finally:
+        await db.close()
+
+
+async def test_last_bot_replies_order_and_limit(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        for i in range(3):
+            await db.insert_bot_reply(
+                tg_message_id=i,
+                reply_to_tg_message_id=None,
+                trigger="ambient",
+                trigger_tg_message_id=None,
+                text=f"reply-{i}",
+                prompt_version=1,
+                few_shot_version=1,
+                delay_sec=i,
+                created_at=1000 + i,
+            )
+
+        rows = await db.last_bot_replies(2)
+        assert [r.text for r in rows] == ["reply-2", "reply-1"]  # новые первыми
+        assert rows[0].trigger == "ambient"
+        assert rows[0].tg_message_id == 2
+        assert rows[0].trigger_tg_message_id is None
+        assert rows[0].prompt_version == 1
+        assert rows[0].few_shot_version == 1
+        assert rows[0].delay_sec == 2
+        assert rows[0].created_at == 1002
+
+        all_rows = await db.last_bot_replies(100)
+        assert [r.text for r in all_rows] == ["reply-2", "reply-1", "reply-0"]
+    finally:
+        await db.close()
+
+
+async def test_prompt_versions_active_and_seed_from_empty(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.active_prompt() is None
+        assert await db.prompt_versions() == []
+
+        v1 = await db.add_prompt_version("body v1", "seed from file", 1000)
+        assert v1 == 1
+        assert await db.active_prompt() == (1, "body v1")
+
+        versions = await db.prompt_versions()
+        assert [(v.version, v.active) for v in versions] == [(1, True)]
+        assert versions[0].note == "seed from file"
+        assert versions[0].created_at == 1000
+    finally:
+        await db.close()
+
+
+async def test_add_prompt_version_increments_and_switches_active(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        v1 = await db.add_prompt_version("body v1", "seed", 1000)
+        v2 = await db.add_prompt_version("body v2", "edited", 2000)
+
+        assert v1 == 1
+        assert v2 == 2
+        assert await db.active_prompt() == (2, "body v2")
+
+        versions = await db.prompt_versions()
+        assert [(v.version, v.active) for v in versions] == [(1, False), (2, True)]
+    finally:
+        await db.close()
+
+
+async def test_activate_prompt_switches_active_and_missing_version_returns_false(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.add_prompt_version("body v1", "seed", 1000)
+        await db.add_prompt_version("body v2", "edited", 2000)
+
+        assert await db.active_prompt() == (2, "body v2")
+
+        ok = await db.activate_prompt(1)
+        assert ok is True
+        assert await db.active_prompt() == (1, "body v1")
+
+        versions = await db.prompt_versions()
+        assert [(v.version, v.active) for v in versions] == [(1, True), (2, False)]
+
+        missing = await db.activate_prompt(99)
+        assert missing is False
+        # активная версия не изменилась
+        assert await db.active_prompt() == (1, "body v1")
+    finally:
+        await db.close()
+
+
+async def test_few_shot_versions_add_and_activate_independent_from_prompt(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.active_few_shot() is None
+
+        await db.add_prompt_version("prompt v1", "seed", 1000)
+        fv1 = await db.add_few_shot_version("- a\n", "seed", 1000)
+        fv2 = await db.add_few_shot_version("- a\n- b\n", "/ex add", 2000)
+
+        assert fv1 == 1
+        assert fv2 == 2
+        assert await db.active_few_shot() == (2, "- a\n- b\n")
+        # версии few_shot и prompt нумеруются независимо
+        assert await db.active_prompt() == (1, "prompt v1")
+
+        ok = await db.activate_few_shot(1)
+        assert ok is True
+        assert await db.active_few_shot() == (1, "- a\n")
+
+        missing = await db.activate_few_shot(42)
+        assert missing is False
+        assert await db.active_few_shot() == (1, "- a\n")
+    finally:
+        await db.close()
+
+
+async def test_prompt_version_bodies_returns_all_bodies(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.prompt_version_bodies() == []
+
+        await db.add_prompt_version("body v1", "seed", 1000)
+        await db.add_prompt_version("body v2", "edited", 2000)
+
+        bodies = await db.prompt_version_bodies()
+        assert set(bodies) == {"body v1", "body v2"}
+    finally:
+        await db.close()
+
+
+async def test_few_shot_version_bodies_returns_all_bodies(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.few_shot_version_bodies() == []
+
+        await db.add_few_shot_version("- a\n", "seed", 1000)
+        await db.add_few_shot_version("- a\n- b\n", "/ex add", 2000)
+
+        bodies = await db.few_shot_version_bodies()
+        assert set(bodies) == {"- a\n", "- a\n- b\n"}
+    finally:
+        await db.close()
+
+
+async def test_message_by_tg_id_found_and_missing(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.message_by_tg_id(1, 100) is None
+
+        await db.insert_message(
+            tg_message_id=100,
+            chat_id=1,
+            user_id=1,
+            display_name="A",
+            text="привет",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1000,
+        )
+        # другой чат, тот же tg_message_id -> не находится
+        assert await db.message_by_tg_id(2, 100) is None
+
+        row = await db.message_by_tg_id(1, 100)
+        assert row is not None
+        assert row.text == "привет"
+        assert row.chat_id == 1
+        assert row.tg_message_id == 100
+    finally:
+        await db.close()
+
+
+async def test_bot_reply_by_tg_id_found_and_missing(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.bot_reply_by_tg_id(555) is None
+
+        await db.insert_bot_reply(
+            tg_message_id=555,
+            reply_to_tg_message_id=None,
+            trigger="mention",
+            trigger_tg_message_id=42,
+            text="привет",
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=5,
+            created_at=1000,
+        )
+
+        row = await db.bot_reply_by_tg_id(555)
+        assert row is not None
+        assert row.text == "привет"
+        assert row.trigger == "mention"
+        assert row.tg_message_id == 555
+        assert row.trigger_tg_message_id == 42
+    finally:
+        await db.close()

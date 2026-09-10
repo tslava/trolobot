@@ -8,7 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from trolobot.config import flatten_config, load_config
-from trolobot.config_models import BehaviourConfig, Config, FiltersConfig, ReplyDelayBucket
+from trolobot.config_models import (
+    BehaviourConfig,
+    Config,
+    FiltersConfig,
+    LlmConfig,
+    ReplyDelayBucket,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "config.yaml"
@@ -176,6 +182,35 @@ def test_invalid_regex_in_real_config_via_override_raises() -> None:
         load_config(CONFIG_PATH, {"filters.topic_stop": override_value})
 
     assert _INVALID_REGEX in str(exc_info.value)
+
+
+# --- LlmConfig: main_model/judge_model — "" или "provider/model" -----------------
+
+
+def test_llm_model_id_accepts_empty_string() -> None:
+    cfg = LlmConfig(main_model="", judge_model="")
+    assert cfg.main_model == ""
+    assert cfg.judge_model == ""
+
+
+def test_llm_model_id_accepts_provider_slash_model() -> None:
+    cfg = LlmConfig(main_model="openai/gpt-4o-mini", judge_model="anthropic/claude-3.5-haiku")
+    assert cfg.main_model == "openai/gpt-4o-mini"
+
+
+@pytest.mark.parametrize("field_name", ["main_model", "judge_model"])
+def test_llm_model_id_rejects_value_without_slash(field_name: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        LlmConfig(**{field_name: "мусор"})
+
+    assert "мусор" in str(exc_info.value)
+
+
+def test_set_llm_main_model_garbage_via_override_raises() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        load_config(CONFIG_PATH, {"llm.main_model": "мусор"})
+
+    assert "llm.main_model" in str(exc_info.value)
 
 
 def test_assistant_markers_are_not_validated_as_regex() -> None:

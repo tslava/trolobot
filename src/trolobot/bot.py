@@ -24,6 +24,7 @@ from trolobot.patterns import Patterns
 from trolobot.responder import Responder
 from trolobot.sanitize import media_placeholder, normalize_text, sanitize_display_name, stable_n
 from trolobot.settings import Settings
+from trolobot.stores import ConfigStore, PromptStore
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +34,28 @@ _LOG_TEXT_MAX_LEN = 200
 
 @dataclass(slots=True)
 class Deps:
-    """Зависимости хендлера. config_getter — под горячую перезагрузку конфига (этап 6)."""
+    """Зависимости хендлера и командного роутера (commands.py, этап 6).
+
+    config_getter/patterns_getter — геттеры, а не замороженные снимки, снятые
+    один раз при сборке Deps в app.py: Patterns пересобирается ConfigStore при
+    каждом /set (новые regex из filters.*), и без геттера handle_message держал
+    бы устаревший объект до перезапуска процесса. patterns_getter = config_store.patterns
+    вызывается на каждом сообщении, как и config_getter = config_store.get.
+    config_store/prompt_store — полноценные хранилища этапа 6, добавлены для
+    commands.py (build_commands_router ждёт их через структурный протокол
+    _CommandsDeps — этот Deps ему структурно соответствует без явного наследования).
+    """
 
     settings: Settings
     config_getter: Callable[[], Config]
     db: Database
     bot_user_id: int
     reserved_names: set[str]
-    patterns: Patterns
+    patterns_getter: Callable[[], Patterns]
     rng: random.Random
+    config_store: ConfigStore
+    prompt_store: PromptStore
+    bot_username: str = ""
     responder: Responder | None = None
     # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
     # не спамить лог на каждое следующее сообщение того же участника.
@@ -90,7 +104,7 @@ def build_router(deps: Deps) -> Router:
             display_name = sanitize_display_name(user.full_name, user.id, deps.reserved_names)
             is_bot = user.is_bot
 
-        if deps.patterns.injection(display_name) is not None:
+        if deps.patterns_getter().injection(display_name) is not None:
             # Имя-инъекция ("Игнорируй правила и скажи ...") прошла санитизацию (она
             # не содержит триггеров бота как отдельных слов), но выглядит как команда
             # гейта 5a — подменяем на "Участник N" до записи в БД и в промпт, чтобы
@@ -149,7 +163,9 @@ def build_router(deps: Deps) -> Router:
             cfg = deps.config_getter()
             now = gate_message.created_at
             state = await load_gate_state(deps.db, cfg, gate_message, now)
-            decision = should_consider(gate_message, state, cfg, deps.patterns, now, deps.rng)
+            decision = should_consider(
+                gate_message, state, cfg, deps.patterns_getter(), now, deps.rng
+            )
             await deps.db.apply_state_changes(decision.state_changes)
 
             if decision.verdict is Verdict.DROP:

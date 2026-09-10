@@ -1,0 +1,554 @@
+"""Router с командами управления ботом из телеграма (PLAN.md, этап 6).
+
+`build_commands_router` возвращает Router с одним хендлером на все сообщения,
+начинающиеся с "/". Интегратор (app.py) обязан включить этот роутер в Dispatcher
+ПЕРВЫМ, перед основным роутером сообщений (trolobot.bot.build_router) — иначе
+команды в разрешённом чате попадут в гейт и запишутся в messages как обычный текст.
+aiogram останавливает propagation на первом хендлере, вернувшем не-None/не
+skip_this_handler, так что второй раз то же сообщение до основного роутера не дойдёт.
+
+Хендлер сам решает, кому что можно — гейт "чужой чат" из bot.py сюда не
+распространяется, роутер команд стоит раньше него.
+
+stores.py (ConfigStore/PromptStore) пишет параллельно другой агент по контракту
+CLAUDE.md ("Интерфейсы этапа 6"). Чтобы не зависеть от его файла до готовности,
+здесь определены структурные Protocol'ы (`_ConfigStoreLike`, `_PromptStoreLike`,
+`_DbLike` и вспомогательные row-протоколы) с ровно теми методами, которые нужны
+командам. Реальные классы (ConfigStore/PromptStore/Database) подойдут под них
+структурно, без явного наследования.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Sequence
+from typing import Protocol
+
+from aiogram import F, Router
+from aiogram.types import Message, User
+
+from trolobot.config_models import Config
+from trolobot.few_shot import FewShot
+from trolobot.sanitize import sanitize_display_name
+from trolobot.settings import Settings
+from trolobot.timeutil import day_key, local_dt
+
+logger = logging.getLogger(__name__)
+
+# Ограничение длины ответа владельцу (PLAN.md, этап 6: "не длиннее 3500 символов").
+_MAX_REPLY_LEN = 3500
+# Превью тела промпта в /prompt без "full" (CLAUDE.md, "Интерфейсы этапа 6").
+_PROMPT_PREVIEW_LEN = 1500
+
+_HELP_TEXT = (
+    "Команды:\n"
+    "/panic — стоп навсегда, до /resume\n"
+    "/resume — снять панику и /stop\n"
+    "/status — краткое состояние бота\n"
+    "/last [n] — последние реплики бота (по умолчанию 5, максимум 20)\n"
+    "/why [hours] — сводка причин молчания за N часов (по умолчанию 1)\n"
+    "/get [prefix] — текущие параметры конфига\n"
+    "/set <ключ> <значение> — изменить параметр без рестарта\n"
+    "/unset <ключ> — сбросить параметр к дефолту из yaml\n"
+    "/prompt [full] — текущий системный промпт\n"
+    "/rollback <версия> — откат промпта на версию\n"
+    "/ex last [n] — последние примеры few-shot\n"
+    "/ex rm [n] — удалить n-й пример few-shot с конца"
+)
+
+
+class _MessageRowLike(Protocol):
+    """Подмножество db.MessageRow, нужное /ex add.
+
+    Члены объявлены через ``@property`` (а не как обычные атрибуты), потому что
+    db.MessageRow — frozen dataclass: его поля read-only, а обычный атрибут в
+    Protocol требует settable-совместимости (инвариантно в обе стороны) и не
+    матчится на read-only поле. ``@property`` в Protocol — это ровно read-only
+    член, который frozen dataclass удовлетворяет структурно.
+    """
+
+    @property
+    def display_name(self) -> str | None: ...
+    @property
+    def text(self) -> str | None: ...
+
+
+class _BotReplyRowLike(Protocol):
+    """Подмножество db.BotReplyRow, нужное /ex add и /last. См. _MessageRowLike про @property."""
+
+    @property
+    def trigger(self) -> str: ...
+    @property
+    def trigger_tg_message_id(self) -> int | None: ...
+    @property
+    def text(self) -> str: ...
+    @property
+    def prompt_version(self) -> int: ...
+    @property
+    def few_shot_version(self) -> int: ...
+    @property
+    def delay_sec(self) -> int: ...
+    @property
+    def created_at(self) -> int: ...
+
+
+class _VersionRowLike(Protocol):
+    """Подмножество db.VersionRow, нужное /prompt (посчитать "всего M"). См. _MessageRowLike."""
+
+    @property
+    def version(self) -> int: ...
+
+
+class _DbLike(Protocol):
+    """Методы Database, которые использует commands.py.
+
+    Часть из них (add_mute/remove_mute/last_bot_replies/audit_stop/
+    message_by_tg_id/bot_reply_by_tg_id и версии промпта) пишет параллельно
+    другой агент — здесь только сигнатуры из контракта CLAUDE.md, без импорта db.py.
+    """
+
+    async def get_state(self, key: str) -> str | None: ...
+    async def set_state(self, key: str, value: str) -> None: ...
+    async def delete_state(self, key: str) -> None: ...
+    async def audit_stop(self, key: str, changed_by: int, now: int) -> None: ...
+    async def add_mute(self, user_id: int, display_name: str, muted_by: int, now: int) -> None: ...
+    async def remove_mute(self, user_id: int) -> bool: ...
+    # Sequence (не list) в возвращаемом типе: list инвариантен по своему параметру,
+    # так что list[_BotReplyRowLike] не принял бы Database.last_bot_replies(), чей
+    # реальный тип — list[BotReplyRow] (BotReplyRow — подтип _BotReplyRowLike, но
+    # List[BotReplyRow] всё равно не подтип List[_BotReplyRowLike]). Sequence
+    # объявлен ковариантным по элементу — этой проблемы не создаёт.
+    async def last_bot_replies(self, n: int) -> Sequence[_BotReplyRowLike]: ...
+    async def message_by_tg_id(
+        self, chat_id: int, tg_message_id: int
+    ) -> _MessageRowLike | None: ...
+    async def bot_reply_by_tg_id(self, tg_message_id: int) -> _BotReplyRowLike | None: ...
+    async def filter_log_summary(self, since: int) -> list[tuple[str, int]]: ...
+    async def load_pending(self) -> Sequence[object]: ...
+    async def night_unanswered(self) -> Sequence[object]: ...
+    async def prompt_versions(self) -> Sequence[_VersionRowLike]: ...
+
+
+class _ConfigStoreLike(Protocol):
+    """Методы stores.ConfigStore, которые использует commands.py."""
+
+    def get(self) -> Config: ...
+    async def set(
+        self, key: str, raw_value: str, changed_by: int, now: int
+    ) -> tuple[str | None, str]: ...
+    async def unset(self, key: str, changed_by: int, now: int) -> str | None: ...
+    def flat(self) -> list[tuple[str, str, bool]]: ...
+
+
+class _PromptStoreLike(Protocol):
+    """Методы stores.PromptStore, которые использует commands.py."""
+
+    def system_prompt(self) -> str: ...
+    def prompt_version(self) -> int: ...
+    def few_shot_version(self) -> int: ...
+    async def rollback_prompt(self, version: int) -> bool: ...
+    async def add_example(self, name: str, user: str, text: str, now: int) -> int: ...
+    async def remove_example(self, index: int, now: int) -> int: ...
+    def examples(self) -> list[FewShot]: ...
+
+
+class _CommandsDeps(Protocol):
+    """Зависимости build_commands_router. bot.Deps потом дополнят этими полями.
+
+    responder не используется ни одной командой этого модуля (только /status,
+    которому нужен исключительно db) — тип ослаблен до object, чтобы не тянуть
+    сюда responder.py.
+
+    Члены объявлены через ``@property``, а не как обычные атрибуты: commands.py
+    только читает deps.* и никогда не присваивает — по PEP 544 обычный (settable)
+    атрибут Protocol требует инвариантного совпадения типа в обе стороны, а
+    ``@property`` — только совместимости на чтение (ковариантно). bot.Deps —
+    обычный (не frozen) dataclass с более конкретными типами полей (ConfigStore,
+    PromptStore, Database, Responder | None), и без ``@property`` он не матчился
+    бы структурно на эти протокольные типы.
+    """
+
+    @property
+    def settings(self) -> Settings: ...
+    @property
+    def config_store(self) -> _ConfigStoreLike: ...
+    @property
+    def prompt_store(self) -> _PromptStoreLike: ...
+    @property
+    def db(self) -> _DbLike: ...
+    @property
+    def responder(self) -> object | None: ...
+    @property
+    def bot_user_id(self) -> int: ...
+    @property
+    def bot_username(self) -> str: ...
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_REPLY_LEN:
+        return text
+    return text[: _MAX_REPLY_LEN - 1] + "…"
+
+
+async def _reply(message: Message, text: str) -> None:
+    await message.answer(_truncate(text), parse_mode=None)
+
+
+def _is_owner(user: User | None, deps: _CommandsDeps) -> bool:
+    return (
+        user is not None
+        and deps.settings.admin_user_id != 0
+        and user.id == deps.settings.admin_user_id
+    )
+
+
+def _resolve_mention_target(message: Message) -> tuple[int, str] | None:
+    """Цель /mute или /unmute: реплай или text_mention-упоминание в entities.
+
+    Обычный @username (entity type "mention") не поддерживается — username
+    в БД не хранится, найти по нему пользователя нечем, игнорируем молча.
+    """
+    reply = message.reply_to_message
+    if reply is not None and reply.from_user is not None:
+        return reply.from_user.id, reply.from_user.full_name
+    for entity in message.entities or ():
+        if entity.type == "text_mention" and entity.user is not None:
+            return entity.user.id, entity.user.full_name
+    return None
+
+
+async def _cmd_stop(message: Message, deps: _CommandsDeps, now: int, user: User | None) -> None:
+    changed_by = user.id if user is not None else 0
+    await deps.db.set_state("stop_until", str(now + 86400))
+    await deps.db.audit_stop("stop", changed_by, now)
+    logger.info("stop: silenced until %s by user_id=%s", now + 86400, changed_by)
+
+
+async def _cmd_mute(message: Message, deps: _CommandsDeps, now: int, user: User | None) -> None:
+    """Без реплая/упоминания — мьютит самого отправителя, доступно всем. Реплаем
+    или упоминанием на ЧУЖОЕ сообщение — только владелец (иначе это готовый
+    инструмент травли: «тебя теперь бот не видит»). Цель-владелец или цель-бот —
+    молча ничего, кем бы ни была вызвана команда."""
+    if user is None:
+        return
+    target = _resolve_mention_target(message)
+    if target is None:
+        target_id, target_name = user.id, user.full_name
+    else:
+        target_id, target_name = target
+        if target_id != user.id and not _is_owner(user, deps):
+            return
+    if target_id == deps.settings.admin_user_id or target_id == deps.bot_user_id:
+        return
+    display_name = sanitize_display_name(target_name, target_id, set())
+    await deps.db.add_mute(target_id, display_name, user.id, now)
+    await deps.db.audit_stop(f"mute:{target_id}", user.id, now)
+    logger.info("mute: user_id=%s by user_id=%s", target_id, user.id)
+
+
+async def _cmd_unmute(message: Message, deps: _CommandsDeps, now: int, user: User | None) -> None:
+    """Без реплая/упоминания — снимает мьют с самого отправителя, доступно всем.
+    Реплаем или упоминанием на чужого — только владелец."""
+    if user is None:
+        return
+    target = _resolve_mention_target(message)
+    target_id = user.id if target is None else target[0]
+    if target is not None and target_id != user.id and not _is_owner(user, deps):
+        return
+    await deps.db.remove_mute(target_id)
+    await deps.db.audit_stop(f"unmute:{target_id}", user.id, now)
+    logger.info("unmute: user_id=%s by user_id=%s", target_id, user.id)
+
+
+async def _cmd_ex_add(message: Message, deps: _CommandsDeps, now: int) -> None:
+    reply = message.reply_to_message
+    if reply is None or reply.from_user is None or reply.from_user.id != deps.bot_user_id:
+        return
+    bot_reply = await deps.db.bot_reply_by_tg_id(reply.message_id)
+    if bot_reply is None:
+        return
+
+    trigger_msg = None
+    if bot_reply.trigger_tg_message_id is not None:
+        trigger_msg = await deps.db.message_by_tg_id(
+            message.chat.id, bot_reply.trigger_tg_message_id
+        )
+
+    if trigger_msg is not None and trigger_msg.display_name and trigger_msg.text:
+        name, user_text = trigger_msg.display_name, trigger_msg.text
+    else:
+        name, user_text = "Чат", "(без обращения)"
+
+    await deps.prompt_store.add_example(name=name, user=user_text, text=bot_reply.text, now=now)
+    logger.info("ex add: %r -> %r", user_text, bot_reply.text)
+
+
+async def _cmd_panic(message: Message, deps: _CommandsDeps, now: int, user: User) -> None:
+    await deps.db.set_state("panic", "1")
+    await deps.db.audit_stop("panic", user.id, now)
+    logger.info("panic set")
+    await _reply(message, "Паника. Бот молчит до /resume.")
+
+
+async def _cmd_resume(message: Message, deps: _CommandsDeps, now: int, user: User) -> None:
+    await deps.db.delete_state("panic")
+    await deps.db.delete_state("stop_until")
+    await deps.db.audit_stop("resume", user.id, now)
+    logger.info("resume")
+    await _reply(message, "Продолжаем.")
+
+
+async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
+    cfg = deps.config_store.get()
+    tz = cfg.persona.timezone
+
+    panic = await deps.db.get_state("panic") == "1"
+    stop_until_raw = await deps.db.get_state("stop_until")
+    stop_until = (
+        local_dt(int(stop_until_raw), tz).strftime("%H:%M %d.%m") if stop_until_raw else "нет"
+    )
+
+    ambient = int(await deps.db.get_state(day_key("ambient_count", now, tz)) or "0")
+    mention = int(await deps.db.get_state(day_key("mention_count", now, tz)) or "0")
+    llm_calls = int(await deps.db.get_state(day_key("llm_calls", now, tz)) or "0")
+    llm_spent = float(await deps.db.get_state(day_key("llm_spent_usd", now, tz)) or "0")
+
+    pending = len(await deps.db.load_pending())
+    night_queue = len(await deps.db.night_unanswered())
+
+    lines = [
+        f"Паника: {'да' if panic else 'нет'}",
+        f"Стоп до: {stop_until}",
+        f"Промпт: v{deps.prompt_store.prompt_version()}, "
+        f"few-shot: v{deps.prompt_store.few_shot_version()}",
+        f"Модели: main={cfg.llm.main_model or '-'}, judge={cfg.llm.judge_model or '-'}",
+        f"Shadow: {'да' if cfg.filters.shadow else 'нет'}",
+        f"Сегодня: ambient={ambient}, mention={mention}, "
+        f"llm_calls={llm_calls}, llm_spent=${llm_spent:.2f}",
+        f"Pending: {pending}",
+        f"Night queue: {night_queue}",
+    ]
+    await _reply(message, "\n".join(lines))
+
+
+async def _cmd_last(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
+    n = 5
+    if args:
+        try:
+            n = int(args[0])
+        except ValueError:
+            n = 5
+    n = max(1, min(n, 20))
+
+    tz = deps.config_store.get().persona.timezone
+    rows = await deps.db.last_bot_replies(n)
+    lines = [
+        f"{local_dt(row.created_at, tz).strftime('%H:%M %d.%m')} | {row.trigger} | "
+        f"p{row.prompt_version}/f{row.few_shot_version} | +{row.delay_sec}s | {row.text}"
+        for row in rows
+    ]
+    await _reply(message, "\n".join(lines) if lines else "Пусто.")
+
+
+async def _cmd_why(message: Message, deps: _CommandsDeps, now: int, args: list[str]) -> None:
+    hours = 1
+    if args:
+        try:
+            hours = int(args[0])
+        except ValueError:
+            hours = 1
+    hours = max(1, min(hours, 168))
+
+    summary = await deps.db.filter_log_summary(now - hours * 3600)
+    lines = [f"{reason} {count}" for reason, count in summary]
+    await _reply(message, "\n".join(lines) if lines else "Пусто.")
+
+
+async def _cmd_get(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
+    prefix = args[0] if args else ""
+    lines = [
+        f"{key}{'*' if overridden else ''}: {value}"
+        for key, value, overridden in deps.config_store.flat()
+        if key.startswith(prefix)
+    ]
+    await _reply(message, "\n".join(lines) if lines else "Пусто.")
+
+
+async def _cmd_set(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    if len(args) < 2:
+        await _reply(message, "Использование: /set <ключ> <значение>")
+        return
+    key, value = args[0], " ".join(args[1:])
+    old, new = await deps.config_store.set(key, value, admin_user_id, now)
+    await _reply(message, f"{key}: {old} → {new}")
+
+
+async def _cmd_unset(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    if not args:
+        await _reply(message, "Использование: /unset <ключ>")
+        return
+    key = args[0]
+    default = await deps.config_store.unset(key, admin_user_id, now)
+    if default is None:
+        await _reply(message, f"{key}: не был переопределён")
+    else:
+        await _reply(message, f"{key}: сброшен к {default}")
+
+
+async def _cmd_prompt(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
+    full = bool(args) and args[0].lower() == "full"
+    body = deps.prompt_store.system_prompt()
+    total = len(await deps.db.prompt_versions())
+    header = f"версия {deps.prompt_store.prompt_version()} (активная), всего {total}"
+
+    if full:
+        text = f"{header}\n\n{body}"
+    else:
+        preview = body[:_PROMPT_PREVIEW_LEN]
+        if len(body) > _PROMPT_PREVIEW_LEN:
+            preview += "…"
+        text = f"{header}\n\n{preview}"
+    await _reply(message, text)
+
+
+async def _cmd_rollback(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
+    if not args:
+        await _reply(message, "Использование: /rollback <версия>")
+        return
+    try:
+        version = int(args[0])
+    except ValueError:
+        await _reply(message, f"Ошибка: {args[0]!r} не похоже на номер версии")
+        return
+    if await deps.prompt_store.rollback_prompt(version):
+        await _reply(message, f"промпт: версия {version}")
+    else:
+        await _reply(message, f"Ошибка: версия {version} не найдена")
+
+
+async def _cmd_ex_last(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
+    n = 5
+    if len(args) > 1:
+        try:
+            n = int(args[1])
+        except ValueError:
+            n = 5
+    n = max(1, n)
+
+    lines = []
+    for example in deps.prompt_store.examples()[-n:]:
+        payload = json.dumps(
+            {"speak": example.speak, "text": example.text},
+            ensure_ascii=False,
+            separators=(", ", ": "),
+        )
+        lines.append(f"{example.name}: {example.user} → {payload}")
+    await _reply(message, "\n".join(lines) if lines else "Пусто.")
+
+
+async def _cmd_ex_rm(message: Message, deps: _CommandsDeps, now: int, args: list[str]) -> None:
+    n = 1
+    if len(args) > 1:
+        try:
+            n = int(args[1])
+        except ValueError:
+            n = 1
+    n = max(1, n)
+    version = await deps.prompt_store.remove_example(n, now)
+    await _reply(message, f"few-shot: версия {version} (удалён пример {n} с конца)")
+
+
+def build_commands_router(deps: _CommandsDeps) -> Router:
+    """Собирает Router с одним хендлером-диспетчером команд.
+
+    Должен быть включён в Dispatcher ПЕРВЫМ, перед trolobot.bot.build_router —
+    команды не должны попадать в гейт и в лог/БД основного хендлера. aiogram
+    сам останавливает распространение сообщения после первого хендлера, чья
+    функция вернулась без исключения, так что явного "cancel propagation" не
+    требуется — важен только порядок регистрации роутеров у интегратора.
+    """
+    router = Router(name=__name__)
+
+    @router.message((F.text & F.text.startswith("/")) | (F.caption & F.caption.startswith("/")))
+    async def handle_command(message: Message) -> None:
+        text = message.text or message.caption or ""
+        tokens = text.split()
+        if not tokens:
+            return
+        cmd_token = tokens[0][1:]
+        if "@" in cmd_token:
+            cmd_part, _, suffix = cmd_token.partition("@")
+            # Суффикс "@другой_бот" в групповых чатах Telegram рассылает команду
+            # всем ботам сразу — исполняем только адресованную нам (без учёта
+            # регистра); иначе, например, /stop@weatherbot остановил бы и нас.
+            if suffix.lower() != deps.bot_username.lower():
+                return
+            cmd = cmd_part.lower()
+        else:
+            cmd = cmd_token.lower()
+        args = tokens[1:]
+
+        user = message.from_user
+        now = int(message.date.timestamp())
+
+        is_chat = message.chat.id == deps.settings.allowed_chat_id
+        is_owner_private = (
+            message.chat.type == "private"
+            and deps.settings.admin_user_id != 0
+            and user is not None
+            and user.id == deps.settings.admin_user_id
+        )
+        if not is_chat and not is_owner_private:
+            return
+
+        try:
+            if is_chat:
+                if cmd == "stop":
+                    await _cmd_stop(message, deps, now, user)
+                elif cmd == "mute":
+                    await _cmd_mute(message, deps, now, user)
+                elif cmd == "unmute":
+                    await _cmd_unmute(message, deps, now, user)
+                elif cmd == "ex" and args and args[0].lower() == "add" and _is_owner(user, deps):
+                    await _cmd_ex_add(message, deps, now)
+                # Неизвестная/чужая команда в чате — молчание, без лога и без ответа.
+            else:
+                assert user is not None  # гарантировано is_owner_private выше
+                admin_user_id = deps.settings.admin_user_id
+                if cmd == "panic":
+                    await _cmd_panic(message, deps, now, user)
+                elif cmd == "resume":
+                    await _cmd_resume(message, deps, now, user)
+                elif cmd == "status":
+                    await _cmd_status(message, deps, now)
+                elif cmd == "last":
+                    await _cmd_last(message, deps, args)
+                elif cmd == "why":
+                    await _cmd_why(message, deps, now, args)
+                elif cmd == "get":
+                    await _cmd_get(message, deps, args)
+                elif cmd == "set":
+                    await _cmd_set(message, deps, now, admin_user_id, args)
+                elif cmd == "unset":
+                    await _cmd_unset(message, deps, now, admin_user_id, args)
+                elif cmd == "prompt":
+                    await _cmd_prompt(message, deps, args)
+                elif cmd == "rollback":
+                    await _cmd_rollback(message, deps, args)
+                elif cmd == "ex" and args and args[0].lower() == "last":
+                    await _cmd_ex_last(message, deps, args)
+                elif cmd == "ex" and args and args[0].lower() == "rm":
+                    await _cmd_ex_rm(message, deps, now, args)
+                else:
+                    await _reply(message, _HELP_TEXT)
+        except Exception as exc:
+            logger.exception("command /%s failed", cmd)
+            if is_owner_private:
+                await _reply(message, f"Ошибка: {exc}")
+
+    return router

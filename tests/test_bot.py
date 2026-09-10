@@ -22,6 +22,7 @@ from trolobot.db import Database
 from trolobot.patterns import Patterns
 from trolobot.sanitize import stable_n
 from trolobot.settings import Settings
+from trolobot.stores import ConfigStore, PromptStore
 
 OWN_CHAT_ID = -1001234567890
 FOREIGN_CHAT_ID = -100999
@@ -92,14 +93,22 @@ def _deps(
 ) -> Deps:
     reserved = {cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers}
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, bot_username)
+    # build_router (в отличие от build_commands_router) ни config_store, ни
+    # prompt_store не читает — конструируем их без .load() (не делает I/O в
+    # __init__), только чтобы Deps был валиден структурно и по типам.
+    config_store = ConfigStore(Path("unused-config.yaml"), database)
+    prompt_store = PromptStore(database, Path("unused-prompt.txt"), Path("unused-few-shot.yaml"))
     return Deps(
         settings=settings,
         config_getter=lambda: cfg,
         db=database,
         bot_user_id=bot_user_id,
         reserved_names=reserved,
-        patterns=patterns,
+        patterns_getter=lambda: patterns,
         rng=rng if rng is not None else random.Random(0),
+        config_store=config_store,
+        prompt_store=prompt_store,
+        bot_username=bot_username,
     )
 
 
@@ -542,7 +551,7 @@ async def test_gate_error_does_not_break_message_write(
 ) -> None:
     settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
     deps = _deps(db, config, settings=settings)
-    deps.patterns = _RaisingPatterns()
+    deps.patterns_getter = lambda: _RaisingPatterns()  # type: ignore[assignment,return-value]
     router = build_router(deps)
     handler = router.message.handlers[0].callback
 

@@ -217,6 +217,40 @@ class FixedRandom:
         return self._value
 
 
+class FakePromptStore:
+    """Подделка stores.PromptStore: подмена системного промпта/few-shot и их версий.
+
+    Отдаёт фиксированные значения, но через методы (не через поля Responder) —
+    так тесты проверяют, что Responder действительно читает prompt_store на
+    каждом _respond, а не кэширует его в конструкторе.
+    """
+
+    def __init__(
+        self,
+        *,
+        prompt: str = PROMPT_TEMPLATE,
+        few_shot: str = 'Дима: привет\n{"speak": true, "text": "И тебе."}',
+        prompt_version: int = 1,
+        few_shot_version: int = 1,
+    ) -> None:
+        self.prompt = prompt
+        self.few_shot = few_shot
+        self.prompt_version_value = prompt_version
+        self.few_shot_version_value = few_shot_version
+
+    def system_prompt(self) -> str:
+        return self.prompt
+
+    def prompt_version(self) -> int:
+        return self.prompt_version_value
+
+    def few_shot_text(self) -> str:
+        return self.few_shot
+
+    def few_shot_version(self) -> int:
+        return self.few_shot_version_value
+
+
 def _make_responder(
     db_: Database,
     cfg: Config,
@@ -227,6 +261,7 @@ def _make_responder(
     seed: int = 0,
     rng: random.Random | FixedRandom | None = None,
     judge: Judge | None = None,
+    prompt_store: FakePromptStore | None = None,
 ) -> Responder:
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
     return Responder(
@@ -236,10 +271,7 @@ def _make_responder(
         llm=llm,
         judge=judge,
         patterns_getter=lambda: patterns,
-        prompt_template=PROMPT_TEMPLATE,
-        few_shot_getter=lambda: 'Дима: привет\n{"speak": true, "text": "И тебе."}',
-        prompt_version=1,
-        few_shot_version=1,
+        prompt_store=prompt_store if prompt_store is not None else FakePromptStore(),
         rng=rng if rng is not None else random.Random(seed),  # type: ignore[arg-type]
         chat_id=CHAT_ID,
         bot_user_id=BOT_USER_ID,
@@ -1183,10 +1215,7 @@ async def test_ambient_generation_is_serialized_and_recheck_blocks_second(
         cfg_getter=lambda: cfg,
         llm=llm,
         patterns_getter=lambda: patterns,
-        prompt_template=PROMPT_TEMPLATE,
-        few_shot_getter=lambda: 'Дима: привет\n{"speak": true, "text": "И тебе."}',
-        prompt_version=1,
-        few_shot_version=1,
+        prompt_store=FakePromptStore(),
         rng=random.Random(0),
         chat_id=CHAT_ID,
         bot_user_id=BOT_USER_ID,
@@ -1379,6 +1408,59 @@ async def test_multiple_reasons_produce_one_filter_log_row_each(
         await llm.aclose()
 
 
+# --- 24. prompt_store читается заново на каждом _respond, не кэшируется в __init__ ---
+
+
+async def test_prompt_store_is_read_fresh_on_each_respond(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(
+        prompt=PROMPT_TEMPLATE, few_shot="Аня: привет\n{}", prompt_version=1, few_shot_version=1
+    )
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=1000, user_id=5, situation="", delay_sec=5
+            ),
+        )
+        payload = _payload(calls[0])
+        system_content = payload["messages"][0]["content"]  # type: ignore[index]
+        assert "Аня: привет" in system_content
+
+        last = await db.last_bot_replies(1)
+        assert last[0].prompt_version == 1
+        assert last[0].few_shot_version == 1
+
+        # Меняем версии на PromptStore "снаружи" (как это делают /rollback и /ex add) —
+        # без пересоздания Responder следующий _respond должен увидеть новые значения.
+        prompt_store.prompt = "Новый системный промпт для {age}, few-shot: {few_shot}"
+        prompt_store.few_shot = "Дима: пока\n{}"
+        prompt_store.prompt_version_value = 2
+        prompt_store.few_shot_version_value = 3
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=1001, user_id=5, situation="", delay_sec=5
+            ),
+        )
+        payload2 = _payload(calls[1])
+        system_content_2 = payload2["messages"][0]["content"]  # type: ignore[index]
+        assert "Новый системный промпт" in system_content_2
+        assert "Дима: пока" in system_content_2
+
+        last2 = await db.last_bot_replies(1)
+        assert last2[0].prompt_version == 2
+        assert last2[0].few_shot_version == 3
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 # --- 23. Судья передаётся в check_output ---
 
 
@@ -1415,6 +1497,82 @@ async def test_judge_is_passed_through_to_check_output(
             ),
         )
         assert captured["judge"] is dummy_judge
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 24. llm.main_model пустой: LLM включён ключом, но модель ещё не задана ---
+
+
+async def test_no_main_model_skips_llm_and_logs_no_model(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    """LLM/Judge/Responder создаются в app.py, как только есть openrouter_api_key,
+    независимо от llm.main_model (CLAUDE.md, "Интерфейсы этапа 6") — пустая модель
+    не должна ронять Responder, только тихо срезать ответ и не ходить в сеть."""
+    cfg = _config()
+    cfg.llm.main_model = ""
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        msg = _gate_message(tg_message_id=900, user_id=5, text="привет всем", created_at=DAY_NOW)
+        with caplog.at_level(logging.WARNING):
+            await responder.on_gate_pass(msg, Trigger.AMBIENT, "Дима")
+            assert responder._debounce_task is not None
+            await clock.run_until(responder._debounce_task)
+
+        assert calls == []
+        assert bot.sent == []
+
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("llm:no_model") == 1
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "main_model" in warnings[0].message
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_main_model_set_hot_enables_llm_on_next_respond(db: Database) -> None:
+    """После горячей установки llm.main_model (как сделал бы ConfigStore.set)
+    следующий _respond того же Responder должен уже звать LLM — без пересборки
+    Responder и без рестарта процесса."""
+    cfg = _config()
+    cfg.llm.main_model = ""
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        first_msg = _gate_message(
+            tg_message_id=901, user_id=5, text="привет всем", created_at=DAY_NOW
+        )
+        await responder.on_gate_pass(first_msg, Trigger.AMBIENT, "Дима")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        assert calls == []
+        assert bot.sent == []
+
+        # Горячая установка модели (то же самое, что делает ConfigStore.set -> /set).
+        cfg.llm.main_model = "test/model"
+
+        await asyncio.sleep(0)  # разрешить предыдущему дебаунс-таску полностью улечься
+        second_msg = _gate_message(
+            tg_message_id=902, user_id=5, text="как настроение", created_at=DAY_NOW + 30
+        )
+        await responder.on_gate_pass(second_msg, Trigger.AMBIENT, "Дима")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Бывает."
     finally:
         await responder.shutdown()
         await llm.aclose()

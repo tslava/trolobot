@@ -1,4 +1,7 @@
-"""Сборка процесса: настройки, конфиг, БД, бот, фоновые таски (PLAN.md, этап 1)."""
+"""Сборка процесса: настройки, БД, конфиг/промпт-хранилища, бот, фоновые таски.
+
+PLAN.md, этапы 1 и 6.
+"""
 
 from __future__ import annotations
 
@@ -12,49 +15,23 @@ import httpx
 from aiogram import Bot, Dispatcher
 
 from trolobot.bot import Deps, build_router
-from trolobot.config import load_config
-from trolobot.config_models import Config
+from trolobot.commands import build_commands_router
 from trolobot.db import Database
-from trolobot.few_shot import load_few_shot, render_few_shot
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
-from trolobot.patterns import Patterns
 from trolobot.responder import Responder
 from trolobot.retention import retention_loop
 from trolobot.settings import Settings
+from trolobot.stores import ConfigStore, PromptStore
 
 logger = logging.getLogger(__name__)
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
-# Версии промпта и few-shot пока константы: таблицы версий (prompt_versions,
-# few_shot_versions) появляются на этапе 6.
-_PROMPT_VERSION = 1
-_FEW_SHOT_VERSION = 1
-
 
 def setup_logging(level: str) -> None:
     """stdout, формат из CLAUDE.md. Секреты сюда никогда не попадают."""
     logging.basicConfig(stream=sys.stdout, level=level, format=_LOG_FORMAT)
-
-
-class ConfigHolder:
-    """Изменяемый контейнер текущего Config.
-
-    На этапе 1 config_getter всегда возвращает один и тот же объект — горячая
-    перезагрузка появится в этапе 6. Класс существует уже сейчас, чтобы Deps.config_getter
-    можно было завязать на .get() и потом просто подменять объект внутри через .set(),
-    не меняя контракт bot.py.
-    """
-
-    def __init__(self, config: Config) -> None:
-        self._config = config
-
-    def get(self) -> Config:
-        return self._config
-
-    def set(self, config: Config) -> None:
-        self._config = config
 
 
 async def main() -> None:
@@ -71,80 +48,85 @@ async def main() -> None:
     llm: LLMClient | None = None
     responder: Responder | None = None
     try:
-        overrides = await db.get_overrides()
-        config = load_config(settings.config_path, overrides)
+        config_store = ConfigStore(settings.config_path, db)
+        await config_store.load()
 
-        # Валидация на старте: файлы должны читаться, иначе падаем сразу, а не на первом сообщении.
-        few_shot_items = load_few_shot(settings.few_shot_path)
-        prompt_template = settings.prompt_path.read_text(encoding="utf-8")
-
-        holder = ConfigHolder(config)
+        prompt_store = PromptStore(db, settings.prompt_path, settings.few_shot_path)
+        await prompt_store.load()
 
         bot = Bot(token=settings.bot_token.get_secret_value())
         me = await bot.get_me()
+        config_store.set_bot_username(me.username or "")
+
+        cfg = config_store.get()
         reserved_names = {
-            config.persona.name,
-            config.persona.display_name,
-            *config.persona.name_triggers,
+            cfg.persona.name,
+            cfg.persona.display_name,
+            *cfg.persona.name_triggers,
             me.username or "",
         } - {""}
 
-        # TODO(этап 6): Patterns зависит от config (filters, name_triggers) и от username
-        # бота — при горячей перезагрузке конфига (config_overrides) его нужно пересобирать
-        # вместе с ConfigHolder.set(), иначе гейт продолжит работать по старым паттернам.
-        patterns = Patterns(config.filters, config.persona.name_triggers, me.username or "")
-
         rng = random.Random()
+
+        if settings.admin_user_id == 0:
+            logger.warning("команды владельца отключены: admin_user_id не задан")
+
+        deps = Deps(
+            settings=settings,
+            config_getter=config_store.get,
+            db=db,
+            bot_user_id=me.id,
+            reserved_names=reserved_names,
+            patterns_getter=config_store.patterns,
+            rng=rng,
+            config_store=config_store,
+            prompt_store=prompt_store,
+            bot_username=me.username or "",
+        )
+
+        dispatcher = Dispatcher()
+        # Роутер команд ПЕРВЫМ: иначе команды в разрешённом чате попали бы в гейт
+        # основного роутера и записались бы в messages как обычный текст.
+        dispatcher.include_router(build_commands_router(deps))
+        dispatcher.include_router(build_router(deps))
 
         api_key = settings.openrouter_api_key
         if api_key is None:
             logger.warning("LLM отключён, ответы не генерируются: openrouter_api_key не задан")
-        elif not holder.get().llm.main_model:
-            logger.warning("LLM отключён, ответы не генерируются: llm.main_model не задан")
         else:
-            http = httpx.AsyncClient(timeout=holder.get().llm.timeout_sec)
+            # LLMClient/Judge/Responder создаются, как только есть ключ, независимо
+            # от того, заданы ли llm.main_model/llm.judge_model сейчас — оба меняются
+            # на горячую через /set, и Responder/Judge сами проверяют пустую модель
+            # на каждом вызове (llm:no_model, judge.check -> []), а не один раз при
+            # старте процесса.
+            if not cfg.llm.main_model:
+                logger.warning("llm.main_model не задан: ответы не генерируются до /set")
+            if not cfg.llm.judge_model:
+                logger.warning("судья отключён: llm.judge_model не задан")
+
+            http = httpx.AsyncClient(timeout=cfg.llm.timeout_sec)
             llm = LLMClient(
-                api_key=api_key.get_secret_value(), cfg_getter=holder.get, db=db, http=http
+                api_key=api_key.get_secret_value(), cfg_getter=config_store.get, db=db, http=http
             )
 
-            judge: Judge | None = None
-            if holder.get().llm.judge_model:
-                judge_prompt = settings.judge_prompt_path.read_text(encoding="utf-8")
-                judge = Judge(llm, holder.get, judge_prompt)
-            else:
-                logger.warning("судья отключён: llm.judge_model не задан")
+            judge_prompt = settings.judge_prompt_path.read_text(encoding="utf-8")
+            judge: Judge | None = Judge(llm, config_store.get, judge_prompt)
 
             responder = Responder(
                 bot=bot,
                 db=db,
-                cfg_getter=holder.get,
+                cfg_getter=config_store.get,
                 llm=llm,
                 judge=judge,
-                patterns_getter=lambda: patterns,
-                prompt_template=prompt_template,
-                few_shot_getter=lambda: render_few_shot(few_shot_items),
-                prompt_version=_PROMPT_VERSION,
-                few_shot_version=_FEW_SHOT_VERSION,
+                patterns_getter=config_store.patterns,
+                prompt_store=prompt_store,
                 rng=rng,
                 chat_id=settings.allowed_chat_id,
                 bot_user_id=me.id,
             )
+            deps.responder = responder
 
-        deps = Deps(
-            settings=settings,
-            config_getter=holder.get,
-            db=db,
-            bot_user_id=me.id,
-            reserved_names=reserved_names,
-            patterns=patterns,
-            rng=rng,
-            responder=responder,
-        )
-
-        dispatcher = Dispatcher()
-        dispatcher.include_router(build_router(deps))
-
-        retention_task = asyncio.create_task(retention_loop(db, holder.get))
+        retention_task = asyncio.create_task(retention_loop(db, config_store.get))
         if responder is not None:
             await responder.restore_pending()
             morning_task = asyncio.create_task(responder.morning_job())

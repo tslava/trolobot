@@ -70,6 +70,27 @@ class NightRow:
     answered_at: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class BotReplyRow:
+    id: int
+    tg_message_id: int
+    trigger: str
+    trigger_tg_message_id: int | None
+    text: str
+    prompt_version: int
+    few_shot_version: int
+    delay_sec: int
+    created_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class VersionRow:
+    version: int
+    note: str
+    active: bool
+    created_at: int
+
+
 def _state_key_date_suffix(key: str) -> str | None:
     """Суффикс после последнего ':' или None, если двоеточия в ключе нет."""
     if ":" not in key:
@@ -625,3 +646,271 @@ class Database:
         if row is None or row["max_created_at"] is None:
             return None
         return int(row["max_created_at"])
+
+    # -- этап 6: управление из телеграма -----------------------------------
+
+    async def set_override(self, key: str, value: str, changed_by: int, now: int) -> str | None:
+        """UPSERT в config_overrides + строка в config_audit, одной транзакцией.
+
+        Возвращает предыдущее значение (None, если ключ не был переопределён).
+        """
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("SELECT value FROM config_overrides WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            old_value = None if row is None else str(row["value"])
+            await conn.execute(
+                "INSERT INTO config_overrides (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, value, now),
+            )
+            await conn.execute(
+                "INSERT INTO config_audit (key, old_value, new_value, changed_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (key, old_value, value, changed_by, now),
+            )
+            await conn.commit()
+            return old_value
+
+    async def delete_override(self, key: str, changed_by: int, now: int) -> str | None:
+        """DELETE из config_overrides + строка в config_audit (new_value=NULL), одной транзакцией.
+
+        Возвращает значение до удаления (None, если ключ и не был переопределён).
+        """
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("SELECT value FROM config_overrides WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            old_value = None if row is None else str(row["value"])
+            await conn.execute("DELETE FROM config_overrides WHERE key = ?", (key,))
+            await conn.execute(
+                "INSERT INTO config_audit (key, old_value, new_value, changed_by, created_at) "
+                "VALUES (?, ?, NULL, ?, ?)",
+                (key, old_value, changed_by, now),
+            )
+            await conn.commit()
+            return old_value
+
+    async def audit_stop(self, key: str, changed_by: int, now: int) -> None:
+        """Строка в config_audit без изменения config_overrides — для /stop и /panic."""
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "INSERT INTO config_audit (key, old_value, new_value, changed_by, created_at) "
+                "VALUES (?, NULL, NULL, ?, ?)",
+                (key, changed_by, now),
+            )
+            await conn.commit()
+
+    async def add_mute(self, user_id: int, display_name: str, muted_by: int, now: int) -> None:
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "INSERT INTO muted_users (user_id, display_name, muted_by, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name, "
+                "muted_by = excluded.muted_by, created_at = excluded.created_at",
+                (user_id, display_name, muted_by, now),
+            )
+            await conn.commit()
+
+    async def remove_mute(self, user_id: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM muted_users WHERE user_id = ?", (user_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def last_bot_replies(self, n: int) -> list[BotReplyRow]:
+        """Последние n реплик бота, новые первыми."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, tg_message_id, trigger, trigger_tg_message_id, text, prompt_version, "
+            "few_shot_version, delay_sec, created_at FROM bot_replies "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (n,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            BotReplyRow(
+                id=row["id"],
+                tg_message_id=row["tg_message_id"],
+                trigger=row["trigger"],
+                trigger_tg_message_id=row["trigger_tg_message_id"],
+                text=row["text"],
+                prompt_version=row["prompt_version"],
+                few_shot_version=row["few_shot_version"],
+                delay_sec=row["delay_sec"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def prompt_versions(self) -> list[VersionRow]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT version, note, active, created_at FROM prompt_versions ORDER BY version"
+        )
+        rows = await cursor.fetchall()
+        return [
+            VersionRow(
+                version=row["version"],
+                note=row["note"],
+                active=bool(row["active"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def active_prompt(self) -> tuple[int, str] | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT version, body FROM prompt_versions WHERE active = 1 LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return (int(row["version"]), str(row["body"]))
+
+    async def add_prompt_version(self, body: str, note: str, now: int) -> int:
+        """Новая версия = max(version)+1, становится active, остальные active=0.
+
+        Одна транзакция: без неё конкурентный вызов мог бы дважды прочитать
+        один и тот же max(version) и оставить две активные версии.
+        """
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("SELECT MAX(version) AS max_version FROM prompt_versions")
+            row = await cursor.fetchone()
+            next_version = (
+                1 if row is None or row["max_version"] is None else int(row["max_version"]) + 1
+            )
+            await conn.execute("UPDATE prompt_versions SET active = 0")
+            await conn.execute(
+                "INSERT INTO prompt_versions (version, body, note, active, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (next_version, body, note, now),
+            )
+            await conn.commit()
+            return next_version
+
+    async def activate_prompt(self, version: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "SELECT 1 FROM prompt_versions WHERE version = ?", (version,)
+            )
+            exists = await cursor.fetchone()
+            if exists is None:
+                return False
+            await conn.execute("UPDATE prompt_versions SET active = 0")
+            await conn.execute(
+                "UPDATE prompt_versions SET active = 1 WHERE version = ?", (version,)
+            )
+            await conn.commit()
+            return True
+
+    async def active_few_shot(self) -> tuple[int, str] | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT version, body_yaml FROM few_shot_versions WHERE active = 1 LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return (int(row["version"]), str(row["body_yaml"]))
+
+    async def add_few_shot_version(self, body_yaml: str, note: str, now: int) -> int:
+        """Как add_prompt_version, но для few_shot_versions — независимая нумерация."""
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("SELECT MAX(version) AS max_version FROM few_shot_versions")
+            row = await cursor.fetchone()
+            next_version = (
+                1 if row is None or row["max_version"] is None else int(row["max_version"]) + 1
+            )
+            await conn.execute("UPDATE few_shot_versions SET active = 0")
+            await conn.execute(
+                "INSERT INTO few_shot_versions (version, body_yaml, note, active, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (next_version, body_yaml, note, now),
+            )
+            await conn.commit()
+            return next_version
+
+    async def activate_few_shot(self, version: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "SELECT 1 FROM few_shot_versions WHERE version = ?", (version,)
+            )
+            exists = await cursor.fetchone()
+            if exists is None:
+                return False
+            await conn.execute("UPDATE few_shot_versions SET active = 0")
+            await conn.execute(
+                "UPDATE few_shot_versions SET active = 1 WHERE version = ?", (version,)
+            )
+            await conn.commit()
+            return True
+
+    async def message_by_tg_id(self, chat_id: int, tg_message_id: int) -> MessageRow | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, tg_message_id, chat_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, is_bot, created_at FROM messages "
+            "WHERE chat_id = ? AND tg_message_id = ? ORDER BY id DESC LIMIT 1",
+            (chat_id, tg_message_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return MessageRow(
+            id=row["id"],
+            tg_message_id=row["tg_message_id"],
+            chat_id=row["chat_id"],
+            user_id=row["user_id"],
+            display_name=row["display_name"],
+            text=row["text"],
+            reply_to_tg_message_id=row["reply_to_tg_message_id"],
+            is_bot=bool(row["is_bot"]),
+            created_at=row["created_at"],
+        )
+
+    async def bot_reply_by_tg_id(self, tg_message_id: int) -> BotReplyRow | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, tg_message_id, trigger, trigger_tg_message_id, text, prompt_version, "
+            "few_shot_version, delay_sec, created_at FROM bot_replies WHERE tg_message_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (tg_message_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return BotReplyRow(
+            id=row["id"],
+            tg_message_id=row["tg_message_id"],
+            trigger=row["trigger"],
+            trigger_tg_message_id=row["trigger_tg_message_id"],
+            text=row["text"],
+            prompt_version=row["prompt_version"],
+            few_shot_version=row["few_shot_version"],
+            delay_sec=row["delay_sec"],
+            created_at=row["created_at"],
+        )
+
+    async def prompt_version_bodies(self) -> list[str]:
+        """Тела всех сохранённых версий системного промпта (для сида PromptStore)."""
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT body FROM prompt_versions")
+        rows = await cursor.fetchall()
+        return [str(row["body"]) for row in rows]
+
+    async def few_shot_version_bodies(self) -> list[str]:
+        """Тела всех сохранённых версий few-shot (для сида PromptStore)."""
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT body_yaml FROM few_shot_versions")
+        rows = await cursor.fetchall()
+        return [str(row["body_yaml"]) for row in rows]
