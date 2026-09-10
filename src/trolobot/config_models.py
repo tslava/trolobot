@@ -146,8 +146,8 @@ class BehaviourConfig(BaseModel):
 
 class LlmConfig(BaseModel):
     provider: str = "openrouter"
-    main_model: str = ""
-    judge_model: str = ""
+    main_model: str = "anthropic/claude-sonnet-5"
+    judge_model: str = "openai/gpt-5.4-nano"
     timeout_sec: int = Field(default=30, ge=1, le=120)
     max_tokens: int = Field(default=200, ge=1, le=4000)
     daily_calls_cap: int = Field(default=60, ge=0, le=1000)
@@ -155,8 +155,8 @@ class LlmConfig(BaseModel):
     circuit_errors: int = Field(default=5, ge=1, le=100)
     circuit_pause_min: int = Field(default=30, ge=0, le=1440)
     # Fallback-цены за 1M токенов: используются, только если провайдер не вернул usage.cost.
-    price_in_usd_per_1m: float = Field(default=5.0, ge=0.0)
-    price_out_usd_per_1m: float = Field(default=25.0, ge=0.0)
+    price_in_usd_per_1m: float = Field(default=2.0, ge=0.0)
+    price_out_usd_per_1m: float = Field(default=10.0, ge=0.0)
 
     @field_validator("main_model", "judge_model")
     @classmethod

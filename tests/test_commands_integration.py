@@ -247,7 +247,7 @@ async def test_set_llm_main_model_garbage_replies_with_error_and_does_not_write(
 
     assert len(sent) == 1
     assert sent[0].startswith("Ошибка")
-    assert config_store.get().llm.main_model == ""
+    assert config_store.get().llm.main_model == "anthropic/claude-sonnet-5"
     assert "llm.main_model" not in await db.get_overrides()
 
 

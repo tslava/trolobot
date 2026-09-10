@@ -365,13 +365,15 @@ behaviour:
 
 llm:
   provider: openrouter                 # OpenAI-совместимый API, ключ в .env
-  main_model: ""                       # id модели в OpenRouter, выбрать на этапе 3
-  judge_model: ""                      # маленькая и дешёвая, этап 4
+  main_model: "anthropic/claude-sonnet-5"   # id модели в OpenRouter
+  judge_model: "openai/gpt-5.4-nano"         # маленькая и дешёвая, другой вендор
   timeout_sec: 30
   max_tokens: 200
   # защита бюджета (плюс credit limit на самом ключе в кабинете OpenRouter — без него не выкатывать)
   daily_calls_cap: 60                  # попыток вызова в сутки, судья считается; худший день ~50
   daily_budget_usd: 2.0                # по usage.cost из ответа; сверх — молчит до конца суток
+  price_in_usd_per_1m: 2.0             # fallback для учёта, если провайдер не вернул usage.cost
+  price_out_usd_per_1m: 10.0
   circuit_errors: 5                    # ошибок подряд → пауза
   circuit_pause_min: 30
 
