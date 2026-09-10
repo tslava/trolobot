@@ -342,6 +342,32 @@ class Database:
         rows = await cursor.fetchall()
         return frozenset(int(row["user_id"]) for row in rows)
 
+    async def display_names(self, user_ids: Sequence[int]) -> dict[int, str]:
+        """Последний (по created_at) display_name каждого user_id из messages.
+
+        Пустой список -> {}. Один запрос для всех user_ids, отсортированный по
+        свежести (created_at, id DESC) — первое вхождение каждого user_id в
+        результате и есть самое свежее его имя.
+        """
+        if not user_ids:
+            return {}
+        conn = self._require_conn()
+        unique_ids = list(dict.fromkeys(user_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
+        cursor = await conn.execute(
+            f"SELECT user_id, display_name FROM messages "
+            f"WHERE user_id IN ({placeholders}) "
+            f"ORDER BY created_at DESC, id DESC",
+            unique_ids,
+        )
+        rows = await cursor.fetchall()
+        result: dict[int, str] = {}
+        for row in rows:
+            user_id = int(row["user_id"])
+            if user_id not in result:
+                result[user_id] = str(row["display_name"])
+        return result
+
     async def recent_activity(self, chat_id: int, since: int) -> list[RecentActivity]:
         conn = self._require_conn()
         cursor = await conn.execute(

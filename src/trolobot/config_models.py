@@ -270,6 +270,54 @@ _ASSISTANT_MARKERS_DEFAULT = [
     "если у тебя есть вопросы",
 ]
 
+# Заведения из CHARACTER.md, раздел 7 — белый список для regex:venue/regex:latin.
+# Многословные названия матчатся по каждому слову (filters.py разбивает фразу на слова),
+# поэтому "LALKA" продублирована отдельно от "Klubokawiarnia LALKA": в чате её называют
+# и полным, и сокращённым именем (см. few_shot.yaml).
+_KNOWN_PLACES_DEFAULT = [
+    "Piwna Stopa",
+    "Dom Piwa",
+    "Deja Vu",
+    "Jeżycówka",
+    "Klubokawiarnia LALKA",
+    "LALKA",
+    "FARBY",
+    "Piwnica",
+    "Wściekły Chmiel",
+    "Lot Chmiela",
+    "BRO",
+    "Ministerstwo Browaru",
+]
+
+# Польский словарь Фёдора (CHARACTER.md, раздел 1: "двести слов, все нужные") — белый
+# список для regex:venue/regex:latin, и одновременно то, что dedup:polish_freq
+# сознательно СЧИТАЕТ латинскими токенами (это и есть польские слова, частоту которых
+# правило ограничивает).
+_POLISH_WORDS_DEFAULT = [
+    "działka",
+    "działki",
+    "działce",
+    "przegląd",
+    "urząd",
+    "urzędzie",
+    "sklep",
+    "piwo",
+    "zrobiony",
+    "mechanik",
+    "sąsiad",
+    "pomidory",
+    "garaż",
+    "grzyby",
+    "las",
+    "dobra",
+    "nie",
+    "tak",
+    "spoko",
+    "pan",
+    "pani",
+    "dziękuję",
+]
+
 _REGEX_LIST_FIELDS = (
     "topic_stop",
     "injection_markers",
@@ -285,6 +333,12 @@ class FiltersConfig(BaseModel):
     places_whitelist: list[str] = Field(
         default_factory=lambda: ["Lidl", "OLX", "Biedronka", "Żabka", "Allegro"]
     )
+    # Заведения из CHARACTER.md, раздел 7 — белый список regex:venue/regex:latin,
+    # см. _KNOWN_PLACES_DEFAULT.
+    known_places: list[str] = Field(default_factory=lambda: list(_KNOWN_PLACES_DEFAULT))
+    # Польский словарь Фёдора — тот же белый список, а для dedup:polish_freq (наоборот)
+    # это и есть слова, чью частоту правило ограничивает, см. _POLISH_WORDS_DEFAULT.
+    polish_words: list[str] = Field(default_factory=lambda: list(_POLISH_WORDS_DEFAULT))
     topic_stop: list[str] = Field(default_factory=lambda: list(_TOPIC_STOP_DEFAULT))
     injection_markers: list[str] = Field(default_factory=lambda: list(_INJECTION_MARKERS_DEFAULT))
     logistics: list[str] = Field(default_factory=lambda: list(_LOGISTICS_DEFAULT))

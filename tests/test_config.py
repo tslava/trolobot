@@ -36,11 +36,17 @@ def test_load_real_config_filters_pattern_lists() -> None:
     assert cfg.filters.places_request == default_filters.places_request
     assert cfg.filters.model_talk == default_filters.model_talk
     assert cfg.filters.assistant_markers == default_filters.assistant_markers
+    assert cfg.filters.known_places == default_filters.known_places
+    assert cfg.filters.polish_words == default_filters.polish_words
 
     assert r"\bсектор газа" in cfg.filters.topic_stop
     assert r"\bпис\b" in cfg.filters.topic_stop
     assert r"\b\d{1,2}[:.]\d{2}\b" in cfg.filters.logistics
     assert "конечно!" in cfg.filters.assistant_markers
+    assert "LALKA" in cfg.filters.known_places
+    assert "Klubokawiarnia LALKA" in cfg.filters.known_places
+    assert "działka" in cfg.filters.polish_words
+    assert "urząd" in cfg.filters.polish_words
 
 
 def test_config_builds_with_defaults_without_yaml() -> None:

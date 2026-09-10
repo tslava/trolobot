@@ -524,6 +524,58 @@ async def test_recent_activity_filters_bot_since_and_chat(tmp_path: Path) -> Non
         await db.close()
 
 
+async def test_display_names_empty_list_returns_empty_dict(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.display_names([]) == {}
+    finally:
+        await db.close()
+
+
+async def test_display_names_returns_latest_per_user(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_message(
+            tg_message_id=1,
+            chat_id=1,
+            user_id=10,
+            display_name="Дима",
+            text="привет",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1000,
+        )
+        # тот же user_id, более новое сообщение -> более новое имя побеждает
+        await db.insert_message(
+            tg_message_id=2,
+            chat_id=1,
+            user_id=10,
+            display_name="Дмитрий",
+            text="переименовался",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=2000,
+        )
+        await db.insert_message(
+            tg_message_id=3,
+            chat_id=1,
+            user_id=20,
+            display_name="Оля",
+            text="привет",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1500,
+        )
+
+        names = await db.display_names([10, 20, 999])
+
+        assert names == {10: "Дмитрий", 20: "Оля"}  # 999 отсутствует в messages -> не в результате
+    finally:
+        await db.close()
+
+
 async def test_enqueue_night_returns_rowid(tmp_path: Path) -> None:
     db = Database(tmp_path / "bot.db")
     await db.connect()

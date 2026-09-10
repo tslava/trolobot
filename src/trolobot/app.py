@@ -16,6 +16,7 @@ from trolobot.config import load_config
 from trolobot.config_models import Config
 from trolobot.db import Database
 from trolobot.few_shot import load_few_shot, render_few_shot
+from trolobot.judge import Judge
 from trolobot.llm import LLMClient
 from trolobot.patterns import Patterns
 from trolobot.responder import Responder
@@ -105,11 +106,20 @@ async def main() -> None:
             llm = LLMClient(
                 api_key=api_key.get_secret_value(), cfg_getter=holder.get, db=db, http=http
             )
+
+            judge: Judge | None = None
+            if holder.get().llm.judge_model:
+                judge_prompt = settings.judge_prompt_path.read_text(encoding="utf-8")
+                judge = Judge(llm, holder.get, judge_prompt)
+            else:
+                logger.warning("судья отключён: llm.judge_model не задан")
+
             responder = Responder(
                 bot=bot,
                 db=db,
                 cfg_getter=holder.get,
                 llm=llm,
+                judge=judge,
                 patterns_getter=lambda: patterns,
                 prompt_template=prompt_template,
                 few_shot_getter=lambda: render_few_shot(few_shot_items),

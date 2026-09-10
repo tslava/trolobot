@@ -10,8 +10,10 @@ import importlib.util
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
+from trolobot import replay as replay_module
 from trolobot.gate_types import GateMessage, StateChange, Trigger
 from trolobot.replay import ReplayState, run_replay
 
@@ -186,9 +188,229 @@ def test_run_replay_produces_day_line_and_summary(tmp_path: Path) -> None:
         bot_username="otec_fedor_bot",
         bot_user_id=0,
         verbose=False,
+        generate=False,
+        judge=False,
+        max_calls=20,
     )
 
     report = run_replay(args)
 
     assert "Итого:" in report
     assert "2026-09-10" in report
+
+
+# --- run_replay --generate: реальная генерация + фильтр поверх PASS -----------
+
+
+def _write_name_trigger_export(path: Path, tz: str) -> None:
+    """Один PASS по имени-триггеру ("федя") — гарантированный, без live-talk/кубика."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    when = datetime(2026, 9, 10, 18, 0, 0, tzinfo=ZoneInfo(tz))
+    payload = {
+        "name": "test",
+        "type": "private_group",
+        "id": 1,
+        "messages": [
+            {
+                "id": 1,
+                "type": "message",
+                "date": when.strftime("%Y-%m-%dT%H:%M:%S"),
+                "from": "Дима",
+                "from_id": "user111",
+                "text": "федя привет как дела",
+            }
+        ],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_minimal_generate_config(path: Path) -> None:
+    path.write_text('llm:\n  main_model: "test/model"\n', encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    not _GATE_AND_PATTERNS_AVAILABLE,
+    reason="trolobot.gate и/или trolobot.patterns ещё не написаны",
+)
+def test_run_replay_generate_prints_reply_and_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOT_TOKEN", "123:test-token")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-key")
+
+    export_path = tmp_path / "result.json"
+    _write_name_trigger_export(export_path, TZ)
+    config_path = tmp_path / "config.yaml"
+    _write_minimal_generate_config(config_path)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        body = {
+            "choices": [{"message": {"content": '{"speak": true, "text": "Бывает, дед."}'}}],
+            "usage": {"cost": 0.0007, "prompt_tokens": 42, "completion_tokens": 7},
+        }
+        return httpx.Response(200, json=body)
+
+    mock_transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=mock_transport)
+
+    monkeypatch.setattr(replay_module.httpx, "AsyncClient", fake_async_client)
+
+    args = argparse.Namespace(
+        export_path=export_path,
+        config=config_path,
+        seed=1,
+        bot_username="otec_fedor_bot",
+        bot_user_id=0,
+        verbose=False,
+        generate=True,
+        judge=False,
+        max_calls=20,
+    )
+
+    report = run_replay(args)
+
+    assert "Генерация:" in report
+    assert "федя привет как дела" in report
+    assert "Бывает, дед." in report
+    assert "| pass" in report
+    assert "вызовов=1, отправлено бы=1" in report
+    assert "потрачено $=0.0007" in report
+
+
+def test_run_replay_generate_without_api_key_raises_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # cwd без .env: гарантирует, что реальный .env репозитория (со своим ключом) не
+    # подмешается — Settings() должна честно увидеть openrouter_api_key=None.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BOT_TOKEN", "123:test-token")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    export_path = tmp_path / "result.json"
+    _write_name_trigger_export(export_path, TZ)
+    config_path = tmp_path / "config.yaml"
+    _write_minimal_generate_config(config_path)
+
+    args = argparse.Namespace(
+        export_path=export_path,
+        config=config_path,
+        seed=1,
+        bot_username="otec_fedor_bot",
+        bot_user_id=0,
+        verbose=False,
+        generate=True,
+        judge=False,
+        max_calls=20,
+    )
+
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        run_replay(args)
+
+
+# --- run_replay --generate --max-calls: потолок по реальным сетевым вызовам --------
+
+
+def _write_repeated_name_trigger_export(path: Path, tz: str, count: int) -> None:
+    """``count`` гарантированных PASS через имя-триггер "федя", разнесённых по времени
+    (сам тест обнуляет mention_cooldown_sec/mention_chat_cooldown_sec, чтобы кулдаун
+    обращений их не блокировал)."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    start = datetime(2026, 9, 10, 18, 0, 0, tzinfo=ZoneInfo(tz))
+    authors = [("Дима", "user111"), ("Аня", "user222")]
+    messages = []
+    for i in range(count):
+        name, from_id = authors[i % 2]
+        when = start + timedelta(minutes=2 * i)
+        messages.append(
+            {
+                "id": i + 1,
+                "type": "message",
+                "date": when.strftime("%Y-%m-%dT%H:%M:%S"),
+                "from": name,
+                "from_id": from_id,
+                "text": f"федя привет как дела номер {i + 1}",
+            }
+        )
+    payload = {"name": "test", "type": "private_group", "id": 1, "messages": messages}
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_max_calls_config(path: Path) -> None:
+    path.write_text(
+        "llm:\n"
+        '  main_model: "test/model"\n'
+        '  judge_model: "test/judge-model"\n'
+        "behaviour:\n"
+        "  mention_cooldown_sec: 0\n"
+        "  mention_chat_cooldown_sec: 0\n",
+        encoding="utf-8",
+    )
+
+
+def test_run_replay_generate_max_calls_counts_real_network_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--max-calls считается по реальным сетевым вызовам (основной + судья), не по
+    числу PASS с генерацией.
+
+    Экспорт даёт 6 гарантированных PASS. filters.shadow=true по умолчанию (config
+    минимальный, filters не переопределены) -> судья вызывается на каждой генерации,
+    прошедшей проверку перед стартом. PASS 1: calls_so_far=0 < 3 -> генерация, счётчик
+    в сторе становится 2 (основной + судья). PASS 2: calls_so_far=2 всё ещё < 3 ->
+    ещё одна генерация, счётчик становится 4. С PASS 3 по PASS 6: calls_so_far=4 >= 3
+    -> генерация не запускается. Итог: 4 реальных сетевых вызова — на один судейский
+    вызов больше заявленного потолка 3, это допустимое превышение (см. replay.py).
+    """
+    monkeypatch.setenv("BOT_TOKEN", "123:test-token")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-key")
+
+    export_path = tmp_path / "result.json"
+    _write_repeated_name_trigger_export(export_path, TZ, count=6)
+    config_path = tmp_path / "config.yaml"
+    _write_max_calls_config(config_path)
+
+    call_count = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        body = {
+            "choices": [{"message": {"content": '{"speak": true, "text": "Бывает, дед."}'}}],
+            "usage": {"cost": 0.0001, "prompt_tokens": 10, "completion_tokens": 5},
+        }
+        return httpx.Response(200, json=body)
+
+    mock_transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=mock_transport)
+
+    monkeypatch.setattr(replay_module.httpx, "AsyncClient", fake_async_client)
+
+    args = argparse.Namespace(
+        export_path=export_path,
+        config=config_path,
+        seed=1,
+        bot_username="otec_fedor_bot",
+        bot_user_id=0,
+        verbose=False,
+        generate=True,
+        judge=True,
+        max_calls=3,
+    )
+
+    report = run_replay(args)
+
+    assert call_count <= 4
+    assert "вызовов=" in report
+    reported_calls = int(report.split("вызовов=")[1].split(",")[0])
+    assert reported_calls == call_count
+    assert reported_calls <= 4

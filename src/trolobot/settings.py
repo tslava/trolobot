@@ -20,4 +20,5 @@ class Settings(BaseSettings):
     config_path: Path = Path("config.yaml")
     few_shot_path: Path = Path("few_shot.yaml")
     prompt_path: Path = Path("prompts/system.txt")
+    judge_prompt_path: Path = Path("prompts/judge.txt")
     log_level: str = "INFO"

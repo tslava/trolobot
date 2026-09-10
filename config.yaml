@@ -70,6 +70,50 @@ filters:
   shadow: true              # true = фильтры логируют, но не режут ответ (щадящий старт)
   places_whitelist: [Lidl, OLX, Biedronka, Żabka, Allegro]  # бытовые бренды, не заведения из раздела 7
 
+  # заведения из CHARACTER.md раздел 7 — белый список regex:venue/regex:latin;
+  # многословные названия матчатся по каждому слову (LALKA продублирована отдельно —
+  # в чате её зовут и полным именем, и коротким, см. few_shot.yaml)
+  known_places:
+    - Piwna Stopa
+    - Dom Piwa
+    - Deja Vu
+    - Jeżycówka
+    - Klubokawiarnia LALKA
+    - LALKA
+    - FARBY
+    - Piwnica
+    - Wściekły Chmiel
+    - Lot Chmiela
+    - BRO
+    - Ministerstwo Browaru
+
+  # польский словарь Фёдора (CHARACTER.md раздел 1) — белый список для regex:venue/
+  # regex:latin; для dedup:polish_freq, наоборот, это и есть слова, чью частоту
+  # правило ограничивает (раз в 5-6 реплик)
+  polish_words:
+    - działka
+    - działki
+    - działce
+    - przegląd
+    - urząd
+    - urzędzie
+    - sklep
+    - piwo
+    - zrobiony
+    - mechanik
+    - sąsiad
+    - pomidory
+    - garaż
+    - grzyby
+    - las
+    - dobra
+    - nie
+    - tak
+    - spoko
+    - pan
+    - pani
+    - dziękuję
+
   # стоп-лист тем (вход и выход), регулярки по границам слов, CHARACTER.md раздел 6.
   # "фронт работ" и "сектор газа" отдельно не ловятся — ложные срабатывания приняты осознанно.
   topic_stop:

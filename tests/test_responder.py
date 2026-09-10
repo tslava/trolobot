@@ -36,8 +36,9 @@ import pytest
 from trolobot import filters as filters_module
 from trolobot.config_models import Config
 from trolobot.db import Database, PendingRow
-from trolobot.filters import FilterVerdict
+from trolobot.filters import FilterContext, FilterVerdict
 from trolobot.gate_types import GateMessage, Trigger
+from trolobot.judge import Judge
 from trolobot.llm import LLMClient
 from trolobot.patterns import Patterns
 from trolobot.prompt import SITUATION_LATE, SITUATION_MORNING
@@ -225,6 +226,7 @@ def _make_responder(
     *,
     seed: int = 0,
     rng: random.Random | FixedRandom | None = None,
+    judge: Judge | None = None,
 ) -> Responder:
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
     return Responder(
@@ -232,6 +234,7 @@ def _make_responder(
         db=db_,
         cfg_getter=lambda: cfg,
         llm=llm,
+        judge=judge,
         patterns_getter=lambda: patterns,
         prompt_template=PROMPT_TEMPLATE,
         few_shot_getter=lambda: 'Дима: привет\n{"speak": true, "text": "И тебе."}',
@@ -820,8 +823,8 @@ async def test_shadow_mode_sends_but_logs_cut(
     clock = FakeClock(DAY_NOW)
     responder = _make_responder(db, cfg, llm, bot, clock)
 
-    async def fake_check_output(text: str, ctx: object) -> FilterVerdict:
-        return FilterVerdict(ok=False, reason="regex:length")
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(ok=False, reason="regex:length", reasons=("regex:length",))
 
     monkeypatch.setattr(filters_module, "check_output", fake_check_output)
 
@@ -1217,6 +1220,201 @@ async def test_ambient_generation_is_serialized_and_recheck_blocks_second(
 
         summary = dict(await db.filter_log_summary(0))
         assert summary.get("send:recheck_ambient_cooldown") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 20. FilterContext собирается полностью: trigger_text из pending, muted_names ---
+# --- через db.display_names(muted_user_ids()), bot_names/system_prompt из Responder. ---
+
+
+async def test_filter_context_wired_with_trigger_text_and_muted_names(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает, дед."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    # Замьюченный автор: его последнее имя в messages должно попасть в muted_names.
+    await _insert_message(
+        db,
+        tg_message_id=500,
+        user_id=7,
+        display_name="Дима",
+        text="фёдор, привет",
+        created_at=DAY_NOW,
+    )
+    conn = db._conn
+    assert conn is not None
+    await conn.execute(
+        "INSERT INTO muted_users (user_id, display_name, muted_by, created_at) VALUES (?, ?, ?, ?)",
+        (7, "Дима", 1, DAY_NOW),
+    )
+    await conn.commit()
+
+    real_check_output = filters_module.check_output
+    captured: dict[str, FilterContext] = {}
+
+    async def spy_check_output(
+        text: str, ctx: FilterContext, judge: object = None
+    ) -> FilterVerdict:
+        captured["ctx"] = ctx
+        return await real_check_output(text, ctx, judge)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(filters_module, "check_output", spy_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=500,
+                user_id=7,
+                situation="",
+                delay_sec=5,
+                trigger_text="фёдор, привет",
+            ),
+        )
+
+        ctx = captured["ctx"]
+        assert ctx.trigger_text == "фёдор, привет"
+        assert ctx.system_prompt == PROMPT_TEMPLATE
+        assert ctx.muted_names == ["Дима"]
+        # patterns_getter() -> Patterns передаётся в FilterContext, а не только в
+        # cfg.filters: одна компиляция regex на весь check_output, не пересборка.
+        assert isinstance(ctx.patterns, Patterns)
+        assert ctx.bot_names[0] == cfg.persona.name
+        assert ctx.bot_names[1] == cfg.persona.display_name
+        assert "Дима" in ctx.participant_names
+        assert len(ctx.recent_replies) <= 50
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 21. Ambient/pending без текста триггера -> trigger_text="" в FilterContext. ---
+
+
+async def test_ambient_reply_has_empty_trigger_text(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    real_check_output = filters_module.check_output
+    captured: dict[str, FilterContext] = {}
+
+    async def spy_check_output(
+        text: str, ctx: FilterContext, judge: object = None
+    ) -> FilterVerdict:
+        captured["ctx"] = ctx
+        return await real_check_output(text, ctx, judge)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(filters_module, "check_output", spy_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=600, user_id=5, situation="", delay_sec=0
+            ),
+        )
+        assert captured["ctx"].trigger_text == ""
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 22. Не-ok вердикт с несколькими причинами -> строка filter_log на каждую причину. ---
+
+
+async def test_multiple_reasons_produce_one_filter_log_row_each(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(
+        text: str, ctx: FilterContext, judge: object = None
+    ) -> FilterVerdict:
+        return FilterVerdict(
+            ok=False,
+            reason="regex:length",
+            reasons=("regex:length", "style:exclaim"),
+        )
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=700, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT stage, reason FROM filter_log "
+            "WHERE trigger_tg_message_id = ? AND verdict = 'cut' ORDER BY id",
+            (700,),
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        assert rows == [
+            {"stage": "regex", "reason": "regex:length"},
+            {"stage": "style", "reason": "style:exclaim"},
+        ]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 23. Судья передаётся в check_output ---
+
+
+async def test_judge_is_passed_through_to_check_output(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+
+    class _DummyJudge:
+        async def check(self, *, candidate: str, trigger_text: str, now: int) -> list[str]:
+            return []
+
+    dummy_judge = _DummyJudge()
+    responder = _make_responder(db, cfg, llm, bot, clock, judge=dummy_judge)  # type: ignore[arg-type]
+
+    captured: dict[str, object] = {}
+
+    async def fake_check_output(
+        text: str, ctx: FilterContext, judge: object = None
+    ) -> FilterVerdict:
+        captured["judge"] = judge
+        return FilterVerdict(ok=True, reason="pass", reasons=())
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=800, user_id=5, situation="", delay_sec=5
+            ),
+        )
+        assert captured["judge"] is dummy_judge
     finally:
         await responder.shutdown()
         await llm.aclose()

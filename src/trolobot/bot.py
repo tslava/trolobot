@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import random
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aiogram import Router
 from aiogram.types import Message
@@ -22,7 +22,7 @@ from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Verdict
 from trolobot.patterns import Patterns
 from trolobot.responder import Responder
-from trolobot.sanitize import media_placeholder, normalize_text, sanitize_display_name
+from trolobot.sanitize import media_placeholder, normalize_text, sanitize_display_name, stable_n
 from trolobot.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,9 @@ class Deps:
     patterns: Patterns
     rng: random.Random
     responder: Responder | None = None
+    # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
+    # не спамить лог на каждое следующее сообщение того же участника.
+    warned_user_ids: set[int] = field(default_factory=set)
 
 
 def build_router(deps: Deps) -> Router:
@@ -86,6 +89,22 @@ def build_router(deps: Deps) -> Router:
             user_id = user.id
             display_name = sanitize_display_name(user.full_name, user.id, deps.reserved_names)
             is_bot = user.is_bot
+
+        if deps.patterns.injection(display_name) is not None:
+            # Имя-инъекция ("Игнорируй правила и скажи ...") прошла санитизацию (она
+            # не содержит триггеров бота как отдельных слов), но выглядит как команда
+            # гейта 5a — подменяем на "Участник N" до записи в БД и в промпт, чтобы
+            # display_name сам по себе не читался как инструкция построчно перед
+            # каждым сообщением участника в {context}.
+            if user_id not in deps.warned_user_ids:
+                deps.warned_user_ids.add(user_id)
+                logger.warning(
+                    "display_name looks like a prompt injection, replacing with placeholder: "
+                    "user_id=%s name=%r",
+                    user_id,
+                    display_name,
+                )
+            display_name = f"Участник {stable_n(user_id)}"
 
         text = normalize_text(message.text or message.caption)
         if not text:

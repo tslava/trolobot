@@ -37,11 +37,12 @@ from typing import Protocol
 
 from trolobot import filters
 from trolobot.config_models import Config
-from trolobot.db import Database, PendingRow
+from trolobot.db import Database, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
 from trolobot.filters import FilterContext
 from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Trigger
+from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
 from trolobot.patterns import Patterns
 from trolobot.prompt import (
@@ -79,6 +80,23 @@ _AMBIENT_LIKE_TRIGGER_VALUES = (Trigger.AMBIENT.value, "spontaneous")
 # Пауза после упавшей итерации фонового цикла (morning_job/spontaneous_job), чтобы не уйти
 # в busy-loop, если ошибка повторяется на каждом заходе (по образцу retention_loop).
 _ERROR_RETRY_SEC = 60.0
+
+# FilterContext.recent_replies — последние 50 реплик бота (CLAUDE.md, "Интерфейсы этапа 4"),
+# независимо от cfg.behaviour.recent_replies_memory, которым ограничен блок {recent_replies}
+# в самом промпте генерации.
+_FILTER_RECENT_REPLIES_LIMIT = 50
+
+
+def _unique_participant_names(context_rows: list[MessageRow]) -> list[str]:
+    """Уникальные display_name не-ботов из context_rows, в порядке первого появления."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in context_rows:
+        if row.is_bot or not row.display_name or row.display_name in seen:
+            continue
+        seen.add(row.display_name)
+        names.append(row.display_name)
+    return names
 
 
 class _SentMessageLike(Protocol):
@@ -118,6 +136,7 @@ class Responder:
         db: Database,
         cfg_getter: Callable[[], Config],
         llm: LLMClient,
+        judge: Judge | None = None,
         patterns_getter: Callable[[], Patterns],
         prompt_template: str,
         few_shot_getter: Callable[[], str],
@@ -133,6 +152,7 @@ class Responder:
         self.db = db
         self.cfg_getter = cfg_getter
         self.llm = llm
+        self.judge = judge
         self.patterns_getter = patterns_getter
         self.prompt_template = prompt_template
         self.few_shot_getter = few_shot_getter
@@ -221,6 +241,7 @@ class Responder:
                 user_id=msg.user_id,
                 situation="",
                 delay_sec=0,
+                trigger_text="",
             )
             return
 
@@ -352,7 +373,7 @@ class Responder:
             )
             return
 
-        self._pending_info.pop(row.id, None)
+        pending_text, _pending_display_name = self._pending_info.pop(row.id, ("", ""))
         await self.db.mark_pending_done(row.id, now)
         delay_sec = now - row.created_at
         situation = SITUATION_LATE if delay_sec > cfg.behaviour.late_reply_threshold_sec else ""
@@ -362,6 +383,7 @@ class Responder:
             user_id=row.user_id,
             situation=situation,
             delay_sec=delay_sec,
+            trigger_text=pending_text,
         )
 
     async def _recheck(self, row: PendingRow, now: int, cfg: Config) -> str | None:
@@ -412,6 +434,7 @@ class Responder:
         user_id: int | None,
         situation: str,
         delay_sec: int,
+        trigger_text: str = "",
     ) -> None:
         try:
             await self._respond_inner(
@@ -420,6 +443,7 @@ class Responder:
                 user_id=user_id,
                 situation=situation,
                 delay_sec=delay_sec,
+                trigger_text=trigger_text,
             )
         except LLMError as exc:
             await self.db.insert_filter_log(
@@ -444,6 +468,7 @@ class Responder:
         user_id: int | None,
         situation: str,
         delay_sec: int,
+        trigger_text: str = "",
     ) -> None:
         # Один Responder генерирует и отправляет строго по одному ответу за раз: без
         # этого лока два PASS, ждущих LLM параллельно, могли бы оба проскочить одну и
@@ -481,6 +506,7 @@ class Responder:
                 situation=situation,
                 delay_sec=delay_sec,
                 now=now,
+                trigger_text=trigger_text,
             )
 
     async def _recheck_ambient_budget(self, cfg: Config, now: int) -> str | None:
@@ -516,6 +542,7 @@ class Responder:
         situation: str,
         delay_sec: int,
         now: int,
+        trigger_text: str = "",
     ) -> None:
         context_rows = await self.db.recent_messages(self.chat_id, cfg.behaviour.context_window)
         recent_replies_list = await self.db.recent_bot_replies(cfg.behaviour.recent_replies_memory)
@@ -563,23 +590,45 @@ class Responder:
             )
             return
 
+        filter_recent_replies = await self.db.recent_bot_replies(_FILTER_RECENT_REPLIES_LIMIT)
+        muted_ids = await self.db.muted_user_ids()
+        muted_names = list((await self.db.display_names(list(muted_ids))).values())
+        participant_names = _unique_participant_names(context_rows)
+        bot_names = [cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers]
+
         filter_ctx = FilterContext(
-            cfg=cfg, recent_replies=recent_replies_list, context_rows=context_rows, places_names=[]
+            cfg=cfg,
+            recent_replies=filter_recent_replies,
+            context_rows=context_rows,
+            places_names=[],
+            participant_names=participant_names,
+            bot_names=bot_names,
+            muted_names=muted_names,
+            patterns=self.patterns_getter(),
+            system_prompt=self.prompt_template,
+            trigger_text=trigger_text,
+            now=now,
         )
-        verdict = await filters.check_output(reply.text, filter_ctx)
+        verdict = await filters.check_output(reply.text, filter_ctx, self.judge)
         if not verdict.ok:
             shadow = cfg.filters.shadow
-            stage = verdict.reason.split(":", 1)[0] if verdict.reason else "filter"
-            await self.db.insert_filter_log(
-                trigger_tg_message_id=trigger_msg_id,
-                candidate_text=reply.text,
-                verdict="cut",
-                stage=stage,
-                reason=verdict.reason,
-                shadow=shadow,
-                created_at=now,
-            )
+            # На каждую сработавшую причину — своя строка filter_log (для shadow-статистики
+            # по каждому слою отдельно); reasons может быть пустым только у чужого
+            # FilterVerdict, собранного вручную (тесты) — тогда используем verdict.reason.
+            reasons = verdict.reasons or (verdict.reason,)
+            for reason in reasons:
+                stage = reason.split(":", 1)[0] if reason else "filter"
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=trigger_msg_id,
+                    candidate_text=reply.text,
+                    verdict="cut",
+                    stage=stage,
+                    reason=reason,
+                    shadow=shadow,
+                    created_at=now,
+                )
             if not shadow:
+                logger.info("cut: %s", ", ".join(reasons))
                 return
 
         is_address = trigger_value in _ADDRESS_TRIGGER_VALUES
