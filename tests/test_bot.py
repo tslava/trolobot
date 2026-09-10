@@ -106,6 +106,8 @@ def _deps(
         reserved_names=reserved,
         patterns_getter=lambda: patterns,
         rng=rng if rng is not None else random.Random(0),
+        # часы = 0: возраст сообщения отрицательный, ветка gate:stale не срабатывает
+        clock=lambda: 0,
         config_store=config_store,
         prompt_store=prompt_store,
         bot_username=bot_username,
@@ -614,3 +616,31 @@ async def test_gate_pass_without_trigger_logs_error_and_skips_responder(
     # сломан только trigger.
     summary = dict(await db.filter_log_summary(0))
     assert summary.get("pass:mention") == 1
+
+
+async def test_stale_message_after_restart_is_stored_but_not_gated(
+    db: Database,
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Хвост апдейтов после рестарта: сообщение старше late_reply_threshold_sec
+    пишется в messages, но в гейт не идёт (gate:stale). Иначе старый меншн
+    получил бы ответ по свежему контексту."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    deps = _deps(db, config, settings=settings)
+    deps.clock = lambda: int(DAY.timestamp()) + 3 * 3600  # «сейчас» на три часа позже
+    handler = build_router(deps).message.handlers[0].callback
+
+    with caplog.at_level(logging.INFO, logger="trolobot.bot"):
+        await handler(
+            _message(
+                from_user=_user(user_id=5, first_name="Дима"),
+                text=f"@{BOT_USERNAME} ты где",
+                date=DAY,
+            )
+        )
+
+    assert len(await db.recent_messages(OWN_CHAT_ID, 10)) == 1
+    assert dict(await db.filter_log_summary(0)) == {"gate:stale": 1}
+    assert any("gate stale" in r.getMessage() for r in caplog.records)

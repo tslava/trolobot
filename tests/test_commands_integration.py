@@ -127,6 +127,7 @@ async def wired(
         reserved_names=reserved,
         patterns_getter=config_store.patterns,
         rng=random.Random(0),
+        clock=lambda: 0,
         config_store=config_store,
         prompt_store=prompt_store,
         bot_username=BOT_USERNAME,

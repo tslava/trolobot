@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -60,6 +61,7 @@ class Deps:
     # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
     # не спамить лог на каждое следующее сообщение того же участника.
     warned_user_ids: set[int] = field(default_factory=set)
+    clock: Callable[[], int] = field(default_factory=lambda: lambda: int(time.time()))
 
 
 def build_router(deps: Deps) -> Router:
@@ -162,6 +164,23 @@ def build_router(deps: Deps) -> Router:
         try:
             cfg = deps.config_getter()
             now = gate_message.created_at
+            # Хвост апдейтов после рестарта: сообщение старше порога поздней реплики
+            # уходит в контекст, но не в гейт. Человек, у которого сел телефон,
+            # не отвечает задним числом. Иначе трёхчасовой меншн получит ответ
+            # по свежему контексту.
+            age = deps.clock() - created_at
+            if age > cfg.behaviour.late_reply_threshold_sec:
+                await deps.db.insert_filter_log(
+                    trigger_tg_message_id=message.message_id,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="gate",
+                    reason="gate:stale",
+                    shadow=False,
+                    created_at=deps.clock(),
+                )
+                logger.info("gate stale: message %s is %ss old, skipped", message.message_id, age)
+                return
             state = await load_gate_state(deps.db, cfg, gate_message, now)
             decision = should_consider(
                 gate_message, state, cfg, deps.patterns_getter(), now, deps.rng
