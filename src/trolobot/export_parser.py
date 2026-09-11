@@ -25,7 +25,7 @@ from trolobot.sanitize import normalize_text, sanitize_display_name
 
 logger = logging.getLogger(__name__)
 
-# from_id в экспорте — "user221675896" или "channel123": буквенный префикс + число.
+# from_id в экспорте — "user123456789" или "channel123": буквенный префикс + число.
 _FROM_ID_RE = re.compile(r"(\d+)$")
 
 

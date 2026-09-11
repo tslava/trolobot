@@ -652,7 +652,7 @@ async def test_invisible_name_falls_back_to_username(
     """Имя из мягких переносов (U+00AD) пустое после санитизации — берём юзернейм."""
     settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
     handler = build_router(_deps(db, config, settings=settings)).message.handlers[0].callback
-    user = User(id=443814859, is_bot=False, first_name="\xad\xad", username="limb000")
+    user = User(id=555000111, is_bot=False, first_name="\xad\xad", username="ghost42")
     await handler(_message(from_user=user, text="привет всем", date=DAY))
     rows = await db.recent_messages(OWN_CHAT_ID, 1)
-    assert rows[0].display_name == "limb"  # цифры санитизация вырезает, как у имён
+    assert rows[0].display_name == "ghost"  # цифры санитизация вырезает, как у имён
