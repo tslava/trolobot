@@ -383,9 +383,83 @@ async def test_resume_clears_panic_and_stop_until(
 
     assert "panic" not in db.state
     assert "stop_until" not in db.state
+    assert sent == ["Продолжаем. Снято: panic, stop."]
+    now = int(NOW.timestamp())
+    assert db.audit_stop_calls == [("resume", ADMIN_ID, now)]
+
+
+async def test_resume_with_nothing_set_replies_without_cleared_list(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """Ничего не было выставлено — не врём владельцу, что что-то снято."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/resume")
+    await handler(message)
+
     assert sent == ["Продолжаем."]
     now = int(NOW.timestamp())
     assert db.audit_stop_calls == [("resume", ADMIN_ID, now)]
+
+
+async def test_resume_clears_llm_circuit_and_resets_streak(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.state["llm_circuit_until"] = str(int(NOW.timestamp()) + 1800)
+    db.state["llm_error_streak"] = "5"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/resume")
+    await handler(message)
+
+    assert "llm_circuit_until" not in db.state
+    assert db.state["llm_error_streak"] == "0"
+    assert sent == ["Продолжаем. Снято: предохранитель LLM (было 5 ошибок подряд)."]
+
+
+async def test_resume_clears_everything_at_once(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.state["panic"] = "1"
+    db.state["stop_until"] = "123"
+    db.state["llm_circuit_until"] = str(int(NOW.timestamp()) + 1800)
+    db.state["llm_error_streak"] = "5"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/resume")
+    await handler(message)
+
+    assert "panic" not in db.state
+    assert "stop_until" not in db.state
+    assert "llm_circuit_until" not in db.state
+    assert db.state["llm_error_streak"] == "0"
+    assert sent == ["Продолжаем. Снято: panic, stop, предохранитель LLM (было 5 ошибок подряд)."]
+
+
+async def test_resume_with_expired_circuit_key_is_still_reported_as_cleared(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """llm_circuit_until из прошлого — предохранитель фактически уже не действует
+    (llm.py сверяет now), но ключ ещё лежит в state, то есть реально был
+    выставлен: /resume чистит его и упоминает в ответе так же, как открытый."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.state["llm_circuit_until"] = str(int(NOW.timestamp()) - 10)
+    db.state["llm_error_streak"] = "5"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/resume")
+    await handler(message)
+
+    assert "llm_circuit_until" not in db.state
+    assert db.state["llm_error_streak"] == "0"
+    assert sent == ["Продолжаем. Снято: предохранитель LLM (было 5 ошибок подряд)."]
 
 
 # --- /mute, /unmute --------------------------------------------------------------
@@ -834,6 +908,61 @@ async def test_status_contains_versions_and_models(
     assert f"v{prompt_store.few_shot_version_value}" in text
     assert "openrouter/main" in text
     assert "j/x" in text
+
+
+async def test_status_shows_circuit_closed_and_zero_streak_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert len(sent) == 1
+    text = sent[0]
+    assert "Предохранитель LLM: закрыт, ошибок подряд: 0" in text
+
+
+async def test_status_shows_circuit_open_until_local_time_and_streak(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    circuit_until = now + 1800
+    db.state["llm_circuit_until"] = str(circuit_until)
+    db.state["llm_error_streak"] = "5"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert len(sent) == 1
+    text = sent[0]
+    expected_time = local_dt(circuit_until, config.persona.timezone).strftime("%H:%M")
+    assert f"Предохранитель LLM: открыт до {expected_time}, ошибок подряд: 5" in text
+
+
+async def test_status_shows_circuit_closed_when_key_expired(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """llm_circuit_until в прошлом — предохранитель фактически отпустил сам по
+    таймеру (та же проверка, что в llm.py: `> now`), /status не должен врать,
+    что он ещё открыт, даже если ключ ещё не подчищен."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.state["llm_circuit_until"] = str(int(NOW.timestamp()) - 10)
+    db.state["llm_error_streak"] = "5"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert len(sent) == 1
+    text = sent[0]
+    assert "Предохранитель LLM: закрыт, ошибок подряд: 5" in text
 
 
 # --- справка ------------------------------------------------------------------
