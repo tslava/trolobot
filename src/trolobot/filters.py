@@ -519,6 +519,8 @@ def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
 
     if patterns.assistant_marker(text) is not None:
         reasons.append("style:assistant")
+    if patterns.grumpy(text) is not None:
+        reasons.append("style:grumpy")
     if _check_question_x2(text, ctx.recent_replies):
         reasons.append("style:question_x2")
     if text.count("!") > 1:

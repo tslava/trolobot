@@ -38,6 +38,7 @@ class Patterns:
         self._places_request = _compile_regex_list(filters.places_request)
         self._model_talk = _compile_regex_list(filters.model_talk)
         self._assistant_markers = _compile_phrase_list(filters.assistant_markers)
+        self._grumpy_markers = _compile_regex_list(filters.grumpy_markers)
         self._name_triggers = [
             re.compile(rf"\b{re.escape(trigger)}\b", re.IGNORECASE) for trigger in name_triggers
         ]
@@ -77,3 +78,6 @@ class Patterns:
 
     def assistant_marker(self, text: str) -> str | None:
         return _first_match(self._assistant_markers, text)
+
+    def grumpy(self, text: str) -> str | None:
+        return _first_match(self._grumpy_markers, text)

@@ -297,6 +297,17 @@ _MODEL_TALK_DEFAULT = [
     r"OpenRouter",
 ]
 
+_GRUMPY_MARKERS_DEFAULT = [
+    r"\bя (же|уже|вам уже) (говорил|сказал|написал)\b",
+    r"\bразговор закрыт\b",
+    r"\bникому не интересно\b",
+    r"\bне буду (говорить|рассказывать|отвечать)\b",
+    r"\bнеинтересно\b",
+    r"\bотстань",
+    r"\bхватит (уже|про|об)",
+    r"\bсколько можно\b",
+]
+
 _ASSISTANT_MARKERS_DEFAULT = [
     "важно отметить",
     "стоит учесть",
@@ -356,6 +367,9 @@ _POLISH_WORDS_DEFAULT = [
     "pan",
     "pani",
     "dziękuję",
+    "lech",
+    "tyskie",
+    "żywiec",
 ]
 
 _REGEX_LIST_FIELDS = (
@@ -365,6 +379,7 @@ _REGEX_LIST_FIELDS = (
     "urgent",
     "places_request",
     "model_talk",
+    "grumpy_markers",
 )
 
 # Разрешённый набор эмодзи (решение владельца, CHARACTER.md раздел 3/4) — небольшой,
@@ -396,6 +411,9 @@ class FiltersConfig(BaseModel):
     places_request: list[str] = Field(default_factory=lambda: list(_PLACES_REQUEST_DEFAULT))
     model_talk: list[str] = Field(default_factory=lambda: list(_MODEL_TALK_DEFAULT))
     assistant_markers: list[str] = Field(default_factory=lambda: list(_ASSISTANT_MARKERS_DEFAULT))
+    # Сухие/раздражённые формулировки (style:grumpy, выходной фильтр) — добродушный
+    # персонаж не отмахивается от вопросов и не злится на повторы (CHARACTER.md раздел 3).
+    grumpy_markers: list[str] = Field(default_factory=lambda: list(_GRUMPY_MARKERS_DEFAULT))
 
     @field_validator(*_REGEX_LIST_FIELDS)
     @classmethod

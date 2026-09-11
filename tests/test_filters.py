@@ -383,6 +383,32 @@ CASES: list[tuple[str, str, FilterContext, str | None]] = [
     # --- маркеры ассистента и стиль ---
     ("style_assistant", "Конечно! Дальше сам разберёшься.", _DEFAULT_CTX, "style:assistant"),
     ("style_assistant_pass", "Не советую, но дело твое.", _DEFAULT_CTX, None),
+    # --- маркеры сухости/раздражения (style:grumpy, CHARACTER.md раздел 3, warm-tone) ---
+    (
+        "style_grumpy_ya_zhe_napisal",
+        "На жене. Тридцать лет уже, я же написал.",
+        _DEFAULT_CTX,
+        "style:grumpy",
+    ),
+    (
+        "style_grumpy_nikomu_ne_interesno",
+        "Название говорить не буду, никому не интересно",
+        _DEFAULT_CTX,
+        "style:grumpy",
+    ),
+    (
+        "style_grumpy_pass",
+        "Женат, тридцать лет. Жена до сих пор удивляется.",
+        _DEFAULT_CTX,
+        None,
+    ),
+    # --- пивные бренды из polish_words не режутся venue/latin (CHARACTER.md раздел 1/4) ---
+    (
+        "venue_lech_latin_polish_word_pass",
+        "Пью Lech, он подешевле.",
+        _DEFAULT_CTX,
+        None,
+    ),
     (
         "style_question_x2",
         "А ты как думаешь?",
