@@ -548,6 +548,20 @@ async def mark_places_not_seen(self, seen_ids: Sequence[str], now: int) -> int
 # настоящего прогона с Google (не --dry-run, не --manual-only) — CLAUDE.md ниже, places_fill.py.
 
 # places.py — рантайм, чистые функции
+def render_places_menu(rows: list[PlaceRow]) -> str
+# Рантайм-путь responder.py при прямом обращении (mention/reply/name) — решение владельца после
+# живого теста: regex про место не покрывает живую речь, поэтому весь кэш уходит в промпт целиком,
+# и модель сама решает, спрашивали ли про место, и выбирает 1-2 подходящих. Пустой список →
+# prompt.PLACES_NONE. Иначе:
+# "Заведения, где ты бывал (только они, других не называешь). Если про место НЕ спрашивали — не
+# упоминай ни одно. Если спросили — назови одно, максимум два подходящих по тишине и району, без
+# часов работы и без цен:\n- <name>, <district>, <category>, тихо|шумно[, <fact>]\n..."
+# Строки по name; quiet=1 → "тихо", иначе "шумно"; fact — только если непустой. Никаких рейтингов,
+# цен, часов работы, слова Google.
+
+# select_places/render_places_block — старый regex-based путь (фильтр по тишине/району/за-город +
+# rng.sample до max_per_reply), больше не зовётся из responder.py, но не удаляются — использует
+# replay.py и тесты.
 def select_places(rows: list[PlaceRow], cfg: PlacesConfig, request_text: str, rng: random.Random) -> list[PlaceRow]
 # фильтр: operational, rating >= min_rating, reviews >= min_reviews; если в запросе есть «тихо/спокойно/поговорить/посидеть» —
 # только quiet=1; если упомянут район (Wilda/Вильда, Jeżyce/Ежице, Stare Miasto/старый город/центр, ...) — сначала он;
@@ -584,10 +598,19 @@ def validate_fact(raw: str) -> str | None      # только кириллица
 # После настоящего прогона с Google (не --dry-run, не --manual-only) все place_id, которые были в places, но не
 # встретились в этом прогоне (не в seen), помечаются operational=0 (db.mark_places_not_seen) — кроме "manual:*".
 
-# responder.py — интеграция: если trigger — обращение (mention/reply/name) и patterns.places_request(trigger_text) →
-# rows = select_places(db.places_all(), cfg.places, trigger_text, rng); places_block = render_places_block(rows);
-# trigger в bot_replies/filter_log = "places" (вместо mention/reply/name). Для ambient/spontaneous/morning блок мест не подмешивается
-# никогда («не вклиниваться с рекомендацией сам»). FilterContext.places_names = db.places_names() всегда (для regex:venue).
+# responder.py — интеграция (решение владельца после живого теста: regex про место
+# не покрывает живую речь — «колись где пиво нормальное», «есть что-то тихое на
+# Ежицах?» — поэтому регулярки остаются только для статистики и ambient, а при
+# прямом обращении выбор «спрашивали ли про место» отдан модели):
+# если trigger — обращение (mention/reply/name) → places_block = render_places_menu(db.places_all())
+# ВСЕГДА, независимо от текста и от patterns.places_request. patterns.places_request(trigger_text)
+# по-прежнему считается, но влияет только на то, что пишется в bot_replies/filter_log: сработало →
+# trigger = "places" (вместо mention/reply/name), не сработало → trigger исходный. Для
+# ambient/spontaneous/morning блок мест не подмешивается никогда («не вклиниваться с рекомендацией
+# сам») — там же живут регулярки для будущей статистики по неадресным упоминаниям. Страховка от
+# выдуманных заведений — не в этом модуле: FilterContext.places_names = db.places_names() всегда
+# (для regex:venue в выходном фильтре), так что даже если модель ошибётся с выбором, вымышленное
+# название всё равно срежется на этапе фильтра.
 
 # tests/test_injections.py — строка про отзыв Google с командой: снять skip, проверить через validate_fact.
 ```

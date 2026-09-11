@@ -58,7 +58,7 @@ from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
 from trolobot.patterns import Patterns
-from trolobot.places import render_places_block, select_places
+from trolobot.places import render_places_menu
 from trolobot.prompt import (
     SITUATION_LATE,
     SITUATION_MORNING,
@@ -87,12 +87,19 @@ _ADDRESS_TRIGGER_VALUES = (Trigger.MENTION.value, Trigger.REPLY.value, Trigger.N
 # восстанавливает _collect_addressed_items после рестарта) — не больше последних 5.
 _ADDRESSED_ITEMS_LIMIT = 5
 
-# Заведения подмешиваются только по запросу и только в обращениях (mention/reply/name);
-# ambient/spontaneous/morning никогда не получают блок мест — "не вклиниваться с
-# рекомендацией сам" (PLAN.md, этап 5). Когда запрос сработал, записываемый trigger
-# (bot_replies.trigger / filter_log.reason) подменяется на "places" (CLAUDE.md,
-# "Интерфейсы этапа 5") — бюджет обращений (mention_count/last_mention_reply_at) при
-# этом считается как для исходного trigger_value, is_address не меняется.
+# Решение владельца после живого теста: детект запроса про место регулярками не
+# покрывает живую речь («колись где пиво нормальное», «есть что-то тихое на
+# Ежицах?»). Поэтому при любом прямом обращении (mention/reply/name) весь кэш
+# заведений (render_places_menu) уходит в промпт целиком, а решение «спрашивали ли
+# про место» принимает модель по инструкции в самом блоке — не select_places.
+# ambient/spontaneous/morning по-прежнему никогда не получают список — "не
+# вклиниваться с рекомендацией сам" (PLAN.md, этап 5). patterns.places_request
+# остаётся — только для статистики: когда регулярка сработала на trigger_text
+# обращения, записываемый trigger (bot_replies.trigger / filter_log.reason)
+# подменяется на "places" (CLAUDE.md, "Интерфейсы этапа 5") — бюджет обращений
+# (mention_count/last_mention_reply_at) при этом считается как для исходного
+# trigger_value, is_address не меняется. Регулярка также используется отдельно
+# для ambient (гейт, шаг про ambient не относится к этому модулю).
 _PLACES_TRIGGER = "places"
 
 _TYPING_ACTION = "typing"
@@ -723,14 +730,11 @@ class Responder:
             situation = situation_addressed(addressed_items) if addressed_items else ""
             if delay_sec > cfg.behaviour.late_reply_threshold_sec:
                 situation = f"{situation}\n{SITUATION_LATE}" if situation else SITUATION_LATE
-        places_triggered = is_address and self.patterns_getter().places_request(trigger_text)
-        if places_triggered:
-            place_rows = await self.db.places_all()
-            selected_places = select_places(place_rows, cfg.places, trigger_text, self.rng)
-            places_block = render_places_block(selected_places)
-        else:
-            places_block = ""
-        record_trigger = _PLACES_TRIGGER if places_triggered else trigger_value
+        # Прямое обращение -> весь кэш заведений в промпт, всегда, независимо от
+        # текста; regex ниже влияет только на записываемый trigger (статистика).
+        places_block = render_places_menu(await self.db.places_all()) if is_address else ""
+        places_requested = is_address and self.patterns_getter().places_request(trigger_text)
+        record_trigger = _PLACES_TRIGGER if places_requested else trigger_value
 
         messages = build_messages(
             system_prompt,

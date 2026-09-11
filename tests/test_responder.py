@@ -2035,9 +2035,14 @@ def _place_row(
     )
 
 
-async def test_places_request_in_mention_picks_quiet_place_and_marks_trigger_places(
+async def test_places_request_in_mention_sends_full_menu_and_marks_trigger_places(
     db: Database,
 ) -> None:
+    """Решение владельца после живого теста: regex не покрывает живую речь, поэтому
+    при обращении весь кэш заведений уходит в промпт целиком (не отфильтрованные
+    select_places 1-2 места) -- решение "спрашивали ли про место" и выбор из списка
+    отдаётся модели. patterns.places_request по-прежнему матчит "куда сходить" и
+    переключает записываемый trigger на "places" -- но только для статистики."""
     cfg = _config()
     llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Есть одно место, тихое."))
     bot = FakeBot()
@@ -2063,8 +2068,9 @@ async def test_places_request_in_mention_picks_quiet_place_and_marks_trigger_pla
         assert len(calls) == 1
         payload = _payload(calls[0])
         user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "Если про место НЕ спрашивали" in user_content
         assert "Тихий Дворик" in user_content
-        assert "Шумный Бар" not in user_content
+        assert "Шумный Бар" in user_content
 
         assert len(bot.sent) == 1
         last = await db.last_bot_replies(1)
@@ -2114,9 +2120,14 @@ async def test_places_block_absent_for_ambient_even_with_places_request_text(
         await llm.aclose()
 
 
-async def test_no_places_request_text_keeps_original_trigger_and_places_none(
+async def test_mention_without_places_words_still_gets_full_menu_and_keeps_trigger(
     db: Database,
 ) -> None:
+    """Живой тест владельца: "колись где пиво нормальное" и подобные фразы не ловятся
+    regex, поэтому список заведений уходит в промпт при ЛЮБОМ прямом обращении, даже
+    когда trigger_text вообще не про место -- решение "спрашивали или нет" за моделью.
+    trigger в bot_replies остаётся исходным (mention): regex на этот текст не сработала,
+    поэтому счётчик "places" для статистики не трогается."""
     cfg = _config()
     llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("И тебе привет."))
     bot = FakeBot()
@@ -2140,7 +2151,8 @@ async def test_no_places_request_text_keeps_original_trigger_and_places_none(
 
         payload = _payload(calls[0])
         user_content = payload["messages"][1]["content"]  # type: ignore[index]
-        assert PLACES_NONE in user_content
+        assert "Если про место НЕ спрашивали" in user_content
+        assert "Тихий Дворик" in user_content
 
         last = await db.last_bot_replies(1)
         assert last[0].trigger == Trigger.MENTION.value

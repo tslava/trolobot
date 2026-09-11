@@ -12,7 +12,7 @@ import pytest
 
 from trolobot.config_models import PlacesConfig
 from trolobot.db import PlaceRow
-from trolobot.places import render_places_block, select_places, validate_fact
+from trolobot.places import render_places_block, render_places_menu, select_places, validate_fact
 from trolobot.prompt import PLACES_NONE
 
 
@@ -254,6 +254,76 @@ def test_render_places_block_never_contains_hours_or_google() -> None:
     # Никаких часов работы (их и нет в PlaceRow) — только время-подобных чисел,
     # которых бы не было ни в одном поле render_places_block.
     assert not any(ch.isdigit() for ch in block)
+
+
+# --------------------------------------------------------------------------- #
+# render_places_menu — решение владельца после живого теста: весь кэш в промпт,
+# выбор "спрашивали ли про место" за моделью (CLAUDE.md, "Интерфейсы этапа 5").
+# --------------------------------------------------------------------------- #
+
+
+def test_render_places_menu_empty_is_places_none() -> None:
+    assert render_places_menu([]) == PLACES_NONE
+
+
+def test_render_places_menu_has_instruction_and_all_rows() -> None:
+    rows = [
+        _row("p1", "Тихий Дворик", district="Wilda", category="craft", quiet=True, fact="тихо"),
+        _row("p2", "Шумный Бар", district="Rataje", category="pub", quiet=False, fact=""),
+    ]
+
+    menu = render_places_menu(rows)
+
+    assert "Если про место НЕ спрашивали" in menu
+    assert "Тихий Дворик" in menu
+    assert "Шумный Бар" in menu
+
+
+def test_render_places_menu_quiet_flag_renders_tiho_or_shumno() -> None:
+    rows = [
+        _row("p1", "Тихий Дворик", quiet=True, fact=""),
+        _row("p2", "Шумный Бар", quiet=False, fact=""),
+    ]
+
+    menu = render_places_menu(rows)
+    lines = {line.split(", ")[0]: line for line in menu.splitlines() if line.startswith("- ")}
+    quiet_line = lines["- Тихий Дворик"]
+    loud_line = lines["- Шумный Бар"]
+
+    assert "тихо" in quiet_line
+    assert "шумно" not in quiet_line
+    assert "шумно" in loud_line
+    assert "тихо" not in loud_line
+
+
+def test_render_places_menu_fact_optional() -> None:
+    rows = [
+        _row("p1", "С Фактом", quiet=True, fact="терраса"),
+        _row("p2", "Без Факта", quiet=True, fact=""),
+    ]
+
+    menu = render_places_menu(rows)
+
+    assert "С Фактом, Wilda, craft, тихо, терраса" in menu
+    assert "Без Факта, Wilda, craft, тихо" in menu
+    assert "Без Факта, Wilda, craft, тихо, " not in menu
+
+
+def test_render_places_menu_never_contains_google_rating_prices_or_hours() -> None:
+    """Источник не палится, рейтинг/отзывы/цены/часы не выводятся -- инструкция про
+    "без часов работы и без цен" в заголовке блока не в счёт, это не данные о месте,
+    а сама инструкция для модели, поэтому проверяем строку данных отдельно."""
+    rows = [_row("p1", "FARBY", fact="дёшево")]
+
+    menu = render_places_menu(rows)
+    data_line = next(line for line in menu.splitlines() if line.startswith("- "))
+
+    assert "Google" not in menu
+    assert "гугл" not in menu.lower()
+    assert "рейтинг" not in data_line.lower()
+    # Никаких часов работы и цен в строке данных — только время-подобных чисел,
+    # которых бы там не было ни в одном поле render_places_menu.
+    assert not any(ch.isdigit() for ch in data_line)
 
 
 # --------------------------------------------------------------------------- #
