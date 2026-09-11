@@ -57,17 +57,18 @@ rollback() {
     exit 1
   fi
 
+  # Логи снимаем ДО пересоздания: compose up -d удаляет упавший контейнер,
+  # и после него docker logs скажет «No such container».
   local failed_cid
-  failed_cid="$(docker compose --env-file "$ENV_FILE" ps -q "$SERVICE" || true)"
+  failed_cid="$(docker compose --env-file "$ENV_FILE" ps -aq "$SERVICE" | head -1 || true)"
+  if [ -n "$failed_cid" ]; then
+    echo "deploy.sh: последние 50 строк логов упавшего контейнера ($TAG):" >&2
+    docker logs --tail 50 "$failed_cid" >&2 || true
+  fi
 
   write_deploy_env "$PREV_TAG" "$PREV_TAG"
   if ! docker compose --env-file "$ENV_FILE" up -d; then
     echo "deploy.sh: откат на $PREV_TAG тоже не поднялся (docker compose up -d упал)" >&2
-  fi
-
-  if [ -n "$failed_cid" ]; then
-    echo "deploy.sh: последние 50 строк логов упавшего контейнера ($TAG):" >&2
-    docker logs --tail 50 "$failed_cid" >&2 || true
   fi
 
   exit 1

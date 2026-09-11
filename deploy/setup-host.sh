@@ -172,10 +172,18 @@ chown -R "$BOT_USER:$BOT_USER" "$SSH_DIR"
 if ! command -v ufw >/dev/null 2>&1; then
   apt-get install -y ufw
 fi
-ufw allow OpenSSH >/dev/null
-ufw default deny incoming >/dev/null
-ufw --force enable >/dev/null
-log "ufw: allow OpenSSH, default deny incoming, enabled"
+if ufw status | grep -q "^Status: active"; then
+  # Файрвол уже настроен владельцем (на хосте могут жить другие сервисы,
+  # например гейтвей на 443) — правила не трогаем, только гарантируем SSH.
+  ufw allow OpenSSH >/dev/null
+  log "ufw уже активен — существующие правила сохранены, SSH разрешён:"
+  ufw status numbered | sed 's/^/    /'
+else
+  ufw allow OpenSSH >/dev/null
+  ufw default deny incoming >/dev/null
+  ufw --force enable >/dev/null
+  log "ufw: allow OpenSSH, default deny incoming, enabled"
+fi
 
 # ---- 10. sshd: проверка, без изменений (не сломать доступ владельца) ---------
 SSHD_EFFECTIVE="$(sshd -T 2>/dev/null || true)"
