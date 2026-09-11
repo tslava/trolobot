@@ -1335,8 +1335,9 @@ async def test_shadow_mode_sends_but_logs_cut(
         await llm2.aclose()
 
 
-# --- 15. _fire_pending переживает ошибку в db.recent_messages: залогировано, ---
-# --- процесс жив, следующий pending обрабатывается нормально. ---
+# --- 15. _fire_pending переживает ошибку в db.recent_messages: залогировано, pending ---
+# --- НЕ помечен done (необработанное исключение внутри генерации — не filter_log- ---
+# --- исход), процесс жив, следующий pending обрабатывается нормально. ---
 
 
 async def test_fire_pending_survives_recent_messages_error_and_continues(
@@ -1383,8 +1384,13 @@ async def test_fire_pending_survives_recent_messages_error_and_continues(
         assert len(errors) == 1
         assert bot.sent == []
         assert calls == []
-        # pending уже помечен done — упало уже внутри генерации, после mark_pending_done.
-        assert await db.load_pending() == []
+        # pending НЕ помечен done: упало необработанное исключение внутри генерации
+        # (до вызова модели), а не filter_log-исход — restore_pending на следующем
+        # старте должен снова его увидеть и повторить попытку (см. тест ниже про
+        # выживание при исключении именно в самом вызове LLM).
+        pending_after_failure = await db.load_pending()
+        assert [row.id for row in pending_after_failure] == [pending_id_1]
+        assert pending_after_failure[0].done_at is None
 
         # Процесс жив: следующий PASS (новый pending) обрабатывается штатно.
         pending_id_2 = await db.insert_pending(
@@ -1410,6 +1416,205 @@ async def test_fire_pending_survives_recent_messages_error_and_continues(
         assert len(calls) == 1
     finally:
         await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 15b. Инцидент: mark_pending_done раньше ставился в начале обработки pending — ---
+# --- SIGTERM во время вызова модели терял ответ навсегда, restore_pending его уже ---
+# --- не видел (уже done). Теперь done не ставится при необработанном исключении ---
+# --- внутри самого llm.call: pending остаётся в БД, следующий restore_pending ---
+# --- (эмулирует рестарт процесса) подхватывает его и повторный вызов LLM успешен. ---
+
+
+async def test_pending_stays_undone_on_llm_exception_and_retries_after_restore(
+    db: Database,
+) -> None:
+    cfg = _config()
+    state = {"raised": False}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if not state["raised"]:
+            state["raised"] = True
+            # Не httpx.HTTPError/TimeoutException -- LLMClient это не перехватывает и
+            # не превращает в LLMError, ровно как "транспортный обрыв во время SIGTERM".
+            raise RuntimeError("transport aborted (simulated SIGTERM)")
+        return _ok_response("Ожил после рестарта.")
+
+    llm, calls = _make_llm(cfg, db, handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=950,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=950,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+            done_at=None,
+        )
+
+        await responder._fire_pending(row)
+
+        assert bot.sent == []
+        assert len(calls) == 1
+        pending_after_crash = await db.load_pending()
+        assert [r.id for r in pending_after_crash] == [pending_id]
+        assert pending_after_crash[0].done_at is None
+
+        # Эмулируем рестарт процесса: restore_pending на новом старте снова видит
+        # незавершённый pending (просрочка мала -- сразу таймер, не send:restart).
+        await responder.restore_pending()
+        assert pending_id in responder._pending_tasks
+
+        await clock.run_until(responder._pending_tasks[pending_id])
+
+        assert len(calls) == 2
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Ожил после рестарта."
+        assert await db.load_pending() == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_pending_marked_done_after_speak_false_final_decision(db: Database) -> None:
+    """speak=false -- окончательное решение о молчании (filter_log-исход llm:silent),
+    поэтому pending помечается done."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _silent_response())
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=970,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=970,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+            done_at=None,
+        )
+
+        await responder._fire_pending(row)
+
+        assert bot.sent == []
+        assert len(calls) == 1
+        assert await db.load_pending() == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("llm:silent") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_pending_marked_done_after_successful_send(db: Database) -> None:
+    """Успешная отправка -- pending помечается done после insert_bot_reply, то есть
+    после того как ответ уже появился в bot_replies."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ну привет."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=980,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=980,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+            done_at=None,
+        )
+
+        await _drive(clock, responder._fire_pending(row))
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+        assert (await db.recent_bot_replies(5)) == ["Ну привет."]
+        assert await db.load_pending() == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_shutdown_waits_for_inflight_generation_before_cancelling(db: Database) -> None:
+    """shutdown() во время висящего вызова модели (_respond_lock занят) не отменяет
+    генерацию сразу -- ждёт (asyncio.wait_for на лок), пока LLM-подделка, зависшая на
+    Event, не будет отпущена; ответ должен успеть уйти."""
+    cfg = _config()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await release.wait()
+        return _ok_response("Договорил после shutdown.")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    llm = LLMClient(api_key="test-key", cfg_getter=lambda: cfg, db=db, http=http)
+    bot = FakeBot()
+
+    async def instant_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
+    responder = Responder(
+        bot=bot,
+        db=db,
+        cfg_getter=lambda: cfg,
+        llm=llm,
+        patterns_getter=lambda: patterns,
+        prompt_store=FakePromptStore(),
+        rng=random.Random(0),
+        chat_id=CHAT_ID,
+        bot_user_id=BOT_USER_ID,
+        clock=lambda: DAY_NOW,
+        sleep=instant_sleep,
+    )
+    try:
+        msg = _gate_message(tg_message_id=990, user_id=5, text="привет всем", created_at=DAY_NOW)
+        gen_task: asyncio.Task[None] = asyncio.ensure_future(
+            responder._handle_debounced(Trigger.AMBIENT, msg, "Юзер1")
+        )
+        await started.wait()  # генерация внутри llm.call, держит _respond_lock
+
+        assert responder._respond_lock.locked()
+        shutdown_task: asyncio.Task[None] = asyncio.ensure_future(responder.shutdown())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not shutdown_task.done()  # ждёт лок, не отменяет пока LLM не ответила
+
+        release.set()  # LLM "отвечает" -- имитация того, что процесс дожил до ответа
+        await gen_task
+        await shutdown_task
+
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Договорил после shutdown."
+    finally:
         await llm.aclose()
 
 

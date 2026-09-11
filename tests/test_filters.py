@@ -124,9 +124,38 @@ CASES: list[tuple[str, str, FilterContext, str | None]] = [
     ("markdown_bold", "Это **очень** важно поверь мне.", _DEFAULT_CTX, "regex:markdown"),
     ("markdown_header", "# Важно: не открывай дверь чужим.", _DEFAULT_CTX, "regex:markdown"),
     ("markdown_codeblock", "```тут код``` не открывай.", _DEFAULT_CTX, "regex:markdown"),
-    ("emoji", "Привет всем сегодня 😀 хорошо.", _DEFAULT_CTX, "regex:emoji"),
+    # 🚀 вне filters.allowed_emoji -> по-прежнему режется, даже не в конце реплики
+    ("emoji", "Привет всем сегодня 🚀 хорошо.", _DEFAULT_CTX, "regex:emoji"),
     ("length_301", "ы" * 301, _DEFAULT_CTX, "regex:length"),
     ("length_boundary_300_pass", "ы" * 300, _DEFAULT_CTX, None),
+    # --- разрешённые эмодзи (решение владельца, CHARACTER.md раздел 3/4) ---
+    ("emoji_allowed_end_pass", "Бывает 🙂", _DEFAULT_CTX, None),
+    ("emoji_allowed_after_dot_pass", "Бывает. 💩", _DEFAULT_CTX, None),
+    ("emoji_allowed_thumbsup_skin_tone_pass", "Бывает 👍🏻", _DEFAULT_CTX, None),
+    ("emoji_count_two_cut", "Бывает 🙂🙂", _DEFAULT_CTX, "style:emoji_count"),
+    ("emoji_position_start_cut", "🙂 Бывает", _DEFAULT_CTX, "style:emoji_position"),
+    ("emoji_disallowed_cut", "Бывает 🚀", _DEFAULT_CTX, "regex:emoji"),
+    (
+        "emoji_freq_within_window_cut",
+        "Бывает 🙂",
+        _ctx(recent_replies=["Все по домам.", "Бывает.", "Ладно.", "Зря 😂"]),
+        "style:emoji_freq",
+    ),
+    (
+        "emoji_freq_fifth_back_pass",
+        "Бывает 🙂",
+        _ctx(
+            recent_replies=[
+                "Зря 😂",
+                "Все по домам разошлись.",
+                "Ладно, я в гараже.",
+                "Купил торф для рассады.",
+                "Спокойной ночи всем.",
+            ]
+        ),
+        None,
+    ),
+    ("emoji_none_no_style_triggers", "Бывает, с кем не случается.", _DEFAULT_CTX, None),
     # --- начинается с имени ---
     (
         "starts_name_participant",
@@ -390,7 +419,9 @@ async def test_check_output_table(
 
 
 async def test_check_output_collects_all_matching_reasons() -> None:
-    text = "- Сделай так 😀\n- И вот так тоже"
+    # 🚀 вне filters.allowed_emoji -> regex:emoji по-прежнему срабатывает; эмодзи в
+    # самом конце реплики, чтобы не задеть style:emoji_position — тот проверяется отдельно.
+    text = "- Сделай так\n- И вот так тоже 🚀"
     verdict = await check_output(text, _DEFAULT_CTX)
     assert verdict.ok is False
     assert verdict.reasons == ("regex:markdown", "regex:emoji")

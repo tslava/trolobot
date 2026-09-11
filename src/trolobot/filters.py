@@ -39,6 +39,11 @@ _MARKDOWN_HEADER_RE = re.compile(r"(^|\n)\s*#")
 
 _EMOJI_RANGES = ((0x1F300, 0x1FAFF), (0x2600, 0x27BF))
 _EMOJI_CATEGORIES = frozenset({"So", "Sk"})
+# Вариационный селектор U+FE0F и цветовые модификаторы кожи U+1F3FB-U+1F3FF, сразу
+# следующие за эмодзи (напр. "👍️" или "👍🏻"), — часть того же символа, не
+# отдельный эмодзи (CLAUDE.md, правки этапа 4).
+_VARIATION_SELECTOR_16 = "\ufe0f"
+_SKIN_TONE_LO, _SKIN_TONE_HI = 0x1F3FB, 0x1F3FF
 
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?…]+(?:\s|$)")
 # Фрагмент между разделителями [.!?…] считается предложением только от 3 слов
@@ -183,14 +188,43 @@ def _has_markdown(text: str) -> bool:
     return _MARKDOWN_HEADER_RE.search(text) is not None
 
 
+def _is_emoji_char(ch: str) -> bool:
+    code_point = ord(ch)
+    if any(lo <= code_point <= hi for lo, hi in _EMOJI_RANGES):
+        return True
+    return unicodedata.category(ch) in _EMOJI_CATEGORIES
+
+
 def _has_emoji(text: str) -> bool:
-    for ch in text:
-        code_point = ord(ch)
-        if any(lo <= code_point <= hi for lo, hi in _EMOJI_RANGES):
-            return True
-        if unicodedata.category(ch) in _EMOJI_CATEGORIES:
-            return True
-    return False
+    return any(_is_emoji_char(ch) for ch in text)
+
+
+def _is_emoji_modifier(ch: str) -> bool:
+    """U+FE0F (вариационный селектор) или цветовой модификатор кожи U+1F3FB-U+1F3FF,
+    сразу следующий за базовым эмодзи ("👍️", "👍🏻") — часть того же символа."""
+    if ch == _VARIATION_SELECTOR_16:
+        return True
+    return _SKIN_TONE_LO <= ord(ch) <= _SKIN_TONE_HI
+
+
+def _emoji_tokens(text: str) -> list[tuple[str, int]]:
+    """Список (базовый символ эмодзи, индекс конца граммемы) для каждого эмодзи в
+    тексте. Модификаторы (``_is_emoji_modifier``) сразу после базового символа
+    поглощаются тем же токеном и не считаются отдельным эмодзи."""
+    tokens: list[tuple[str, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if _is_emoji_char(ch):
+            end = i + 1
+            while end < n and _is_emoji_modifier(text[end]):
+                end += 1
+            tokens.append((ch, end))
+            i = end
+        else:
+            i += 1
+    return tokens
 
 
 def _sentence_count(text: str) -> int:
@@ -280,6 +314,15 @@ def _check_prompt_leak(text: str, system_prompt: str) -> bool:
     return bool(prompt_grams & text_grams)
 
 
+def _allowed_emoji_set(ctx: FilterContext) -> frozenset[str]:
+    return frozenset(ctx.cfg.filters.allowed_emoji)
+
+
+def _check_emoji_disallowed(text: str, allowed: frozenset[str]) -> bool:
+    """regex:emoji — эмодзи вне filters.allowed_emoji."""
+    return any(ch not in allowed for ch, _ in _emoji_tokens(text))
+
+
 def _check_latin_run(text: str, whitelist: set[str]) -> bool:
     run = 0
     for raw_token in text.split():
@@ -306,7 +349,7 @@ def layer_regex(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
         reasons.append("regex:length")
     if _has_markdown(text):
         reasons.append("regex:markdown")
-    if _has_emoji(text):
+    if _check_emoji_disallowed(text, _allowed_emoji_set(ctx)):
         reasons.append("regex:emoji")
     if _sentence_count(text) > 2:
         reasons.append("regex:sentences")
@@ -437,6 +480,32 @@ def _check_self_echo(text: str, ctx: FilterContext) -> bool:
     return False
 
 
+def _check_emoji_count(text: str, allowed: frozenset[str], max_per_reply: int) -> bool:
+    """style:emoji_count — разрешённых эмодзи в реплике больше emoji_max_per_reply."""
+    count = sum(1 for ch, _ in _emoji_tokens(text) if ch in allowed)
+    return count > max_per_reply
+
+
+def _check_emoji_freq(text: str, recent_replies: list[str], window: int) -> bool:
+    """style:emoji_freq — в тексте есть эмодзи И хотя бы в одной из последних
+    ``window`` recent_replies тоже было эмодзи (правило «не чаще раза из пяти»
+    держит выходной фильтр, не промпт, см. CHARACTER.md раздел 3)."""
+    if window <= 0 or not _has_emoji(text):
+        return False
+    return any(_has_emoji(reply) for reply in recent_replies[-window:])
+
+
+def _check_emoji_position(text: str) -> bool:
+    """style:emoji_position — после последнего эмодзи в тексте остаётся что-то,
+    кроме пробелов и точек (допускаются "Бывает 🙂" и "Бывает. 💩", но не "🙂 Бывает")."""
+    tokens = _emoji_tokens(text)
+    if not tokens:
+        return False
+    _, last_end = tokens[-1]
+    remainder = text[last_end:].replace(" ", "").replace(".", "")
+    return bool(remainder)
+
+
 def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
     """Слой 2: детерминированные правила, 0 мс. ``patterns`` — см. ``layer_regex``."""
     reasons: list[str] = []
@@ -454,6 +523,14 @@ def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
         reasons.append("style:question_x2")
     if text.count("!") > 1:
         reasons.append("style:exclaim")
+
+    allowed_emoji = _allowed_emoji_set(ctx)
+    if _check_emoji_count(text, allowed_emoji, ctx.cfg.filters.emoji_max_per_reply):
+        reasons.append("style:emoji_count")
+    if _check_emoji_freq(text, ctx.recent_replies, ctx.cfg.filters.emoji_recent_window):
+        reasons.append("style:emoji_freq")
+    if _check_emoji_position(text):
+        reasons.append("style:emoji_position")
 
     return reasons
 

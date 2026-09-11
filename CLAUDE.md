@@ -310,7 +310,7 @@ class Responder:
     # В момент due: если in_window(quiet) → перенести в night_queue (enqueue_night) и mark_pending_done, filter_log send:night;
     # перепроверка детерминированных шагов гейта (panic/stop/muted/topic_cooldown/mention caps) через load_gate_state +
     # локальную функцию recheck() — БЕЗ dice и live; провал → filter_log send:recheck_<причина>, mark_pending_done;
-    # иначе _respond(trigger, delay_sec = now - created_at, late = delay_sec > late_reply_threshold_sec).
+    # иначе _respond(trigger, delay_sec = now - created_at, pending_id=row.id, late = delay_sec > late_reply_threshold_sec) — mark_pending_done откладывается до итога генерации (_finish_pending: любой filter_log-исход или успешная отправка), НЕ до вызова модели, иначе SIGTERM во время llm.call теряет ответ навсегда (restore_pending его уже не увидит).
     # Обращений может накопиться несколько за время схлопывания одного pending — _pending_info хранит
     # list[(display_name, text)], каждое схлопывание дописывает, не заменяет; _generate_and_send строит
     # situation обращения из этого списка через prompt.situation_addressed (потолок 5), а не из аргумента
@@ -380,7 +380,10 @@ async def check_output(text: str, ctx: FilterContext, judge: Judge | None = None
 def layer_regex(text, ctx) -> list[str]
 #   regex:length        len(text) > 300
 #   regex:markdown      r"(^|\n)\s*[-*•] ", r"(^|\n)\s*\d+\.\s", "**", "#" в начале строки, "```"
-#   regex:emoji         любой символ категории So/Sk или в диапазонах эмодзи (U+1F300–1FAFF, U+2600–27BF)
+#   regex:emoji         эмодзи (символ категории So/Sk или в диапазонах U+1F300–1FAFF, U+2600–27BF),
+#                       которого нет в filters.allowed_emoji; вариационный селектор U+FE0F и цветовой
+#                       модификатор кожи U+1F3FB–1F3FF сразу после эмодзи — часть того же символа,
+#                       отдельно не считаются
 #   regex:sentences     больше двух предложений: split по [.!?…]+; предложением считается фрагмент от 3 слов —
 #                       рубленая байка «…переносили. Дважды. Потом контору закрыли…» проходит, лекция из трёх фраз нет
 #   regex:starts_name   первое слово (без знаков) без учёта регистра ∈ participant_names ∪ bot_names ∪ имена из participant_names по первому слову
@@ -412,6 +415,11 @@ def layer_rules(text, ctx) -> list[str]
 #   style:assistant     filters.assistant_markers (фразы, без учёта регистра)
 #   style:question_x2   text.rstrip() заканчивается на "?" И последняя из recent_replies тоже
 #   style:exclaim       больше одного "!" — восклицательных почти нет
+#   style:emoji_count   разрешённых эмодзи (filters.allowed_emoji) в реплике больше filters.emoji_max_per_reply
+#   style:emoji_freq    в реплике есть эмодзи И хотя бы в одной из последних filters.emoji_recent_window
+#                       recent_replies тоже есть эмодзи (любое, не только разрешённое)
+#   style:emoji_position эмодзи не в конце реплики — после последнего эмодзи, за вычетом пробелов
+#                       и точек, остаётся что-то ещё (буквы, цифры, другие знаки)
 
 # judge.py — слой 3
 @dataclass(frozen=True) class JudgeVerdict: in_character: bool; risky: bool; obeyed_user: bool; reason: str

@@ -115,6 +115,10 @@ _AMBIENT_LIKE_TRIGGER_VALUES = (Trigger.AMBIENT.value, "spontaneous")
 # в busy-loop, если ошибка повторяется на каждом заходе (по образцу retention_loop).
 _ERROR_RETRY_SEC = 60.0
 
+# shutdown(): если идёт генерация (_respond_lock занят), сколько ждать её штатного
+# завершения перед отменой таймеров — штатный SIGTERM не должен рвать вызов модели.
+_SHUTDOWN_GENERATION_WAIT_SEC = 10.0
+
 # FilterContext.recent_replies — последние 50 реплик бота (CLAUDE.md, "Интерфейсы этапа 4"),
 # независимо от cfg.behaviour.recent_replies_memory, которым ограничен блок {recent_replies}
 # в самом промпте генерации.
@@ -467,8 +471,11 @@ class Responder:
             # _pending_info пуст. Восстанавливаем накопленные обращения из messages.
             addressed_items = await self._collect_addressed_items(row)
         pending_text = addressed_items[-1][1] if addressed_items else ""
-        await self.db.mark_pending_done(row.id, now)
         delay_sec = now - row.created_at
+        # mark_pending_done НЕ вызывается здесь (инцидент: раньше ставился до генерации —
+        # SIGTERM во время вызова модели терял ответ навсегда, restore_pending его уже не
+        # видел). pending_id уходит в _respond/_generate_and_send и помечается done только
+        # по итогу обработки — см. _finish_pending.
         await self._respond(
             trigger=row.trigger,
             trigger_msg_id=row.trigger_tg_message_id,
@@ -477,6 +484,7 @@ class Responder:
             delay_sec=delay_sec,
             trigger_text=pending_text,
             addressed_items=addressed_items,
+            pending_id=row.id,
         )
 
     async def _collect_addressed_items(self, row: PendingRow) -> list[tuple[str, str]]:
@@ -561,6 +569,24 @@ class Responder:
     # Генерация и отправка.
     # ------------------------------------------------------------------ #
 
+    async def _finish_pending(self, pending_id: int | None, done_at: int) -> None:
+        """Помечает pending done — но только по итогу обработки (успешная отправка
+        плюс insert_bot_reply, либо любой filter_log-исход молчания: recheck-провал,
+        night_queue, llm:no_model, llm:invalid_json, llm:silent, срез фильтром не в
+        shadow, LLMError). Вызывается явно в каждой такой точке, а не в конце
+        _respond_inner безусловно — иначе необработанное исключение внутри генерации
+        (см. except Exception в _respond) тоже пометило бы pending done через finally,
+        что и было причиной инцидента (SIGTERM во время llm.call → ответ потерян
+        навсегда, restore_pending его уже не видел).
+
+        Риск, принятый осознанно: если процесс убьют (SIGKILL, без шанса на finally)
+        уже после bot.send_message, но до этого вызова — при следующем старте
+        restore_pending подхватит тот же pending и отправит дубликат. Редкий случай,
+        мириться с ним дешевле, чем с потерей ответа.
+        """
+        if pending_id is not None:
+            await self.db.mark_pending_done(pending_id, done_at)
+
     async def _respond(
         self,
         *,
@@ -571,6 +597,7 @@ class Responder:
         delay_sec: int,
         trigger_text: str = "",
         addressed_items: list[tuple[str, str]] | None = None,
+        pending_id: int | None = None,
     ) -> None:
         try:
             await self._respond_inner(
@@ -581,8 +608,10 @@ class Responder:
                 delay_sec=delay_sec,
                 trigger_text=trigger_text,
                 addressed_items=addressed_items,
+                pending_id=pending_id,
             )
         except LLMError as exc:
+            now = self._clock()
             await self.db.insert_filter_log(
                 trigger_tg_message_id=trigger_msg_id,
                 candidate_text=None,
@@ -590,12 +619,17 @@ class Responder:
                 stage="llm",
                 reason=exc.reason,
                 shadow=False,
-                created_at=self._clock(),
+                created_at=now,
             )
+            await self._finish_pending(pending_id, now)
         except Exception:
             logger.exception(
                 "responder failed: trigger=%s trigger_msg_id=%s", trigger, trigger_msg_id
             )
+            # Намеренно НЕ mark_pending_done: необработанное исключение (транспортный
+            # обрыв во время SIGTERM, любой сбой внутри _generate_and_send) не должно
+            # "хоронить" pending — restore_pending на следующем старте подхватит его
+            # заново (см. _finish_pending).
 
     async def _respond_inner(
         self,
@@ -607,6 +641,7 @@ class Responder:
         delay_sec: int,
         trigger_text: str = "",
         addressed_items: list[tuple[str, str]] | None = None,
+        pending_id: int | None = None,
     ) -> None:
         # Один Responder генерирует и отправляет строго по одному ответу за раз: без
         # этого лока два PASS, ждущих LLM параллельно, могли бы оба проскочить одну и
@@ -633,6 +668,7 @@ class Responder:
                         shadow=False,
                         created_at=now,
                     )
+                    await self._finish_pending(pending_id, now)
                     return
 
             await self._generate_and_send(
@@ -646,6 +682,7 @@ class Responder:
                 now=now,
                 trigger_text=trigger_text,
                 addressed_items=addressed_items,
+                pending_id=pending_id,
             )
 
     async def _recheck_ambient_budget(self, cfg: Config, now: int) -> str | None:
@@ -683,6 +720,7 @@ class Responder:
         now: int,
         trigger_text: str = "",
         addressed_items: list[tuple[str, str]] | None = None,
+        pending_id: int | None = None,
     ) -> None:
         if not cfg.llm.main_model:
             # LLM включён (есть openrouter_api_key), но модель ещё не задана —
@@ -703,6 +741,7 @@ class Responder:
             ):
                 self._last_no_model_warn_at = now
                 logger.warning("llm.main_model не задан, ответ не сгенерирован")
+            await self._finish_pending(pending_id, now)
             return
 
         context_rows = await self.db.recent_messages(self.chat_id, cfg.behaviour.context_window)
@@ -761,6 +800,7 @@ class Responder:
                 shadow=False,
                 created_at=now,
             )
+            await self._finish_pending(pending_id, now)
             return
 
         if not reply.speak:
@@ -773,6 +813,7 @@ class Responder:
                 shadow=False,
                 created_at=now,
             )
+            await self._finish_pending(pending_id, now)
             return
 
         filter_recent_replies = await self.db.recent_bot_replies(_FILTER_RECENT_REPLIES_LIMIT)
@@ -817,6 +858,7 @@ class Responder:
                 )
             if not shadow:
                 logger.info("cut: %s", ", ".join(reasons))
+                await self._finish_pending(pending_id, now)
                 return
 
         reply_to_message_id: int | None = None
@@ -866,6 +908,7 @@ class Responder:
             shadow=False,
             created_at=now,
         )
+        await self._finish_pending(pending_id, now)
 
     async def _run_typing(self, text: str) -> None:
         duration = len(text) / _CHARS_PER_SEC
@@ -1033,7 +1076,26 @@ class Responder:
 
     async def shutdown(self) -> None:
         """Отменяет дебаунс- и pending-таймеры. Сами pending остаются в БД —
-        следующий restore_pending (после рестарта) подхватит их заново."""
+        следующий restore_pending (после рестарта) подхватит их заново.
+
+        Если в момент остановки идёт генерация (``_respond_lock`` занят — идёт
+        вызов модели или отправка), даём ей до ``_SHUTDOWN_GENERATION_WAIT_SEC``
+        довершиться штатно, а не рвём её отменой: штатный SIGTERM не должен
+        обрывать вызов модели на полуслове (инцидент — mark_pending_done,
+        поставленный до генерации, из-за этого терял ответ навсегда). Не успела за
+        отведённое время — отменяем как обычно; pending останется в БД (done не
+        выставлен) и будет подхвачен restore_pending на следующем старте.
+        """
+        if self._respond_lock.locked():
+            try:
+                await asyncio.wait_for(
+                    self._respond_lock.acquire(), timeout=_SHUTDOWN_GENERATION_WAIT_SEC
+                )
+            except TimeoutError:
+                pass
+            else:
+                self._respond_lock.release()
+
         tasks: list[asyncio.Task[None]] = []
         if self._debounce_task is not None and not self._debounce_task.done():
             self._debounce_task.cancel()

@@ -367,12 +367,22 @@ _REGEX_LIST_FIELDS = (
     "model_talk",
 )
 
+# Разрешённый набор эмодзи (решение владельца, CHARACTER.md раздел 3/4) — небольшой,
+# редко и к месту. Порядок фиксирован. 💩 и 👍 в этом чате значат «одобряю» (локальная
+# шутка про 💩), см. prompts/system.txt.
+_ALLOWED_EMOJI_DEFAULT = ["🙁", "🙂", "😂", "😀", "🤪", "💩", "👍"]
+
 
 class FiltersConfig(BaseModel):
     shadow: bool = True
     places_whitelist: list[str] = Field(
         default_factory=lambda: ["Lidl", "OLX", "Biedronka", "Żabka", "Allegro"]
     )
+    # Разрешённые эмодзи для regex:emoji/style:emoji_* (CHARACTER.md раздел 3/4).
+    allowed_emoji: list[str] = Field(default_factory=lambda: list(_ALLOWED_EMOJI_DEFAULT))
+    emoji_max_per_reply: int = Field(default=1, ge=0, le=3)
+    # Если хотя бы в одной из последних N реплик было эмодзи — новое режется (style:emoji_freq).
+    emoji_recent_window: int = Field(default=4, ge=0, le=20)
     # Заведения из CHARACTER.md, раздел 7 — белый список regex:venue/regex:latin,
     # см. _KNOWN_PLACES_DEFAULT.
     known_places: list[str] = Field(default_factory=lambda: list(_KNOWN_PLACES_DEFAULT))
