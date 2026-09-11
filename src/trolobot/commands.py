@@ -292,11 +292,37 @@ async def _cmd_panic(message: Message, deps: _CommandsDeps, now: int, user: User
 
 
 async def _cmd_resume(message: Message, deps: _CommandsDeps, now: int, user: User) -> None:
+    """Снимает panic, stop_until и предохранитель LLM (llm_circuit_until/
+    llm_error_streak). Действия безусловны (как раньше для panic/stop_until), но
+    в ответе перечисляется только то, что реально было выставлено — иначе
+    владелец решит, что бот стоял на паузе, которой не было."""
+    panic_was_set = await deps.db.get_state("panic") is not None
+    stop_was_set = await deps.db.get_state("stop_until") is not None
+    streak_before = await deps.db.get_state("llm_error_streak")
+    circuit_was_open = await deps.db.get_state("llm_circuit_until") is not None
+
     await deps.db.delete_state("panic")
     await deps.db.delete_state("stop_until")
+    await deps.db.delete_state("llm_circuit_until")
+    await deps.db.set_state("llm_error_streak", "0")
     await deps.db.audit_stop("resume", user.id, now)
-    logger.info("resume")
-    await _reply(message, "Продолжаем.")
+    logger.info(
+        "resume: panic=%s stop=%s circuit=%s", panic_was_set, stop_was_set, circuit_was_open
+    )
+
+    cleared: list[str] = []
+    if panic_was_set:
+        cleared.append("panic")
+    if stop_was_set:
+        cleared.append("stop")
+    if circuit_was_open:
+        streak = streak_before if streak_before is not None else "?"
+        cleared.append(f"предохранитель LLM (было {streak} ошибок подряд)")
+
+    text = "Продолжаем."
+    if cleared:
+        text += f" Снято: {', '.join(cleared)}."
+    await _reply(message, text)
 
 
 async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
@@ -309,6 +335,14 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         local_dt(int(stop_until_raw), tz).strftime("%H:%M %d.%m") if stop_until_raw else "нет"
     )
 
+    circuit_until_raw = await deps.db.get_state("llm_circuit_until")
+    circuit_state = "закрыт"
+    if circuit_until_raw is not None:
+        circuit_until = int(circuit_until_raw)
+        if circuit_until > now:
+            circuit_state = f"открыт до {local_dt(circuit_until, tz).strftime('%H:%M')}"
+    llm_error_streak = await deps.db.get_state("llm_error_streak") or "0"
+
     ambient = int(await deps.db.get_state(day_key("ambient_count", now, tz)) or "0")
     mention = int(await deps.db.get_state(day_key("mention_count", now, tz)) or "0")
     llm_calls = int(await deps.db.get_state(day_key("llm_calls", now, tz)) or "0")
@@ -320,6 +354,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     lines = [
         f"Паника: {'да' if panic else 'нет'}",
         f"Стоп до: {stop_until}",
+        f"Предохранитель LLM: {circuit_state}, ошибок подряд: {llm_error_streak}",
         f"Промпт: v{deps.prompt_store.prompt_version()}, "
         f"few-shot: v{deps.prompt_store.few_shot_version()}",
         f"Модели: main={cfg.llm.main_model or '-'}, judge={cfg.llm.judge_model or '-'}",

@@ -29,6 +29,7 @@ from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Verdict
 from trolobot.settings import Settings
 from trolobot.stores import ConfigStore, PromptStore
+from trolobot.timeutil import local_dt
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_PATH = _REPO_ROOT / "config.yaml"
@@ -457,6 +458,49 @@ async def test_status_returns_text_with_prompt_and_few_shot_versions(
     assert f"v{prompt_store.few_shot_version()}" in text
     assert "Паника" in text
     assert "Стоп до" in text
+    assert "Предохранитель LLM: закрыт, ошибок подряд: 0" in text
+
+
+async def test_status_shows_open_circuit_and_error_streak(
+    wired: tuple[Deps, Database, ConfigStore, PromptStore], sent: list[str]
+) -> None:
+    deps, db, config_store, _prompt_store = wired
+    handler = _commands_handler(deps)
+
+    await db.set_state("llm_circuit_until", str(NOW_TS + 1800))
+    await db.set_state("llm_error_streak", "5")
+
+    message = _message(chat=_private_chat(), from_user=_user(ADMIN_ID, "Владелец"), text="/status")
+    await handler(message)
+
+    assert len(sent) == 1
+    text = sent[0]
+    expected_time = local_dt(NOW_TS + 1800, config_store.get().persona.timezone).strftime("%H:%M")
+    assert f"Предохранитель LLM: открыт до {expected_time}, ошибок подряд: 5" in text
+
+
+# --- /resume: снимает panic/stop и предохранитель LLM целиком через реальную БД ----
+
+
+async def test_resume_clears_llm_circuit_via_real_db(
+    wired: tuple[Deps, Database, ConfigStore, PromptStore], sent: list[str]
+) -> None:
+    deps, db, _config_store, _prompt_store = wired
+    handler = _commands_handler(deps)
+
+    await db.set_state("panic", "1")
+    await db.set_state("stop_until", "123")
+    await db.set_state("llm_circuit_until", str(NOW_TS + 1800))
+    await db.set_state("llm_error_streak", "5")
+
+    message = _message(chat=_private_chat(), from_user=_user(ADMIN_ID, "Владелец"), text="/resume")
+    await handler(message)
+
+    assert await db.get_state("panic") is None
+    assert await db.get_state("stop_until") is None
+    assert await db.get_state("llm_circuit_until") is None
+    assert await db.get_state("llm_error_streak") == "0"
+    assert sent == ["Продолжаем. Снято: panic, stop, предохранитель LLM (было 5 ошибок подряд)."]
 
 
 # --- Порядок роутеров в Dispatcher: команды раньше основного гейта ------------------
