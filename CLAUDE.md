@@ -413,6 +413,7 @@ def layer_rules(text, ctx) -> list[str]
 #   dedup:self_echo     нормализованная 4-грамма кандидата (кроме грамм из одних стоп-слов: я/и/в/на/не/что/это/у/меня/тебя/
 #                       ты/а/но/да/нет/же/бы/как/так/то/все/всё) целиком по словам встречается в любой из последних 20 recent_replies
 #   style:assistant     filters.assistant_markers (фразы, без учёта регистра)
+#   style:grumpy        filters.grumpy_markers («я же говорил», «разговор закрыт», «никому не интересно», ...)
 #   style:question_x2   text.rstrip() заканчивается на "?" И последняя из recent_replies тоже
 #   style:exclaim       больше одного "!" — восклицательных почти нет
 #   style:emoji_count   разрешённых эмодзи (filters.allowed_emoji) в реплике больше filters.emoji_max_per_reply
