@@ -384,6 +384,59 @@ def _check_question_x2(text: str, recent_replies: list[str]) -> bool:
     return recent_replies[-1].rstrip().endswith("?")
 
 
+# Стоп-слова для dedup:self_echo (CLAUDE.md, "Интерфейсы этапа 4", правки): 4-грамма,
+# состоящая только из этих слов, слишком общая, чтобы считаться самоповтором.
+_SELF_ECHO_STOPWORDS = frozenset(
+    {
+        "я",
+        "и",
+        "в",
+        "на",
+        "не",
+        "что",
+        "это",
+        "у",
+        "меня",
+        "тебя",
+        "ты",
+        "а",
+        "но",
+        "да",
+        "нет",
+        "же",
+        "бы",
+        "как",
+        "так",
+        "то",
+        "все",
+        "всё",
+    }
+)
+
+_SELF_ECHO_RECENT = 20
+
+
+def _check_self_echo(text: str, ctx: FilterContext) -> bool:
+    """dedup:self_echo — кандидат пересказывает свою же недавнюю байку.
+
+    Нормализованная 4-грамма кандидата (без грамм из одних стоп-слов) сверяется
+    со словами последних ``_SELF_ECHO_RECENT`` ``ctx.recent_replies``: если все
+    четыре слова граммы встречаются среди слов одной и той же реплики — срез.
+    Сравнение по множеству слов, а не по дословному фрагменту (в отличие от
+    ``regex:echo``) — цель поймать пересказ той же байки другими словами/порядком,
+    не только буквальное повторение.
+    """
+    grams = _ngrams(_normalize_words(text), 4)
+    grams = {gram for gram in grams if set(gram) - _SELF_ECHO_STOPWORDS}
+    if not grams:
+        return False
+    for reply in ctx.recent_replies[-_SELF_ECHO_RECENT:]:
+        reply_words = set(_normalize_words(reply))
+        if any(set(gram) <= reply_words for gram in grams):
+            return True
+    return False
+
+
 def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
     """Слой 2: детерминированные правила, 0 мс. ``patterns`` — см. ``layer_regex``."""
     reasons: list[str] = []
@@ -392,6 +445,8 @@ def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
         reasons.append("dedup:jaccard")
     if _check_polish_freq(text, ctx):
         reasons.append("dedup:polish_freq")
+    if _check_self_echo(text, ctx):
+        reasons.append("dedup:self_echo")
 
     if patterns.assistant_marker(text) is not None:
         reasons.append("style:assistant")

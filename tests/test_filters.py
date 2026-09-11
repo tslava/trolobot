@@ -332,6 +332,25 @@ CASES: list[tuple[str, str, FilterContext, str | None]] = [
         ),
         None,
     ),
+    # --- самоповтор байки (слой 2, dedup:self_echo, CLAUDE.md правки этапа 4) ---
+    (
+        "self_echo_reworded_anekdote_cut",
+        "я его дома пью, одну бутылку",
+        _ctx(recent_replies=["пью одно пиво за вечер, дома, одну бутылку"]),
+        "dedup:self_echo",
+    ),
+    (
+        "self_echo_stopwords_only_pass",
+        "И не то что я против, просто устал.",
+        _ctx(recent_replies=["Ну и не то что тут скажешь."]),
+        None,
+    ),
+    (
+        "self_echo_three_common_words_pass",
+        "рыбу ловил утром вчера",
+        _ctx(recent_replies=["рыбу ловил утром сегодня"]),
+        None,
+    ),
     # --- маркеры ассистента и стиль ---
     ("style_assistant", "Конечно! Дальше сам разберёшься.", _DEFAULT_CTX, "style:assistant"),
     ("style_assistant_pass", "Не советую, но дело твое.", _DEFAULT_CTX, None),

@@ -188,6 +188,10 @@ PLACES_REQUEST_CASES = [
     ("pivnuha", "пивнуха рядом", True),
     ("kuda_sjezdit", "куда съездить на выходных", True),
     ("kak_dela_no_match", "как дела", False),
+    ("kolis_gde_pivo_normalnoe", "колись где пиво самое нормальное в центре", True),
+    ("kuda_poyti_vecherom", "куда пойти вечером", True),
+    ("gde_ty_zhivyosh_no_match", "где ты живёшь", False),
+    ("pivo_vkusnoe_bylo_no_match", "пиво вкусное было", False),
 ]
 
 
