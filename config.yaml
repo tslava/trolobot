@@ -46,7 +46,7 @@ behaviour:
 
 llm:
   provider: openrouter                 # OpenAI-совместимый API, ключ в .env
-  main_model: "anthropic/claude-sonnet-5"   # id модели в OpenRouter
+  main_model: "anthropic/claude-opus-5"     # id модели в OpenRouter
   judge_model: "openai/gpt-5.4-nano"         # маленькая и дешёвая, другой вендор
   timeout_sec: 30
   max_tokens: 200
@@ -56,8 +56,8 @@ llm:
   circuit_errors: 5                    # ошибок подряд → пауза
   circuit_pause_min: 30
   # fallback-цены за 1M токенов; используются, только если провайдер не вернул usage.cost
-  price_in_usd_per_1m: 2.0
-  price_out_usd_per_1m: 10.0
+  price_in_usd_per_1m: 5.0
+  price_out_usd_per_1m: 25.0
 
 places:
   min_rating: 4.2
