@@ -24,6 +24,7 @@ import contextlib
 import json
 import logging
 import random
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -101,6 +102,9 @@ class FakeBot:
         self.events.append(("typing", str(chat_id), action))
 
 
+_REAL_IO_STEP_SEC = 0.001  # реальная пауза, пока корутина в I/O (поток aiosqlite)
+
+
 class FakeClock:
     """Виртуальное время: sleep() не продвигает его сам, ждёт явного будильника.
 
@@ -108,6 +112,32 @@ class FakeClock:
     продвинуть время до его момента, дать циклу событий тик» пока указанная
     задача не завершится. ``run_until_idle()`` — то же самое, но пока вообще
     не останется ни ожидающих, ни готовых к выполнению корутин.
+
+    Почему это не так просто, как кажется: между тем, как ``_tick`` разбудил
+    ожидающего (``event.set()``) и тем, как разбуженная корутина либо
+    завершится, либо снова дойдёт до ``sleep()`` и зарегистрируется новым
+    ожидающим, может потребоваться произвольное число переключений цикла
+    событий — например, если по пути есть настоящий I/O (httpx с реальным
+    транспортом, aiosqlite) или несколько вложенных ``await``. Один
+    ``asyncio.sleep(0)`` после пробуждения даёт только один такой
+    переключение. Раньше ``run_until`` тратил ровно один "раунд" бюджета
+    ``max_rounds`` на каждый такой промежуточный тик, из-за чего число
+    раундов, нужных для завершения одного и того же теста, зависело от
+    того, сколько лишних переключений подбросит конкретная машина/версия
+    Python — на CI иногда не укладывалось в 10000. ``run_until`` теперь не
+    считает раундом ожидание "цикл ещё не догнал до следующего sleep()":
+    после каждого продвижения времени он ждёт крошечными реальными паузами
+    (см. ``_drain``), пока не появится хотя бы один новый ожидающий или
+    задача не завершится — и это не расходует ``max_rounds``. Реальные паузы,
+    а не ``asyncio.sleep(0)``: настоящая БД в тестах — aiosqlite, он работает
+    в отдельном потоке, и пустые прокруты цикла событий потоку времени не дают
+    (на CI это давало ложные «застои»). Если за несколько секунд реального
+    времени ни ожидающих не появилось, ни задача не завершилась — это
+    настоящий застой, и ``run_until`` падает с сообщением, какие задачи живы. Отдельно
+    исправлен off-by-one: раньше, если задача завершалась ровно на
+    последнем тике бюджета, цикл ``for`` заканчивался без повторной
+    проверки ``task.done()`` и падал, хотя задача уже была done —
+    теперь это перепроверяется и после цикла.
     """
 
     def __init__(self, start: int) -> None:
@@ -130,13 +160,46 @@ class FakeClock:
             if target > self.value:
                 self.value = target
             event.set()
-        await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        else:
+            # Ожидающих нет: значит корутина сейчас в настоящем I/O (aiosqlite
+            # работает в отдельном потоке). Пустой sleep(0) потоку времени не даёт,
+            # нужна крошечная реальная пауза.
+            await asyncio.sleep(_REAL_IO_STEP_SEC)
+
+    async def _drain(self, task: asyncio.Task[None], max_wait_sec: float = 5.0) -> bool:
+        """Даёт корутине догнать после пробуждения: ждёт реальным временем
+        (шагами по _REAL_IO_STEP_SEC), пока не появится новый ожидающий или задача
+        не завершится. Время FakeClock не двигает. Возвращает True, если дождались;
+        False — если за max_wait_sec реального времени ничего не произошло:
+        это настоящий застой, а не отставание планировщика или поток aiosqlite."""
+        deadline = time.monotonic() + max_wait_sec
+        while time.monotonic() < deadline:
+            if self._waiters or task.done():
+                return True
+            await asyncio.sleep(_REAL_IO_STEP_SEC)
+        return bool(self._waiters) or task.done()
 
     async def run_until(self, task: asyncio.Task[None], max_rounds: int = 10_000) -> None:
         for _ in range(max_rounds):
             if task.done():
                 return
+            if not self._waiters:
+                caught_up = await self._drain(task)
+                if task.done():
+                    return
+                if not caught_up:
+                    alive = sorted(
+                        repr(t) for t in asyncio.all_tasks() if t is not task and not t.done()
+                    )
+                    raise AssertionError(
+                        "FakeClock.run_until: нет ни ожидающих, ни завершения задачи "
+                        f"за 5 с реального ожидания; задача {task!r} "
+                        f"жива; другие живые задачи: {alive}"
+                    )
             await self._tick()
+        if task.done():
+            return
         raise AssertionError("FakeClock.run_until: задача не завершилась")
 
     async def run_until_idle(self, max_rounds: int = 10_000) -> None:
