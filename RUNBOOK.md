@@ -19,7 +19,7 @@
 В личке с ботом:
 
 - `/status` — паника, стоп, версии промпта/few-shot, модели, shadow, счётчики
-  дня (ambient/mention/llm_calls/llm_spent), pending, night queue.
+  дня (ambient/mention/llm_calls/llm_spent/reactions), pending, night queue.
 - `/why 168` — сводка причин молчания за неделю (`stage:reason count`),
   отсортировано по частоте. Главный сигнал: одна причина резко доминирует —
   повод разбираться раньше месячного цикла.
@@ -139,6 +139,7 @@ ssh owner@host "ls -lh /opt/trolobot/backups"
 | Отвечает слишком часто | `/set behaviour.ambient_probability 0.05` (или ниже) |
 | Неудачная правка промпта | `/rollback <версия>` — номер смотреть в `/prompt` |
 | Кто-то попросил не трогать его | Он сам `/mute` в чате, без реплая (мьютит себя). Замьютить другого может только владелец, реплаем на его сообщение |
+| Реакции-эмодзи раздражают или их слишком много | `/set behaviour.reactions.enabled false` — выключает совсем; `/set behaviour.reactions.probability 0.05` — просто реже. `/why` покажет `react:error`, если реакции в чате запрещены администратором группы (Telegram → настройки чата → разрешить реакции) — это не баг бота, чинится в настройках чата, не в `/set` |
 
 ---
 

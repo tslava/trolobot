@@ -90,6 +90,7 @@ def _deps(
     bot_user_id: int = 999,
     bot_username: str = BOT_USERNAME,
     rng: random.Random | None = None,
+    bot: object | None = None,
 ) -> Deps:
     reserved = {cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers}
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, bot_username)
@@ -111,6 +112,7 @@ def _deps(
         config_store=config_store,
         prompt_store=prompt_store,
         bot_username=bot_username,
+        bot=bot,  # type: ignore[arg-type]
     )
 
 
@@ -656,3 +658,111 @@ async def test_invisible_name_falls_back_to_username(
     await handler(_message(from_user=user, text="привет всем", date=DAY))
     rows = await db.recent_messages(OWN_CHAT_ID, 1)
     assert rows[0].display_name == "ghost"  # цифры санитизация вырезает, как у имён
+
+
+# --- Реакции на срез гейта по кубику (reactions.py) ---
+
+
+class _FakeReactionBot:
+    """Подделка ReactionBotLike: только пишет вызовы set_message_reaction."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int, object]] = []
+
+    async def set_message_reaction(
+        self, chat_id: int, message_id: int, reaction: object = None
+    ) -> bool:
+        self.calls.append((chat_id, message_id, reaction))
+        return True
+
+
+def _config_dice_drop(*, reaction_probability: float) -> Config:
+    """Живой разговор идёт (ambient дошёл бы до кубика), но ambient_probability=0.0
+    гарантирует детерминированный DROP gate:dice независимо от rng-сида."""
+    cfg = Config()
+    behaviour = cfg.behaviour.model_copy(
+        update={
+            "ambient_probability": 0.0,
+            "reactions": cfg.behaviour.reactions.model_copy(
+                update={"probability": reaction_probability, "cooldown_min": 0, "daily_cap": 100}
+            ),
+        }
+    )
+    return cfg.model_copy(update={"behaviour": behaviour})
+
+
+async def _send_live_talk(handler: object, *, message_id_start: int = 300) -> None:
+    """Три сообщения от двух разных людей за live_talk.window_min — гейт дойдёт до
+    шага 11 (кубик) на последнем сообщении (см. test_gate_ambient_pass_on_live_talk)."""
+    users = [
+        _user(user_id=5, first_name="Дима"),
+        _user(user_id=6, first_name="Оля"),
+        _user(user_id=5, first_name="Дима"),
+    ]
+    texts = ["привет всем", "как настроение", "погода класс"]
+    for i, (user, text) in enumerate(zip(users, texts, strict=True)):
+        message = _message(
+            message_id=message_id_start + i,
+            from_user=user,
+            text=text,
+            date=DAY + timedelta(seconds=i * 10),
+        )
+        await handler(message)  # type: ignore[operator]
+
+
+async def test_gate_dice_drop_with_probability_one_reacts(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_dice_drop(reaction_probability=1.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    bot = _FakeReactionBot()
+    deps = _deps(db, cfg, settings=settings, bot=bot)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await _send_live_talk(handler)
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("gate:dice") == 1
+    assert len(bot.calls) == 1
+    _, _, reaction = bot.calls[0]
+    assert reaction[0].emoji in cfg.behaviour.reactions.emoji  # type: ignore[index]
+    assert dict(await db.filter_log_summary(0)).get("react:sent") == 1
+
+
+async def test_gate_dice_drop_with_probability_zero_does_not_react(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_dice_drop(reaction_probability=0.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    bot = _FakeReactionBot()
+    deps = _deps(db, cfg, settings=settings, bot=bot)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await _send_live_talk(handler)
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("gate:dice") == 1
+    assert bot.calls == []
+
+
+async def test_gate_not_live_drop_does_not_react(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DROP по детерминированной причине (gate:not_live, не gate:dice/gate:ambient_cooldown)
+    никогда не ставит реакцию, даже при probability=1.0."""
+    cfg = _config_dice_drop(reaction_probability=1.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    bot = _FakeReactionBot()
+    deps = _deps(db, cfg, settings=settings, bot=bot)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="какая погода вечером",
+        date=DAY,
+    )
+    await handler(message)
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("gate:not_live") == 1
+    assert bot.calls == []

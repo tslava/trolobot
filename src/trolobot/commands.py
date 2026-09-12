@@ -347,6 +347,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     mention = int(await deps.db.get_state(day_key("mention_count", now, tz)) or "0")
     llm_calls = int(await deps.db.get_state(day_key("llm_calls", now, tz)) or "0")
     llm_spent = float(await deps.db.get_state(day_key("llm_spent_usd", now, tz)) or "0")
+    reactions = int(await deps.db.get_state(day_key("reaction_count", now, tz)) or "0")
 
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
@@ -360,7 +361,8 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"Модели: main={cfg.llm.main_model or '-'}, judge={cfg.llm.judge_model or '-'}",
         f"Shadow: {'да' if cfg.filters.shadow else 'нет'}",
         f"Сегодня: ambient={ambient}, mention={mention}, "
-        f"llm_calls={llm_calls}, llm_spent=${llm_spent:.2f}",
+        f"llm_calls={llm_calls}, llm_spent=${llm_spent:.2f}, "
+        f"reactions={reactions}/{cfg.behaviour.reactions.daily_cap}",
         f"Pending: {pending}",
         f"Night queue: {night_queue}",
     ]

@@ -624,6 +624,77 @@ def validate_fact(raw: str) -> str | None      # только кириллица
 # tests/test_injections.py — строка про отзыв Google с командой: снять skip, проверить через validate_fact.
 ```
 
+## Интерфейсы: реакции
+
+Решение владельца поверх гейта — реакция-эмодзи вместо полного молчания на
+недетерминированный DROP (`gate:dice`/`gate:ambient_cooldown`). Живёт снаружи
+гейта: `gate.py` не меняется, `bot.py` зовёт `reactions.py` уже после того, как
+`should_consider` вернул `Verdict.DROP`.
+
+```python
+# config_models.py — BehaviourConfig.reactions: ReactionsConfig
+class ReactionsConfig(BaseModel):
+    enabled: bool = True
+    probability: float = Field(default=0.2, ge=0.0, le=1.0)
+    cooldown_min: int = Field(default=60, ge=0, le=1440)
+    daily_cap: int = Field(default=8, ge=0, le=100)
+    emoji: list[str] = Field(default_factory=lambda: ["👍", "💩"])
+# Валидация: emoji непустой (field_validator на ReactionsConfig) и каждый элемент
+# ∈ filters.allowed_emoji (model_validator на Config — только он видит оба поля
+# сразу). /set behaviour.reactions.<ключ> работает как любой другой вложенный
+# ключ (behaviour.live_talk.min_messages) — включая emoji списком, тем же
+# механизмом, что filters.topic_stop (yaml.safe_load строки-значения).
+
+# reactions.py
+REACT_REASONS: frozenset[str] = frozenset({"gate:dice", "gate:ambient_cooldown"})
+
+@dataclass(frozen=True, slots=True)
+class ReactionState:
+    last_reaction_at: int | None
+    last_reaction_user_id: int | None
+    count_today: int
+
+def pick_reaction(*, drop_reason: str, user_id: int, state: ReactionState,
+                  cfg: ReactionsConfig, rng: random.Random, now: int) -> str | None
+# Чистая функция, как should_consider. Порядок: enabled → drop_reason ∈ REACT_REASONS →
+# daily_cap → cooldown_min (last_reaction_at) → тот же user_id (last_reaction_user_id) →
+# кубик (rng.random() < probability) → rng.choice(emoji). Кубик последним — rng тратится,
+# только когда реакция вообще возможна (тесты с seed стабильнее).
+
+async def load_reaction_state(db: Database, tz: str, now: int) -> ReactionState
+# state-ключи: last_reaction_at, last_reaction_user_id, day_key("reaction_count", now, tz)
+# (сутки по persona.timezone, как mention_count/ambient_count).
+
+class ReactionBotLike(Protocol):
+    async def set_message_reaction(
+        self, chat_id: int, message_id: int, reaction: list[ReactionTypeUnion] | None = None
+    ) -> bool: ...
+# Узкий протокол вместо aiogram.Bot (по образцу responder._BotLike) — тесты подделывают
+# без aiogram. reaction типизирован ReactionTypeUnion (не только ReactionTypeEmoji):
+# list инвариантен по параметру, узкий тип не прошёл бы mypy при передаче настоящего Bot.
+
+async def react(bot: ReactionBotLike, db: Database, *, chat_id: int, tg_message_id: int,
+                user_id: int, emoji: str, tz: str, now: int) -> bool
+# bot.set_message_reaction(reaction=[ReactionTypeEmoji(emoji=emoji)]); успех → set_state
+# last_reaction_at/last_reaction_user_id, increment_state(day_key("reaction_count")),
+# insert_filter_log(verdict="pass", stage="react", reason="react:sent", shadow=False,
+# candidate_text=emoji), лог INFO. TelegramBadRequest/TelegramForbiddenError (реакции
+# запрещены в чате, сообщение удалено) → logger.warning, insert_filter_log(verdict="cut",
+# stage="react", reason="react:error"), state НЕ трогать, return False. Другие исключения
+# не ловятся — их ловит общий except хендлера в bot.py.
+
+# bot.py: в ветке Verdict.DROP, после insert_filter_log(stage="gate") — если
+# decision.reason in REACT_REASONS и deps.bot is not None: load_reaction_state →
+# pick_reaction(rng=deps.rng) → не None → react(deps.bot, ...). Deps получает bot:
+# ReactionBotLike | None = None (не aiogram.Bot напрямую — иначе Deps.bot=None в
+# существующих тестах хендлера не типизировался бы). app.py: Deps(bot=bot, ...) —
+# тот же объект Bot, что и для polling/Responder.
+
+# commands.py /status: строка счётчиков дня дополнена reactions=<count_today>/<daily_cap>.
+# /why показывает react:sent/react:error автоматически через filter_log_summary — стадия
+# и причина уже в reason ("react:sent"/"react:error"), отдельного кода в commands.py не нужно.
+```
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»
