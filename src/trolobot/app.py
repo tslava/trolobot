@@ -82,6 +82,7 @@ async def main() -> None:
             config_store=config_store,
             prompt_store=prompt_store,
             bot_username=me.username or "",
+            bot=bot,
         )
 
         dispatcher = Dispatcher()

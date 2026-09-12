@@ -22,6 +22,13 @@ from trolobot.gate import should_consider
 from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Verdict
 from trolobot.patterns import Patterns
+from trolobot.reactions import (
+    REACT_REASONS,
+    ReactionBotLike,
+    load_reaction_state,
+    pick_reaction,
+    react,
+)
 from trolobot.responder import Responder
 from trolobot.sanitize import media_placeholder, normalize_text, sanitize_display_name, stable_n
 from trolobot.settings import Settings
@@ -58,6 +65,10 @@ class Deps:
     prompt_store: PromptStore
     bot_username: str = ""
     responder: Responder | None = None
+    # Узкий протокол (set_message_reaction) вместо aiogram.Bot — только для реакций
+    # (reactions.py). None в discovery/тестах без реального бота — тогда реакция
+    # просто не ставится, сообщение всё равно пишется и гейтится как обычно.
+    bot: ReactionBotLike | None = None
     # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
     # не спамить лог на каждое следующее сообщение того же участника.
     warned_user_ids: set[int] = field(default_factory=set)
@@ -202,6 +213,32 @@ def build_router(deps: Deps) -> Router:
                     created_at=now,
                 )
                 logger.debug("gate drop: %s (%s)", decision.reason, gate_message.tg_message_id)
+                if decision.reason in REACT_REASONS and deps.bot is not None:
+                    # Реакция вместо полного молчания — только на недетерминированные
+                    # причины (gate:dice/gate:ambient_cooldown), только в разрешённом
+                    # чате (эта ветка недостижима в discovery mode и для чужого чата —
+                    # см. проверки выше). Решение живёт снаружи гейта, gate.py не меняется.
+                    tz = cfg.persona.timezone
+                    rstate = await load_reaction_state(deps.db, tz, now)
+                    emoji = pick_reaction(
+                        drop_reason=decision.reason,
+                        user_id=user_id,
+                        state=rstate,
+                        cfg=cfg.behaviour.reactions,
+                        rng=deps.rng,
+                        now=now,
+                    )
+                    if emoji is not None:
+                        await react(
+                            deps.bot,
+                            deps.db,
+                            chat_id=gate_message.chat_id,
+                            tg_message_id=gate_message.tg_message_id,
+                            user_id=user_id,
+                            emoji=emoji,
+                            tz=tz,
+                            now=now,
+                        )
             elif decision.verdict is Verdict.QUEUE_NIGHT:
                 await deps.db.enqueue_night(
                     tg_message_id=gate_message.tg_message_id,
