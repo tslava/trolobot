@@ -84,6 +84,30 @@ class ReplyDelayBucket(BaseModel):
         return value
 
 
+class ReactionsConfig(BaseModel):
+    """Реакции-эмодзи на чужие сообщения, срезанные гейтом по gate:dice/gate:ambient_cooldown.
+
+    Дёшево: не вызывает модель, не создаёт сообщение, только setMessageReaction —
+    эффект присутствия без текстового ответа (CLAUDE.md, "Интерфейсы: реакции").
+    ``emoji`` валидируется на уровне ``Config`` (см. ``Config._check_reactions_emoji_allowed``):
+    каждый элемент обязан входить в ``filters.allowed_emoji``, иначе ``/set
+    behaviour.reactions.emoji`` падает с понятной ошибкой.
+    """
+
+    enabled: bool = True
+    probability: float = Field(default=0.2, ge=0.0, le=1.0)
+    cooldown_min: int = Field(default=60, ge=0, le=1440)
+    daily_cap: int = Field(default=8, ge=0, le=100)
+    emoji: list[str] = Field(default_factory=lambda: ["👍", "💩"])
+
+    @field_validator("emoji")
+    @classmethod
+    def _validate_non_empty(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("reactions.emoji must not be empty")
+        return value
+
+
 class BehaviourConfig(BaseModel):
     quiet_window: tuple[str, str] = ("02:00", "07:00")
     morning_reply_window: tuple[str, str] = ("07:00", "08:00")
@@ -94,6 +118,7 @@ class BehaviourConfig(BaseModel):
     daily_cap: int = Field(default=3, ge=0, le=50)
 
     spontaneous: SpontaneousConfig = Field(default_factory=SpontaneousConfig)
+    reactions: ReactionsConfig = Field(default_factory=ReactionsConfig)
 
     # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает
     # ответ, кулдаун только сдвигает due_at на этапе responder (earliest).
@@ -432,3 +457,21 @@ class Config(BaseModel):
     llm: LlmConfig = Field(default_factory=LlmConfig)
     places: PlacesConfig = Field(default_factory=PlacesConfig)
     filters: FiltersConfig = Field(default_factory=FiltersConfig)
+
+    @model_validator(mode="after")
+    def _check_reactions_emoji_allowed(self) -> "Config":
+        """behaviour.reactions.emoji — подмножество filters.allowed_emoji.
+
+        Проверка живёт здесь, а не на ReactionsConfig: только Config видит оба
+        поля одновременно. /set behaviour.reactions.emoji с мусором (не входящим
+        в allowed_emoji) должен падать с понятной ошибкой, а не тихо позволять
+        боту реагировать эмодзи, которого нет в голосе персонажа.
+        """
+        allowed = set(self.filters.allowed_emoji)
+        bad = [e for e in self.behaviour.reactions.emoji if e not in allowed]
+        if bad:
+            raise ValueError(
+                f"behaviour.reactions.emoji: {bad!r} not in "
+                f"filters.allowed_emoji {sorted(allowed)!r}"
+            )
+        return self
