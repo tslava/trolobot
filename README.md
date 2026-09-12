@@ -110,7 +110,7 @@ docker compose up -d --build
 3. Ключ OpenRouter с выставленным `credit limit` в кабинете (`OPENROUTER_API_KEY`)
    — без лимита не выкатывать.
 4. Модели в `config.yaml`: `llm.main_model` и `llm.judge_model` — по умолчанию
-   уже заданы (`anthropic/claude-sonnet-5` и `openai/gpt-5.4-nano`), но если
+   уже заданы (`anthropic/claude-opus-5` и `openai/gpt-5.4-nano`), но если
    один из них очистить через `/set`/`/unset`, бот молчит (`llm:no_model`
    в `/why`), пока модель не задана снова.
 5. Заведения: либо ключ Google Places (`GOOGLE_PLACES_KEY`) и настоящий прогон
