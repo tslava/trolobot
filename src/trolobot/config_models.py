@@ -108,6 +108,35 @@ class ReactionsConfig(BaseModel):
         return value
 
 
+class StickersConfig(BaseModel):
+    """Стикеры вместо текста — второй вызов дешёвой моделью (CLAUDE.md, "Интерфейсы:
+    стикеры"). Основная модель ничего не знает о каталоге; уже прошедший выходной
+    фильтр текст вместе с триггером и каталогом уходит второй, дешёвой модели
+    (``model`` или, если пусто, ``llm.judge_model``), которая либо называет номер
+    стикера, либо ``null`` — и тогда уходит текст как раньше.
+    """
+
+    enabled: bool = True
+    # Сколько текстовых реплик должно пройти после стикера, прежде чем следующий разрешён.
+    min_replies_between: int = Field(default=4, ge=0, le=50)
+    daily_cap: int = Field(default=1, ge=0, le=50)
+    # Столько последних использованных стикеров (по id) не повторять.
+    recent_window: int = Field(default=10, ge=0, le=50)
+    model: str = ""
+    max_tokens: int = Field(default=60, ge=10, le=300)
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
+
+
 class BehaviourConfig(BaseModel):
     quiet_window: tuple[str, str] = ("02:00", "07:00")
     morning_reply_window: tuple[str, str] = ("07:00", "08:00")
@@ -119,6 +148,7 @@ class BehaviourConfig(BaseModel):
 
     spontaneous: SpontaneousConfig = Field(default_factory=SpontaneousConfig)
     reactions: ReactionsConfig = Field(default_factory=ReactionsConfig)
+    stickers: StickersConfig = Field(default_factory=StickersConfig)
 
     # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает
     # ответ, кулдаун только сдвигает due_at на этапе responder (earliest).

@@ -22,6 +22,7 @@ from trolobot.llm import LLMClient
 from trolobot.responder import Responder
 from trolobot.retention import retention_loop
 from trolobot.settings import Settings
+from trolobot.stickers import StickerChooser, load_catalog
 from trolobot.stores import ConfigStore, PromptStore
 
 logger = logging.getLogger(__name__)
@@ -113,12 +114,24 @@ async def main() -> None:
             judge_prompt = settings.judge_prompt_path.read_text(encoding="utf-8")
             judge: Judge | None = Judge(llm, config_store.get, judge_prompt)
 
+            # Каталог стикеров — офлайн-файл (CLAUDE.md, "Интерфейсы: стикеры"),
+            # правится stickers_fill.py и владельцем руками. Пустой/отсутствующий
+            # файл -> пустой каталог, чузер не создаётся, всё остальное работает
+            # как раньше (Responder.sticker_chooser=None).
+            catalog = load_catalog(settings.stickers_path)
+            deps.sticker_catalog_enabled = sum(1 for sticker in catalog.stickers if sticker.enabled)
+            sticker_chooser: StickerChooser | None = None
+            if deps.sticker_catalog_enabled:
+                sticker_prompt = settings.sticker_prompt_path.read_text(encoding="utf-8")
+                sticker_chooser = StickerChooser(llm, config_store.get, catalog, sticker_prompt)
+
             responder = Responder(
                 bot=bot,
                 db=db,
                 cfg_getter=config_store.get,
                 llm=llm,
                 judge=judge,
+                sticker_chooser=sticker_chooser,
                 patterns_getter=config_store.patterns,
                 prompt_store=prompt_store,
                 rng=rng,

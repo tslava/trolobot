@@ -1,0 +1,338 @@
+set_name: OxyOxy
+stickers:
+- id: 1
+  file_id: CAACAgIAAxUAAWqnuUIEDqmT85edzVbnuR1_DRmLAALynAACv1xZSx9oUeKJ5eP3PQQ
+  emoji: 👏
+  text: СПАСИ БОЧКИ
+  when: шутливый призыв помочь в игре
+  enabled: true
+- id: 2
+  file_id: CAACAgIAAxUAAWqnuULenuWuZ145zdhEJmoZkJuLAALpoAACKEJYSzJfjUKbwTVvPQQ
+  emoji: ⚙️
+  text: МИНА ЛЕЖАЛА ДАВНО
+  when: когда всплыл старый косяк или давняя проблема
+  enabled: true
+- id: 3
+  file_id: CAACAgIAAxUAAWqnuUI4hKZxjUuRodi72SDu6QbHAALNkwAC4o_oSIa4nNLLB-LTPQQ
+  emoji: 🧐
+  text: КОНЧИЛ ОБОТРИ СТАНОК
+  when: когда друг закончил работу и намусорил
+  enabled: true
+- id: 4
+  file_id: CAACAgIAAxUAAWqnuUIpK01LbmOSJEKdXEIE53tEAAL3mgACNAAB6Ej1ln9Byhbv_T0E
+  emoji: 💼
+  text: ТЕРМИНОЛОГИЮ МЫ НЕ БУДЕМ ОСПАРИВАТЬ
+  when: когда спор скатился в придирки к словам
+  enabled: true
+- id: 5
+  file_id: CAACAgIAAxUAAWqnuUKfH9JKn6ezOWEUArhkrU5yAAKDmQACBXqBSLhN2Sx-RUj1PQQ
+  emoji: 🎢
+  text: ЗАЙМЁМСЯ КАРУСЕЛЯМИ
+  when: Приглашение начать веселье или движуху
+  enabled: true
+- id: 6
+  file_id: CAACAgIAAxUAAWqnuUI60sp16QcJpWqmvIQHM7lJAAKrlgAChxWASIvt_eEv8ayyPQQ
+  emoji: 🐳
+  text: ЭТЬ ЭТЬ ТЮ ТЮ ТЮ
+  when: когда дурачишься и поддерживаешь весёлый бессмысленный флуд
+  enabled: true
+- id: 7
+  file_id: CAACAgIAAxUAAWqnuUI2CwSk4TupiwUR5oKBrdA1AAIlogACyBOASPdv1cmJHI0tPQQ
+  emoji: 🦄
+  text: ПОЛУЧИ ЛОСЯ
+  when: в шутку грозишь другу за подколку
+  enabled: true
+- id: 8
+  file_id: CAACAgIAAxUAAWqnuULsgiDRCnXiwTQlTKnFY4JiAAIDAAN4gTYNMJ2RVVoAAZnGPQQ
+  emoji: 😡
+  text: ТАК НЕ МОЖНО
+  when: когда друг сказал или сделал что-то недопустимое
+  enabled: true
+- id: 9
+  file_id: CAACAgIAAxUAAWqnuUKWqgLm51bK9KxEBdhUYsbPAAIEAAN4gTYNBhMB5D51RCE9BA
+  emoji: 🤔
+  text: ЧТО ПРОИСХОДИТ?
+  when: когда в чате начался непонятный хаос
+  enabled: true
+- id: 10
+  file_id: CAACAgIAAxUAAWqnuULr9W1JU7fLpxrlb5Vgbb92AAIFAAN4gTYNKbU-Tqjugrg9BA
+  emoji: 😐
+  text: ПРИКАЗ НЕ ПОСТУПАЛ
+  when: когда отказываешься что-то делать без указаний
+  enabled: true
+- id: 11
+  file_id: CAACAgIAAxUAAWqnuUJE7zfgL4S2iCClVYs7yXpOAAIGAAN4gTYNzwthgaQRqog9BA
+  emoji: 😱
+  text: Я ПОРАЖЁН
+  when: в ответ на шокирующую или удивительную новость
+  enabled: true
+- id: 12
+  file_id: CAACAgIAAxUAAWqnuUI8N0JJaatYYUt_iLwVfPhAAAIHAAN4gTYNC6KTk2t-syQ9BA
+  emoji: 😎
+  text: НУЖНО ПРИНЯТЬ УПРАВЛЕНЧЕСКОЕ РЕШЕНИЕ
+  when: когда в чате долго спорят без итога
+  enabled: true
+- id: 13
+  file_id: CAACAgIAAxUAAWqnuUJaj5QCbNtarrqM_q6c_vNBAAIIAAN4gTYN-j2K8S0amY09BA
+  emoji: 🕺
+  text: КАК ИНДУСЫ СРУЩИЕ В ТАНЦЕ
+  when: реакция на нелепые танцы или абсурдное видео
+  enabled: true
+- id: 14
+  file_id: CAACAgIAAxUAAWqnuUJY0iWgDzUi2H0z6mNES_yAAAIJAAN4gTYNi0sEF1sgjAQ9BA
+  emoji: 💩
+  text: ВСЁ ГОВНО КРОМЕ МОЧИ
+  when: когда всё бесит и хочется абсурдно поныть
+  enabled: true
+- id: 15
+  file_id: CAACAgIAAxUAAWqnuULldQgMf781GRnBPIIcJw3yAAIKAAN4gTYNibSQfijKS0Y9BA
+  emoji: 😳
+  text: ТРЕБУЕТСЯ ПОЯСНИТЕЛЬНАЯ БРИГАДА
+  when: когда чьё-то сообщение совершенно непонятно
+  enabled: true
+- id: 16
+  file_id: CAACAgIAAxUAAWqnuULTkOqXcp8QJCPufvhI6D-EAAILAAN4gTYNbLUE7YWA4kM9BA
+  emoji: 🤚
+  text: ТАК, ПОГОДИ
+  when: когда нужно остановить разговор и разобраться
+  enabled: true
+- id: 17
+  file_id: CAACAgIAAxUAAWqnuUJz2EqwVWBa1IqqOaruoWiyAAIMAAN4gTYN3bpNAAGICeJ0PQQ
+  emoji: 😠
+  text: НЕ УБЕДИТЕЛЬНО
+  when: когда друг привёл слабый аргумент или оправдание
+  enabled: true
+- id: 18
+  file_id: CAACAgIAAxUAAWqnuUIpnrBZAAF4G4J7pGqO5_UkQgACDQADeIE2DcR3xb3AqTLIPQQ
+  emoji: 😧
+  text: ОПАСНОСТЬ У ВОРОТ "ДИНАМО"
+  when: когда обсуждают футбол и нарастающую угрозу
+  enabled: true
+- id: 19
+  file_id: CAACAgIAAxUAAWqnuUKmtYq3GOvzY3qTMSyfvBv1AAIOAAN4gTYNZlvhzUi3DJU9BA
+  emoji: 😮
+  text: ЧУДЕСА НА ВИРАЖАХ
+  when: когда события приняли неожиданный поворот
+  enabled: true
+- id: 20
+  file_id: CAACAgIAAxUAAWqnuUKD8tPc3r6yAnb6VCdS95HrAAIPAAN4gTYN3Mkt3bRzFak9BA
+  emoji: 🤬
+  text: ПИСЬКИ
+  when: когда разговор скатился в детский сад
+  enabled: true
+- id: 21
+  file_id: CAACAgIAAxUAAWqnuUKTUVYBuGupRwcT8ZgpW8p2AAIQAAN4gTYNFQ7mKD7sQNQ9BA
+  emoji: 😎
+  text: Я СДЕЛАЛ СРЕЗЫ
+  when: когда похвастался выполненной работой или задачей
+  enabled: true
+- id: 22
+  file_id: CAACAgIAAxUAAWqnuUJ2eEpVinns6i54T6-wi99qAAISAAN4gTYNl2kh5ATER6g9BA
+  emoji: 😤
+  text: ПОЧЕМУ ВСЁ ТАК МЕДЛЕННО
+  when: когда все тормозят и долго ждёшь ответа
+  enabled: true
+- id: 23
+  file_id: CAACAgIAAxUAAWqnuUI8KNdSXLW47LYIELgXse98AAITAAN4gTYNDB5Pn24sl4M9BA
+  emoji: 🥰
+  text: ПРОСТИМУЛИРУЮ ТВОЮ ПРОДАЖУ
+  when: в шутку о рабочих сделках и бизнесе
+  enabled: true
+- id: 24
+  file_id: CAACAgIAAxUAAWqnuUIE1LbjhQfQymEJOoyECIgpAAIUAAN4gTYNJGCxrPCgGto9BA
+  emoji: 😓
+  text: СОВЕСТИ У ВАС НЕТ
+  when: в шутку упрекая друзей за наглость
+  enabled: true
+- id: 25
+  file_id: CAACAgIAAxUAAWqnuUKP9n8e4b2mbqlPqIUEPeqtAAIVAAN4gTYNDbPhArN4-Hc9BA
+  emoji: 🕥
+  text: '9:45'
+  when: когда напоминаешь о времени или опоздании
+  enabled: true
+- id: 26
+  file_id: CAACAgIAAxUAAWqnuUKtDNi5v3pA47lp4yIBdT5GAAIWAAN4gTYNAAF924B3pszyPQQ
+  emoji: ✋
+  text: ЭТО МЫ ПОКА ПАРКУЕМ
+  when: когда друзья ждут, а вы ищете парковку
+  enabled: true
+- id: 27
+  file_id: CAACAgIAAxUAAWqnuUJ3zUbDcMhq5np3-_V8I0kVAAIXAAN4gTYNsiao7-F_HXY9BA
+  emoji: 🤪
+  text: ЫЫЫ
+  when: когда смешно до неприличия, ржач без слов
+  enabled: true
+- id: 28
+  file_id: CAACAgIAAxUAAWqnuULsJalRkoDIrwdyUgjQomYAAxgAA3iBNg3uktgU8sYevj0E
+  emoji: ☝️
+  text: ДЕЛАЕМ ТО ЧТО НУЖНО НЕ ДЕЛАЕМ ТО ЧТО НЕ НУЖНО
+  when: когда объясняешь простой план действий друзьям
+  enabled: true
+- id: 29
+  file_id: CAACAgIAAxUAAWqnuULYulBryeuZK2xTE5ACA0unAAIZAAN4gTYNuMjaYqXIciA9BA
+  emoji: 🤙
+  text: У ТЕБЯ ЕСТЬ БИЗНЕС ЗАДАЧА
+  when: когда друг просит сделать что-то срочно
+  enabled: true
+- id: 30
+  file_id: CAACAgIAAxUAAWqnuUIXJOC3E_k6an6B7lLg7qp8AAIaAAN4gTYNDKvXLoPK2ZE9BA
+  emoji: 🧠
+  text: НАДО ПОБАЗАРИТЬ
+  when: когда зовёшь друга обсудить важное дело
+  enabled: true
+- id: 31
+  file_id: CAACAgIAAxUAAWqnuUKONqr01A9KMM47h2nVDxNXAAIbAAN4gTYNTsXxbyN8_3c9BA
+  emoji: 👍
+  text: ВЕРИ ГУД КОМРАД
+  when: когда друг сделал что-то отлично
+  enabled: true
+- id: 32
+  file_id: CAACAgIAAxUAAWqnuULEERRC6wNTRfgoB6Hdj5AfAAKECwACrrTxSYYlGiu1GQuOPQQ
+  emoji: 😏
+  text: ДЕЛО ЗА МАЛЫМ
+  when: когда остался последний простой шаг
+  enabled: true
+- id: 33
+  file_id: CAACAgIAAxUAAWqnuUISw-kaT3-kgcK_Gtv5dDt5AAIJDQACzNvxSSPq26PIQGycPQQ
+  emoji: 👪
+  text: ПОСОВЕТОВАЛИ СТАРЫЕ ДРУЗЬЯ
+  when: когда сомнительное решение оправдывают советом друзей
+  enabled: true
+- id: 34
+  file_id: CAACAgIAAxUAAWqnuUIguHI3efAZHqvo0cWkMBUXAAKECwACmjnxSamD4syn5D4QPQQ
+  emoji: 👌
+  text: ЙES OFF HORSE
+  when: ироничное «да, конечно»
+  enabled: true
+- id: 35
+  file_id: CAACAgIAAxUAAWqnuULFPcb6OZhjw4HKf3u3gKWMAAIjDAACRTlgSyhPOQt5XgmtPQQ
+  emoji: 🧳
+  text: ПО СТАРИННОЙ ИРАКСКОЙ ТРАДИЦИИ
+  when: Шутливое оправдание странного обычая или действия
+  enabled: true
+- id: 36
+  file_id: CAACAgIAAxUAAWqnuUJJYXi5pd7P51iYlhPUpLhFAAIXDAAC4vloS1S9HJXg_Z8wPQQ
+  emoji: 🍽
+  text: ЧТО НА ВХОДЕ ТО И НА ВЫХОДЕ
+  when: когда результат оказался предсказуемо плохим
+  enabled: true
+- id: 37
+  file_id: CAACAgIAAxUAAWqnuUIIulFV6fvFW_YWCrYEecZbAALjCwACxLxpS_wsroYOyTlxPQQ
+  emoji: 🤙
+  text: НО ЭТО И ХОРОШО
+  when: когда в неудаче находишь плюс
+  enabled: true
+- id: 38
+  file_id: CAACAgIAAxUAAWqnuULRxfkgj7DpDZQCUPEZsq4nAAIrCwACmzdhS6p6ZlzODyjHPQQ
+  emoji: 🐄
+  text: ТЫ ТОЛЬКО ОБЕЩАЕШЬ
+  when: когда друг снова не сдержал обещание
+  enabled: true
+- id: 39
+  file_id: CAACAgIAAxUAAWqnuUKUIpLnaEbQw8trsPXLpeSdAAKTDAAC_jVASJTXzOCewga5PQQ
+  emoji: 🥵
+  text: Я УТОМИЛСЯ СЕГОДНЯ
+  when: после тяжёлого дня, когда нет сил
+  enabled: true
+- id: 40
+  file_id: CAACAgIAAxUAAWqnuUKL6fRiD6DYeP_xFFsEHP1nAAI8DQACXIZBSA1YxgfKQC-qPQQ
+  emoji: 🤭
+  text: ДА МНЕ НЕ ВАЖНО!
+  when: Когда безразличен выбор или спор друзей
+  enabled: true
+- id: 41
+  file_id: CAACAgIAAxUAAWqnuUJZ3QwlP9UL41nRwslOVNt8AAKUDwAC9jbZSUC8HjMHAoahPQQ
+  emoji: 👮‍♀️
+  text: ТЫ ЗА ЭТО ЗАПЛАТИШЬ
+  when: шутливая угроза после чужой подколки
+  enabled: true
+- id: 42
+  file_id: CAACAgIAAxUAAWqnuUKXIbVMbkBNMy-NxFIR8y-PAALZDAACxDrYSVurqO02qvFvPQQ
+  emoji: 🙅‍♂️
+  text: ТЫ НЕ СДЕЛАЕШЬ ЭТО
+  when: когда подначиваешь друга на слабо
+  enabled: true
+- id: 43
+  file_id: CAACAgIAAxUAAWqnuUILP-IzqoA9-gnucL2jU-ylAAKMDQACvqTZSRMv3rXkz0dkPQQ
+  emoji: 🤺
+  text: ВОТ ЭТО ПОВОРОТ
+  when: когда новость неожиданно всё перевернула
+  enabled: true
+- id: 44
+  file_id: CAACAgIAAxUAAWqnuUJLgVvgZd8SU9iYHGOlAuPOAAIRDgACRLQpSoyWO_Et7CXlPQQ
+  emoji: 👹
+  text: БЕС ОЧКА
+  when: когда кто-то струсил или слабо отреагировал
+  enabled: true
+- id: 45
+  file_id: CAACAgIAAxUAAWqnuUJTBp08WOMblzlSFkxR5hGZAAJ0EAACj0YgSsDK7EnAc35fPQQ
+  emoji: 💋
+  text: А ТЫ ТАК НЕ МОЖЕШЬ
+  when: когда хвастаешься достижением и дразнишь друзей
+  enabled: true
+- id: 46
+  file_id: CAACAgIAAxUAAWqnuUK5G0JH_shD9VEMrpW_WE5DAAJoEAAC0AUgSkOLPXbpgI5UPQQ
+  emoji: 💍
+  text: ОТКУДА В ЖОПЕ АЛМАЗЫ?
+  when: когда друг рассказывает подозрительно невероятную историю
+  enabled: true
+- id: 47
+  file_id: CAACAgIAAxUAAWqnuUJPaOX5CVSZuuNtLjRfE32hAALYFQACLQeoSiQj9PYff_20PQQ
+  emoji: 👾
+  text: ''
+  when: картина без надписи
+  enabled: false
+- id: 48
+  file_id: CAACAgIAAyEFAATf03cuAAIkkWqnAaMd35E9pDx8MHt0MpUjxymgAAIJEgACEBLpSrqrY9BSFMAaPQQ
+  emoji: 🧜
+  text: ЗА ЧТО БОРОЛИСЬ НА ТО И НАПОРОЛИСЬ
+  when: когда чьи-то старания вышли боком
+  enabled: true
+- id: 49
+  file_id: CAACAgIAAxUAAWqnuUJzspLMCGEJu9Ye_UYU88IwAALaDQACvxY4S_RAfnhQY71iPQQ
+  emoji: 🦄
+  text: НЕ ПОЛУЧИ ЛОСЯ
+  when: шутливая угроза другу за дерзость
+  enabled: true
+- id: 50
+  file_id: CAACAgIAAxUAAWqnuUJ8oHdPXQyE6mVRGlKupanLAAJaDgACkis5S0IQkQlGDushPQQ
+  emoji: 💥
+  text: СЦЕПОЧКА
+  when: когда друзья находят забавную связь событий
+  enabled: true
+- id: 51
+  file_id: CAACAgIAAxUAAWqnuUIUJNcxZx9byRQtSUNOZ9gEAAI6EgACQ1UwS02wK6AO7MHePQQ
+  emoji: 👔
+  text: ХАМИТЕ ЭРНЕСТУЛЯ
+  when: когда друг шутливо грубит или дерзит
+  enabled: true
+- id: 52
+  file_id: CAACAgIAAxUAAWqnuUL9JdDSIts5OP9A4CEFg3f0AAL3EgACcrgxS_Pyk2uoMY5CPQQ
+  emoji: 🥂
+  text: ХОРОШИХ ВЫХОДНЫХ
+  when: в пятницу вечером, прощаясь с друзьями
+  enabled: true
+- id: 53
+  file_id: CAACAgIAAxUAAWqnuUIk8BcGDfh9fUpJ79I5MmCQAAJ6EgACJQEIS1fKpey-D3JyPQQ
+  emoji: 💰
+  text: ЧТО С ДЕНЬГАМИ?
+  when: когда напоминаешь другу про долг или оплату
+  enabled: true
+- id: 54
+  file_id: CAACAgIAAxUAAWqnuULRepO6FpGxiDUgiHwzPrQOAALTFAACHEQQSz35brhiMqoJPQQ
+  emoji: 🐑
+  text: ОВСЕЕВ ПОРЕШАЕТ
+  when: когда обещаешь решить проблему друзей
+  enabled: true
+- id: 55
+  file_id: CAACAgIAAxUAAWqnuULuQpudT0hWIg9dD95GgyQ-AALNGQACuxgIS2tcAtl5mJiJPQQ
+  emoji: 🤷
+  text: НИ СНОМ НИ ДУХОМ НИ УХОМ НИ РЫЛОМ
+  when: когда совсем не в курсе происходящего
+  enabled: true
+- id: 56
+  file_id: CAACAgIAAxUAAWqnuUILma7G0wslt1Um1AoL6SYgAAI1hwACU7SpSG4HFeRJuigKPQQ
+  emoji: 🧠
+  text: ДРОЧЬ СЛАБОНУЖНАЯ
+  when: когда обсуждают бесполезное занятие или ерунду
+  enabled: true

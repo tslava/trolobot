@@ -44,6 +44,7 @@ from trolobot.llm import LLMClient
 from trolobot.patterns import Patterns
 from trolobot.prompt import PLACES_NONE, SITUATION_LATE, SITUATION_MORNING
 from trolobot.responder import Responder
+from trolobot.stickers import Sticker
 from trolobot.timeutil import day_key, in_window
 
 CHAT_ID = -100123456
@@ -88,6 +89,7 @@ class FakeBot:
     def __init__(self) -> None:
         self.events: list[tuple[str, ...]] = []
         self.sent: list[tuple[int, str, int | None]] = []
+        self.sent_stickers: list[tuple[int, str, int | None]] = []
         self._next_id = 5000
 
     async def send_message(
@@ -96,6 +98,14 @@ class FakeBot:
         self._next_id += 1
         self.sent.append((chat_id, text, reply_to_message_id))
         self.events.append(("send", str(chat_id), text))
+        return SentMessage(message_id=self._next_id)
+
+    async def send_sticker(
+        self, chat_id: int, sticker: str, *, reply_to_message_id: int | None = None
+    ) -> SentMessage:
+        self._next_id += 1
+        self.sent_stickers.append((chat_id, sticker, reply_to_message_id))
+        self.events.append(("sticker", str(chat_id), sticker))
         return SentMessage(message_id=self._next_id)
 
     async def send_chat_action(self, chat_id: int, action: str) -> None:
@@ -297,6 +307,29 @@ class MinRandom:
         return lo
 
 
+class FakeStickerChooser:
+    """Подделка ``StickerChooser``: без реального LLM-вызова — тесты этого модуля
+    проверяют интеграцию (когда чузер вызывается и что происходит после), а не сам
+    выбор моделью (это уже покрыто test_stickers.py)."""
+
+    def __init__(self, sticker: Sticker | None = None) -> None:
+        self.sticker = sticker
+        self.calls: list[dict[str, object]] = []
+
+    async def choose(
+        self, *, reply_text: str, trigger_text: str, exclude_ids: set[int], now: int
+    ) -> Sticker | None:
+        self.calls.append(
+            {
+                "reply_text": reply_text,
+                "trigger_text": trigger_text,
+                "exclude_ids": exclude_ids,
+                "now": now,
+            }
+        )
+        return self.sticker
+
+
 class FakePromptStore:
     """Подделка stores.PromptStore: подмена системного промпта/few-shot и их версий.
 
@@ -341,6 +374,7 @@ def _make_responder(
     seed: int = 0,
     rng: random.Random | FixedRandom | MinRandom | None = None,
     judge: Judge | None = None,
+    sticker_chooser: FakeStickerChooser | None = None,
     prompt_store: FakePromptStore | None = None,
 ) -> Responder:
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
@@ -350,6 +384,7 @@ def _make_responder(
         cfg_getter=lambda: cfg,
         llm=llm,
         judge=judge,
+        sticker_chooser=sticker_chooser,  # type: ignore[arg-type]
         patterns_getter=lambda: patterns,
         prompt_store=prompt_store if prompt_store is not None else FakePromptStore(),
         rng=rng if rng is not None else random.Random(seed),  # type: ignore[arg-type]
@@ -2523,6 +2558,109 @@ async def test_filter_context_places_names_still_cuts_fabricated_venue(
         assert bot.sent == []
         logs = await db.filter_log_summary(DAY_NOW - 10)
         assert any(reason == "regex:venue" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- Стикеры: интеграция StickerChooser в _generate_and_send -----------------
+
+
+async def test_sticker_chosen_sends_sticker_not_text(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("И тебе привет."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    chooser = FakeStickerChooser(
+        sticker=Sticker(
+            id=3, file_id="FILE3", emoji="😂", text="Ну ты даёшь", when="", enabled=True
+        )
+    )
+    responder = _make_responder(db, cfg, llm, bot, clock, sticker_chooser=chooser)
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=50, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        assert bot.sent == []  # send_message НЕ вызывался
+        assert len(bot.sent_stickers) == 1
+        assert bot.sent_stickers[0][1] == "FILE3"
+        assert len(chooser.calls) == 1
+
+        replies = await db.recent_bot_replies(5)
+        assert replies == ["[стикер #3] Ну ты даёшь"]
+
+        assert await db.get_state("replies_since_sticker") == "0"
+        sticker_key = day_key("sticker_count", clock.now(), cfg.persona.timezone)
+        assert await db.get_state(sticker_key) == "1"
+
+        # Счётчики бюджета обращений/ambient — общий хвост, тот же, что у текста.
+        ambient_key = day_key("ambient_count", clock.now(), cfg.persona.timezone)
+        assert await db.get_state(ambient_key) == "1"
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "send:sticker" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_sticker_chooser_returns_none_sends_text_as_before(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    chooser = FakeStickerChooser(sticker=None)
+    responder = _make_responder(db, cfg, llm, bot, clock, sticker_chooser=chooser)
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=51, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        assert len(chooser.calls) == 1
+        assert bot.sent_stickers == []
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Бывает."
+
+        assert await db.get_state("replies_since_sticker") == "1"
+        sticker_key = day_key("sticker_count", clock.now(), cfg.persona.timezone)
+        assert await db.get_state(sticker_key) is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_sticker_chooser_not_called_when_min_replies_between_not_elapsed(
+    db: Database,
+) -> None:
+    cfg = _config()
+    cfg.behaviour.stickers.min_replies_between = 4
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    chooser = FakeStickerChooser(
+        sticker=Sticker(id=1, file_id="F1", text="Не должно быть выбрано", enabled=True)
+    )
+    responder = _make_responder(db, cfg, llm, bot, clock, sticker_chooser=chooser)
+    await db.set_state("replies_since_sticker", "1")
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=52, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        assert chooser.calls == []  # чузер не вызывается вовсе
+        assert bot.sent_stickers == []
+        assert len(bot.sent) == 1
+        assert await db.get_state("replies_since_sticker") == "2"
     finally:
         await responder.shutdown()
         await llm.aclose()

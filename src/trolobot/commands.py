@@ -183,6 +183,8 @@ class _CommandsDeps(Protocol):
     def bot_user_id(self) -> int: ...
     @property
     def bot_username(self) -> str: ...
+    @property
+    def sticker_catalog_enabled(self) -> int: ...
 
 
 def _truncate(text: str) -> str:
@@ -348,6 +350,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     llm_calls = int(await deps.db.get_state(day_key("llm_calls", now, tz)) or "0")
     llm_spent = float(await deps.db.get_state(day_key("llm_spent_usd", now, tz)) or "0")
     reactions = int(await deps.db.get_state(day_key("reaction_count", now, tz)) or "0")
+    stickers = int(await deps.db.get_state(day_key("sticker_count", now, tz)) or "0")
 
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
@@ -362,7 +365,9 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"Shadow: {'да' if cfg.filters.shadow else 'нет'}",
         f"Сегодня: ambient={ambient}, mention={mention}, "
         f"llm_calls={llm_calls}, llm_spent=${llm_spent:.2f}, "
-        f"reactions={reactions}/{cfg.behaviour.reactions.daily_cap}",
+        f"reactions={reactions}/{cfg.behaviour.reactions.daily_cap}, "
+        f"stickers={stickers}/{cfg.behaviour.stickers.daily_cap} "
+        f"({deps.sticker_catalog_enabled} в каталоге)",
         f"Pending: {pending}",
         f"Night queue: {night_queue}",
     ]

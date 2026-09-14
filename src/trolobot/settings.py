@@ -21,4 +21,6 @@ class Settings(BaseSettings):
     few_shot_path: Path = Path("few_shot.yaml")
     prompt_path: Path = Path("prompts/system.txt")
     judge_prompt_path: Path = Path("prompts/judge.txt")
+    sticker_prompt_path: Path = Path("prompts/sticker.txt")
+    stickers_path: Path = Path("stickers.yaml")
     log_level: str = "INFO"

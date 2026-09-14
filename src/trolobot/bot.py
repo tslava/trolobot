@@ -69,6 +69,11 @@ class Deps:
     # (reactions.py). None в discovery/тестах без реального бота — тогда реакция
     # просто не ставится, сообщение всё равно пишется и гейтится как обычно.
     bot: ReactionBotLike | None = None
+    # Сколько enabled-стикеров в каталоге (stickers.yaml) — считается один раз в
+    # app.py при старте, только для /status ("(N в каталоге)"). Каталог не меняется
+    # на горячую (в отличие от config_overrides), поэтому фиксированное число, а не
+    # геттер, достаточно.
+    sticker_catalog_enabled: int = 0
     # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
     # не спамить лог на каждое следующее сообщение того же участника.
     warned_user_ids: set[int] = field(default_factory=set)
