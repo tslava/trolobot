@@ -397,6 +397,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     llm_spent = float(await deps.db.get_state(day_key("llm_spent_usd", now, tz)) or "0")
     reactions = int(await deps.db.get_state(day_key("reaction_count", now, tz)) or "0")
     stickers = int(await deps.db.get_state(day_key("sticker_count", now, tz)) or "0")
+    followup_calls = int(await deps.db.get_state(day_key("followup_calls", now, tz)) or "0")
 
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
@@ -418,6 +419,17 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     else:
         hot_line = "hot window: нет"
 
+    checkin_due_raw = await deps.db.get_state("checkin_due")
+    try:
+        checkin_due = int(checkin_due_raw) if checkin_due_raw is not None else None
+    except ValueError:
+        checkin_due = None
+    checkin_line = (
+        f"checkin: due {local_dt(checkin_due, tz).strftime('%H:%M')}"
+        if checkin_due is not None
+        else "checkin: нет"
+    )
+
     lines = [
         f"Паника: {'да' if panic else 'нет'}",
         f"Стоп до: {stop_until}",
@@ -435,6 +447,8 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"Night queue: {night_queue}",
         f"life events: {len(life_events)} ({life_unsent})",
         hot_line,
+        f"followup calls: {followup_calls}/{cfg.behaviour.followup.daily_cap}",
+        checkin_line,
     ]
     await _reply(message, "\n".join(lines))
 

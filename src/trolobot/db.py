@@ -692,6 +692,17 @@ class Database:
             return None
         return int(row["max_created_at"])
 
+    async def last_bot_reply_at(self) -> int | None:
+        """created_at последней реплики бота (bot_replies) — момент, от которого
+        responder._maybe_checkin (CLAUDE.md, "внимание как у живого человека:
+        вернулся проверить") считает "тему умершей" и берёт messages_since."""
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT MAX(created_at) AS max_created_at FROM bot_replies")
+        row = await cursor.fetchone()
+        if row is None or row["max_created_at"] is None:
+            return None
+        return int(row["max_created_at"])
+
     # -- этап 6: управление из телеграма -----------------------------------
 
     async def set_override(self, key: str, value: str, changed_by: int, now: int) -> str | None:
@@ -928,22 +939,38 @@ class Database:
             created_at=row["created_at"],
         )
 
-    async def messages_since(self, chat_id: int, since: int) -> list[MessageRow]:
-        """Человеческие сообщения чата с created_at >= since, хронологически.
+    async def messages_since(
+        self, chat_id: int, since: int, limit: int | None = None
+    ) -> list[MessageRow]:
+        """Человеческие сообщения чата с created_at > since, хронологически.
 
-        Используется responder._collect_addressed_items для восстановления
-        накопленных обращений к боту после рестарта процесса (когда
-        _pending_info пуст) — по образцу recent_activity, но с полной строкой,
-        а не только (user_id, created_at).
+        ``limit`` не задан (по умолчанию) — используется
+        ``responder._collect_addressed_items`` для восстановления накопленных
+        обращений к боту после рестарта процесса (когда ``_pending_info``
+        пуст), возвращает все подходящие строки. ``limit`` задан — используется
+        ``responder._maybe_checkin`` (CLAUDE.md, "внимание как у живого
+        человека: вернулся проверить"): последние ``limit`` строк, но всё
+        равно в хронологическом порядке.
         """
         conn = self._require_conn()
-        cursor = await conn.execute(
-            "SELECT id, tg_message_id, chat_id, user_id, display_name, text, "
-            "reply_to_tg_message_id, is_bot, created_at FROM messages "
-            "WHERE chat_id = ? AND is_bot = 0 AND created_at >= ? ORDER BY created_at, id",
-            (chat_id, since),
-        )
-        rows = await cursor.fetchall()
+        if limit is None:
+            cursor = await conn.execute(
+                "SELECT id, tg_message_id, chat_id, user_id, display_name, text, "
+                "reply_to_tg_message_id, is_bot, created_at FROM messages "
+                "WHERE chat_id = ? AND is_bot = 0 AND created_at > ? ORDER BY created_at, id",
+                (chat_id, since),
+            )
+            rows = await cursor.fetchall()
+        else:
+            cursor = await conn.execute(
+                "SELECT id, tg_message_id, chat_id, user_id, display_name, text, "
+                "reply_to_tg_message_id, is_bot, created_at FROM messages "
+                "WHERE chat_id = ? AND is_bot = 0 AND created_at > ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (chat_id, since, limit),
+            )
+            rows = list(await cursor.fetchall())
+            rows.reverse()
         return [
             MessageRow(
                 id=row["id"],

@@ -208,8 +208,81 @@ class HotWindowConfig(BaseModel):
         description="Шанс ambient-реплики в горячем окне вместо ambient_probability",
     )
     ambient_cap: int = Field(
-        default=4, ge=0, le=50, description="Потолок ambient-реплик за одно горячее окно"
+        default=8, ge=0, le=50, description="Потолок ambient-реплик за одно горячее окно"
     )
+
+
+class FollowupConfig(BaseModel):
+    """Дешёвая семантическая проверка «это мне или про мою тему?» в горячем окне
+    (CLAUDE.md, "внимание как у живого человека"). Сообщения, которые обычный гейт
+    не признал прямым обращением, во время горячего окна дополнительно проверяются
+    маленькой моделью — «да» превращает их в обращение ``Trigger.FOLLOWUP``.
+    """
+
+    enabled: bool = Field(
+        default=True, description="Включает дешёвую проверку «это мне?» в горячем окне"
+    )
+    model: str = Field(
+        default="", description="Модель для проверки «это мне?»; пусто -> llm.judge_model"
+    )
+    max_tokens: int = Field(
+        default=60, ge=10, le=300, description="Лимит токенов ответа дешёвой проверки"
+    )
+    daily_cap: int = Field(
+        default=300,
+        ge=0,
+        le=5000,
+        description="Потолок вызовов дешёвой проверки в сутки, свой счётчик",
+    )
+    context_messages: int = Field(
+        default=10, ge=1, le=50, description="Сколько сообщений чата дать дешёвой проверке"
+    )
+    recent_replies: int = Field(
+        default=3, ge=1, le=10, description="Сколько последних реплик Фёдора дать проверке"
+    )
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
+
+
+class CheckinConfig(BaseModel):
+    """«Вернулся проверить» — раз в ``after_min`` минут после закрытия горячего
+    окна один вызов основной модели по всему, что написали после последней
+    реплики персонажа (CLAUDE.md, "внимание как у живого человека: вернулся
+    проверить"). Не путать с ``followup`` (дешёвая проверка ВНУТРИ окна) —
+    здесь окно уже закрыто, проверка идёт основной моделью и реже.
+    """
+
+    enabled: bool = Field(default=True, description="Включает периодическую проверку «вернулся»")
+    after_min: tuple[int, int] = Field(
+        default=(120, 240),
+        description="Минут после закрытия горячего окна до проверки, [мин, макс]",
+    )
+    topic_max_hours: int = Field(
+        default=48, ge=1, le=720, description="Часов без реплик бота — тема считается умершей"
+    )
+    max_messages: int = Field(
+        default=40, ge=1, le=200, description="Сколько сообщений после последней реплики брать"
+    )
+    poll_sec: int = Field(
+        default=300, ge=30, le=3600, description="Период фонового цикла checkin_job, сек"
+    )
+
+    @field_validator("after_min")
+    @classmethod
+    def _validate_after_min(cls, value: tuple[int, int]) -> tuple[int, int]:
+        lo, hi = value
+        if not (0 <= lo <= hi):
+            raise ValueError(f"invalid after_min {value!r}: expected 0 <= min <= max")
+        return value
 
 
 class BehaviourConfig(BaseModel):
@@ -247,6 +320,14 @@ class BehaviourConfig(BaseModel):
     hot_window: HotWindowConfig = Field(
         default_factory=HotWindowConfig,
         description="Горячее окно живее обычного после /life и /say",
+    )
+    followup: FollowupConfig = Field(
+        default_factory=FollowupConfig,
+        description="Дешёвая проверка «это мне?» для сообщений без обращения в окне",
+    )
+    checkin: CheckinConfig = Field(
+        default_factory=CheckinConfig,
+        description="Периодическая проверка «вернулся» после закрытия горячего окна",
     )
 
     # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает

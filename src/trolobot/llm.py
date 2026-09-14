@@ -88,13 +88,22 @@ class LLMClient:
         model: str,
         max_tokens: int,
         now: int,
+        counter_key: str = "llm_calls",
+        calls_cap: int | None = None,
     ) -> LLMResult:
         """Обёртка над ``call_raw`` для текстовых сообщений (``content: str``).
 
         Существующие вызывающие (Responder, Judge, places_fill) работают только
         с текстом — узкий тип параметра здесь сохранён, чтобы их код не менялся.
         """
-        return await self.call_raw(messages, model=model, max_tokens=max_tokens, now=now)
+        return await self.call_raw(
+            messages,
+            model=model,
+            max_tokens=max_tokens,
+            now=now,
+            counter_key=counter_key,
+            calls_cap=calls_cap,
+        )
 
     async def call_raw(
         self,
@@ -103,12 +112,21 @@ class LLMClient:
         model: str,
         max_tokens: int,
         now: int,
+        counter_key: str = "llm_calls",
+        calls_cap: int | None = None,
     ) -> LLMResult:
         """То же самое, что ``call``, но ``content`` сообщения может быть не только
         строкой — content-массивом ``[{"type": "text", ...}, {"type": "image_url", ...}]``
         для запросов со зрением (``stickers_fill.py``, распознавание надписи на стикере).
         Вся логика (бюджет, calls_cap, circuit, учёт трат) — здесь, единственная точка
-        вызова модели; ``call`` не дублирует её, только сужает тип."""
+        вызова модели; ``call`` не дублирует её, только сужает тип.
+
+        ``counter_key``/``calls_cap`` (CLAUDE.md, "внимание как у живого человека") —
+        свой суточный счётчик попыток вместо общего ``llm_calls``, со своим потолком
+        (``None`` -> ``cfg.llm.daily_calls_cap``, как раньше). Нужны дешёвым проверкам
+        вроде followup-чекера, чтобы не съедать бюджет вызовов основной модели —
+        бюджет в долларах, circuit и increment-до-запроса при этом общие для всех
+        счётчиков."""
         if not model:
             # Пустая модель — ошибка конфигурации (main_model ещё не выбран), а не
             # сбой вызова: пусть решает вызывающий (Responder), ретраев тут нет.
@@ -121,10 +139,11 @@ class LLMClient:
         if circuit_until_raw is not None and int(circuit_until_raw) > now:
             raise LLMError("llm:circuit_open")
 
-        calls_key = day_key("llm_calls", now, tz)
+        cap = calls_cap if calls_cap is not None else cfg.llm.daily_calls_cap
+        calls_key = day_key(counter_key, now, tz)
         calls_raw = await self._db.get_state(calls_key)
         calls_count = int(calls_raw) if calls_raw is not None else 0
-        if calls_count >= cfg.llm.daily_calls_cap:
+        if calls_count >= cap:
             raise LLMError("llm:calls_cap")
 
         spent_key = day_key("llm_spent_usd", now, tz)

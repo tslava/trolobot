@@ -22,7 +22,7 @@ from trolobot.db import LifeEventRow
 from trolobot.few_shot import FewShot
 from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
-from trolobot.timeutil import local_dt
+from trolobot.timeutil import day_key, local_dt
 
 OWN_CHAT_ID = -1001234567890
 FOREIGN_CHAT_ID = -100999
@@ -1548,6 +1548,66 @@ async def test_status_shows_hot_window_none_when_expired(
     await handler(message)
 
     assert "hot window: нет" in sent[0]
+
+
+async def test_status_shows_followup_calls_zero_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.followup.daily_cap
+    assert f"followup calls: 0/{cap}" in sent[0]
+
+
+async def test_status_shows_followup_calls_today_count(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    db.state[day_key("followup_calls", now, config.persona.timezone)] = "7"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.followup.daily_cap
+    assert f"followup calls: 7/{cap}" in sent[0]
+
+
+async def test_status_shows_checkin_none_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "checkin: нет" in sent[0]
+
+
+async def test_status_shows_checkin_due_local_time(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    due = now + 3600
+    db.state["checkin_due"] = str(due)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    expected_time = local_dt(due, config.persona.timezone).strftime("%H:%M")
+    assert f"checkin: due {expected_time}" in sent[0]
 
 
 # --- справка ------------------------------------------------------------------

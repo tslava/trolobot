@@ -15,6 +15,7 @@ class Trigger(StrEnum):
     MENTION = "mention"  # @username в тексте
     REPLY = "reply"  # реплай на сообщение бота
     NAME = "name"  # слово из persona.name_triggers
+    FOLLOWUP = "followup"  # без обращения, но дешёвая проверка признала адресованным боту
     AMBIENT = "ambient"  # без обращения, внутрь живого разговора
 
 

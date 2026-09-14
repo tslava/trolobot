@@ -421,6 +421,75 @@ async def test_call_raw_accepts_vision_content_and_counts_budget() -> None:
     assert payload["model"] == "vision/model"
 
 
+async def test_custom_counter_key_is_isolated_from_llm_calls() -> None:
+    """counter_key (CLAUDE.md, "внимание как у живого человека") пишет свой
+    суточный счётчик вместо общего llm_calls — followup-чекер не должен есть
+    бюджет вызовов основной модели."""
+    cfg = Config()
+    store = FakeStore()
+    handler, calls = _counting_handler(lambda _req: _ok_response())
+    client = _client(handler, cfg, store)
+    try:
+        result = await client.call(
+            MESSAGES, model="m", max_tokens=50, now=NOW, counter_key="followup_calls"
+        )
+    finally:
+        await client.aclose()
+
+    assert result.text == "Привет"
+    followup_key = day_key("followup_calls", NOW, cfg.persona.timezone)
+    llm_calls_key = day_key("llm_calls", NOW, cfg.persona.timezone)
+    assert store.state[followup_key] == "1"
+    assert llm_calls_key not in store.state
+    assert len(calls) == 1
+
+
+async def test_custom_calls_cap_blocks_before_request_independent_of_daily_calls_cap() -> None:
+    cfg = Config()
+    cfg.llm.daily_calls_cap = 1000  # общий потолок далеко не достигнут
+    store = FakeStore()
+    calls_key = day_key("followup_calls", NOW, cfg.persona.timezone)
+    store.state[calls_key] = "3"
+    handler, calls = _counting_handler(lambda _req: _ok_response())
+    client = _client(handler, cfg, store)
+    try:
+        with pytest.raises(LLMError) as excinfo:
+            await client.call(
+                MESSAGES,
+                model="m",
+                max_tokens=50,
+                now=NOW,
+                counter_key="followup_calls",
+                calls_cap=3,
+            )
+    finally:
+        await client.aclose()
+
+    assert excinfo.value.reason == "llm:calls_cap"
+    assert store.state[calls_key] == "3"  # не выросло
+    assert len(calls) == 0
+
+
+async def test_default_counter_key_and_cap_unchanged() -> None:
+    """Без явных counter_key/calls_cap поведение — как раньше: общий llm_calls и
+    cfg.llm.daily_calls_cap."""
+    cfg = Config()
+    cfg.llm.daily_calls_cap = 1
+    store = FakeStore()
+    calls_key = day_key("llm_calls", NOW, cfg.persona.timezone)
+    store.state[calls_key] = "1"
+    handler, calls = _counting_handler(lambda _req: _ok_response())
+    client = _client(handler, cfg, store)
+    try:
+        with pytest.raises(LLMError) as excinfo:
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    assert excinfo.value.reason == "llm:calls_cap"
+    assert len(calls) == 0
+
+
 async def test_call_raw_respects_circuit_and_caps_same_as_call() -> None:
     cfg = Config()
     cfg.llm.daily_calls_cap = 0

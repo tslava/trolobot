@@ -1039,6 +1039,126 @@ async def test_last_message_at_ignores_bot_and_other_chats(tmp_path: Path) -> No
         await db.close()
 
 
+async def test_last_bot_reply_at_none_without_replies(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.last_bot_reply_at() is None
+    finally:
+        await db.close()
+
+
+async def test_last_bot_reply_at_returns_max_created_at(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_bot_reply(
+            tg_message_id=1,
+            reply_to_tg_message_id=None,
+            trigger="ambient",
+            trigger_tg_message_id=None,
+            text="раньше",
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=0,
+            created_at=1000,
+        )
+        await db.insert_bot_reply(
+            tg_message_id=2,
+            reply_to_tg_message_id=None,
+            trigger="mention",
+            trigger_tg_message_id=None,
+            text="позже",
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=0,
+            created_at=5000,
+        )
+
+        assert await db.last_bot_reply_at() == 5000
+    finally:
+        await db.close()
+
+
+async def test_messages_since_strictly_after_excludes_bot_and_other_chats(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_message(
+            tg_message_id=1,
+            chat_id=1,
+            user_id=1,
+            display_name="A",
+            text="at boundary",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1000,
+        )
+        await db.insert_message(
+            tg_message_id=2,
+            chat_id=1,
+            user_id=2,
+            display_name="B",
+            text="after",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1001,
+        )
+        await db.insert_message(
+            tg_message_id=3,
+            chat_id=1,
+            user_id=99,
+            display_name="Bot",
+            text="bot reply",
+            reply_to_tg_message_id=None,
+            is_bot=True,
+            created_at=1002,
+        )
+        await db.insert_message(
+            tg_message_id=4,
+            chat_id=2,
+            user_id=3,
+            display_name="C",
+            text="other chat",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1003,
+        )
+
+        rows = await db.messages_since(1, 1000)
+        # created_at > since (строго): сообщение ровно на границе не входит.
+        assert [row.text for row in rows] == ["after"]
+    finally:
+        await db.close()
+
+
+async def test_messages_since_limit_keeps_last_n_chronological(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        for i in range(5):
+            await db.insert_message(
+                tg_message_id=10 + i,
+                chat_id=1,
+                user_id=1,
+                display_name="A",
+                text=f"msg-{i}",
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=1000 + i,
+            )
+
+        rows = await db.messages_since(1, 999, 2)
+        assert [row.text for row in rows] == ["msg-3", "msg-4"]
+
+        all_rows = await db.messages_since(1, 999, 100)
+        assert [row.text for row in all_rows] == [f"msg-{i}" for i in range(5)]
+    finally:
+        await db.close()
+
+
 # -- этап 6: управление из телеграма ------------------------------------------
 
 

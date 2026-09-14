@@ -18,7 +18,8 @@ from aiogram.types import Chat, Message, PhotoSize, User
 
 from trolobot.bot import Deps, build_router
 from trolobot.config_models import Config
-from trolobot.db import Database
+from trolobot.db import Database, MessageRow
+from trolobot.gate_types import Trigger
 from trolobot.patterns import Patterns
 from trolobot.sanitize import stable_n
 from trolobot.settings import Settings
@@ -91,6 +92,8 @@ def _deps(
     bot_username: str = BOT_USERNAME,
     rng: random.Random | None = None,
     bot: object | None = None,
+    responder: object | None = None,
+    followup: object | None = None,
 ) -> Deps:
     reserved = {cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers}
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, bot_username)
@@ -113,6 +116,8 @@ def _deps(
         prompt_store=prompt_store,
         bot_username=bot_username,
         bot=bot,  # type: ignore[arg-type]
+        responder=responder,  # type: ignore[arg-type]
+        followup=followup,  # type: ignore[arg-type]
     )
 
 
@@ -766,3 +771,211 @@ async def test_gate_not_live_drop_does_not_react(
     summary = dict(await db.filter_log_summary(0))
     assert summary.get("gate:not_live") == 1
     assert bot.calls == []
+
+
+# --- Дешёвая проверка "это мне?" в горячем окне (followup.py) ---
+
+
+class _FakeFollowupChecker:
+    """Подделка FollowupChecker: записывает аргументы вызова, отдаёт заданный result."""
+
+    def __init__(self, result: bool) -> None:
+        self.result = result
+        self.calls: list[dict[str, object]] = []
+
+    async def check(
+        self,
+        *,
+        text: str,
+        display_name: str,
+        context_rows: list[MessageRow],
+        recent_replies: list[str],
+        now: int,
+    ) -> bool:
+        self.calls.append(
+            {
+                "text": text,
+                "display_name": display_name,
+                "context_rows": context_rows,
+                "recent_replies": recent_replies,
+                "now": now,
+            }
+        )
+        return self.result
+
+
+async def _set_hot_until(db: Database, *, future: bool) -> None:
+    offset = 3600 if future else -3600
+    await db.set_state("hot_until", str(int(DAY.timestamp()) + offset))
+
+
+def _config_hot_window_dice_drop() -> Config:
+    """followup включён (дефолт), горячее окно открыто (see _set_hot_until) и его
+    кубик детерминированно даёт DROP gate:dice независимо от rng-сида — иначе
+    ambient_cap/probability по умолчанию сделали бы исход недетерминированным."""
+    cfg = Config()
+    hot_window = cfg.behaviour.hot_window.model_copy(update={"ambient_probability": 0.0})
+    behaviour = cfg.behaviour.model_copy(update={"hot_window": hot_window})
+    return cfg.model_copy(update={"behaviour": behaviour})
+
+
+async def test_followup_checker_true_in_hot_window_passes_as_followup(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """gate:dice (в FOLLOWUP_REASONS) + окно открыто + чекер сказал "да" ->
+    followup:yes вместо gate:dice, responder.on_gate_pass(FOLLOWUP)."""
+    cfg = _config_hot_window_dice_drop()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(True)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, followup=checker, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+    await _set_hot_until(db, future=True)
+
+    message = _message(
+        message_id=321,
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="какая погода вечером",
+        date=DAY,
+    )
+    await handler(message)
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("followup:yes") == 1
+    assert "gate:dice" not in summary
+
+    assert len(responder.calls) == 1
+    _msg, trigger, display_name = responder.calls[0]
+    assert trigger is Trigger.FOLLOWUP
+    assert display_name == "Дима"
+
+    assert len(checker.calls) == 1
+    call = checker.calls[0]
+    assert call["text"] == "какая погода вечером"
+    assert call["display_name"] == "Дима"
+    assert call["now"] == int(DAY.timestamp())
+    # Текущее сообщение не входит в context_rows — оно уже записано insert_message,
+    # но контракт требует убрать его перед передачей чекеру.
+    context_rows = call["context_rows"]
+    assert isinstance(context_rows, list)
+    assert all(row.tg_message_id != 321 for row in context_rows)
+
+
+async def test_followup_checker_false_falls_back_to_gate_drop(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_hot_window_dice_drop()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(False)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, followup=checker, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+    await _set_hot_until(db, future=True)
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="какая погода вечером",
+        date=DAY,
+    )
+    await handler(message)
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("followup:no") == 1
+    assert summary.get("gate:dice") == 1  # дальше как раньше
+    assert responder.calls == []
+    assert len(checker.calls) == 1
+
+
+async def test_followup_not_called_outside_hot_window(
+    db: Database, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(True)
+    deps = _deps(db, config, settings=settings, followup=checker)
+    handler = build_router(deps).message.handlers[0].callback
+    await _set_hot_until(db, future=False)  # окно уже закрыто
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="какая погода вечером",
+        date=DAY,
+    )
+    await handler(message)
+
+    assert checker.calls == []
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("gate:not_live") == 1
+    assert "followup:yes" not in summary
+    assert "followup:no" not in summary
+
+
+async def test_followup_not_called_when_no_hot_until_set(
+    db: Database, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """hot_until вообще не задан (окно ни разу не открывалось) — тот же путь, что
+    и закрытое окно: чекер не вызывается."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(True)
+    deps = _deps(db, config, settings=settings, followup=checker)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="какая погода вечером",
+        date=DAY,
+    )
+    await handler(message)
+
+    assert checker.calls == []
+
+
+async def test_followup_not_called_for_reason_outside_followup_reasons(
+    db: Database, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """gate:topic не входит в FOLLOWUP_REASONS — чекер не вызывается, даже когда
+    горячее окно открыто."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(True)
+    deps = _deps(db, config, settings=settings, followup=checker)
+    handler = build_router(deps).message.handlers[0].callback
+    await _set_hot_until(db, future=True)
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="хватит уже про войну говорить",
+        date=DAY,
+    )
+    await handler(message)
+
+    assert checker.calls == []
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("gate:topic") == 1
+
+
+async def test_followup_disabled_by_config_skips_checker(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_hot_window_dice_drop()
+    cfg = cfg.model_copy(
+        update={
+            "behaviour": cfg.behaviour.model_copy(
+                update={"followup": cfg.behaviour.followup.model_copy(update={"enabled": False})}
+            )
+        }
+    )
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(True)
+    deps = _deps(db, cfg, settings=settings, followup=checker)
+    handler = build_router(deps).message.handlers[0].callback
+    await _set_hot_until(db, future=True)
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="какая погода вечером",
+        date=DAY,
+    )
+    await handler(message)
+
+    assert checker.calls == []
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("gate:dice") == 1
