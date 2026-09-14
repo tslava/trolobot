@@ -63,6 +63,12 @@ async def load_gate_state(db: Database, cfg: Config, msg: GateMessage, now: int)
     since = now - cfg.behaviour.live_talk.window_min * 60
     recent = await db.recent_activity(msg.chat_id, since)
 
+    hot_until_raw = await db.get_state("hot_until")
+    hot_until = _parse_int_state("hot_until", hot_until_raw)
+
+    hot_ambient_count_raw = await db.get_state("hot_ambient_count")
+    hot_ambient_count = _parse_int_state_default_zero("hot_ambient_count", hot_ambient_count_raw)
+
     return GateState(
         panic=panic,
         stop_until=stop_until,
@@ -74,4 +80,6 @@ async def load_gate_state(db: Database, cfg: Config, msg: GateMessage, now: int)
         ambient_count_today=ambient_count_today,
         last_ambient_at=last_ambient_at,
         recent=tuple(recent),
+        hot_until=hot_until,
+        hot_ambient_count=hot_ambient_count,
     )

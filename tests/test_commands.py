@@ -1501,6 +1501,55 @@ async def test_status_shows_no_life_events_by_default(
     assert "life events: 0 (0)" in sent[0]
 
 
+async def test_status_shows_hot_window_none_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "hot window: нет" in sent[0]
+
+
+async def test_status_shows_hot_window_open_until_local_time_and_count(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    hot_until = now + 900
+    db.state["hot_until"] = str(hot_until)
+    db.state["hot_ambient_count"] = "2"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    expected_time = local_dt(hot_until, config.persona.timezone).strftime("%H:%M")
+    cap = config.behaviour.hot_window.ambient_cap
+    assert f"hot window: до {expected_time} (2/{cap})" in sent[0]
+
+
+async def test_status_shows_hot_window_none_when_expired(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """hot_until в прошлом — /status не должен врать, что окно ещё открыто."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    db.state["hot_until"] = str(now - 10)
+    db.state["hot_ambient_count"] = "1"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "hot window: нет" in sent[0]
+
+
 # --- справка ------------------------------------------------------------------
 
 

@@ -57,6 +57,11 @@ class GateState:
     ambient_count_today: int  # ambient + spontaneous
     last_ambient_at: int | None
     recent: tuple[RecentActivity, ...]  # не-бот сообщения за live_talk.window_min, включая текущее
+    # Горячее окно после /life и /say (CLAUDE.md, "горячее окно"): дефолты в конце —
+    # чтобы существующие позиционные вызовы (replay.py, тесты) не ломались, окно
+    # там не открывается (hot_until всегда None).
+    hot_until: int | None = None
+    hot_ambient_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)

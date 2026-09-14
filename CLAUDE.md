@@ -1016,6 +1016,61 @@ shadow=false -> sent=False с причиной; LLMError -> reason; say: тек�
 счётчики не тронуты; слот life подставляется в system для обычного ambient), `tests/test_commands.py`
 (все ветки /life и /say через фейковый responder, responder=None, аудит).
 
+## Интерфейсы: горячее окно после /life и /say
+
+Решение владельца: после того как бот сам вбросил новость (`/life`) или реплику (`/say`),
+разговор скорее всего пойдёт вокруг неё, и полчаса он должен отвечать живее обычного.
+Вне окна поведение не меняется ни на шаг.
+
+```python
+# config_models.py — BehaviourConfig.hot_window: HotWindowConfig (с description у каждого поля)
+class HotWindowConfig(BaseModel):
+    enabled: bool = True
+    minutes: int = Field(default=30, ge=0, le=720)            # длительность окна после /life и /say
+    mention_max_delay_sec: int = Field(default=120, ge=0, le=3600)  # потолок задержки ответа на обращение в окне
+    ambient_probability: float = Field(default=0.5, ge=0.0, le=1.0) # вместо behaviour.ambient_probability
+    ambient_cap: int = Field(default=4, ge=0, le=50)          # ambient-реплик за одно окно
+# config.yaml дублирует дефолты с комментариями.
+
+# state-ключи: hot_until (unix), hot_ambient_count (сбрасывается в "0" при открытии нового окна).
+# Открывает окно responder: в announce_life и say при успешной отправке (sent=True), если
+# cfg.behaviour.hot_window.enabled и minutes > 0: set_state("hot_until", now + minutes*60),
+# set_state("hot_ambient_count", "0"). Повторный /life внутри окна — окно продлевается заново от now.
+
+# gate_types.py — GateState дополняется (с дефолтами, чтобы существующие тесты/replay не менять):
+    hot_until: int | None = None
+    hot_ambient_count: int = 0
+# gate_state.load_gate_state читает оба ключа. replay.py: in-memory состояние — hot_until None (окно там не открывается).
+
+# gate.py — только ambient-ветка (шаги 9–11), обращения гейт не трогает (задержка — в responder):
+# hot = cfg.behaviour.hot_window.enabled and state.hot_until is not None and now < state.hot_until.
+# hot → шаг 9 (not_live) пропускается; шаг 10 (ambient_cap/ambient_cooldown) заменяется на
+# state.hot_ambient_count >= hot_window.ambient_cap → DROP "gate:hot_cap"; шаг 11 — кубик с
+# hot_window.ambient_probability → DROP "gate:dice" / PASS Trigger.AMBIENT, reason "pass:ambient_hot".
+# Не hot → ровно как раньше. reactions.REACT_REASONS не меняется (gate:dice в окне тоже даёт шанс реакции).
+
+# responder.py:
+# - обращения: due = now + pick_delay(...); если hot (тот же расчёт, по state hot_until через db.get_state) →
+#   delay = min(delay, hot_window.mention_max_delay_sec); лог INFO "hot window: mention delay capped".
+#   Кулдаун-сдвиг (earliest) остаётся — но в окне mention_chat_cooldown_sec/mention_cooldown_sec тоже
+#   ограничиваются mention_max_delay_sec: earliest = min(earliest, now + mention_max_delay_sec).
+# - ambient в окне: _recheck_ambient_budget пропускает проверки ambient_count/last_ambient_at и вместо них
+#   проверяет hot_ambient_count < ambient_cap (провал → filter_log send:recheck_hot_cap). После отправки
+#   ambient в окне — increment_state("hot_ambient_count"), а ambient_count(day)/last_ambient_at НЕ трогать
+#   (окно не ест дневной бюджет). bot_replies.trigger остаётся "ambient"; filter_log reason "send:ambient_hot".
+# - Признак «в окне» для ambient берётся ОДИН раз в начале _generate_and_send (hot_until из state), чтобы
+#   отправка и счётчики согласовались, даже если окно закрылось во время вызова модели.
+
+# commands.py /status: строка "hot window: до HH:MM (<hot_ambient_count>/<ambient_cap>)" либо "hot window: нет".
+# _HELP_TEXT не меняется. README: абзац в разделе про /life.
+```
+
+Тесты: `tests/test_gate.py` (в окне: not_live пропускается, hot_cap, кубик с hot-вероятностью, reason
+pass:ambient_hot; вне окна и при enabled=false — прежние решения), `tests/test_gate_state.py` (чтение ключей),
+`tests/test_responder.py` (announce_life/say открывают окно и сбрасывают счётчик; потолок задержки обращения;
+ambient в окне не трогает ambient_count, инкрементит hot_ambient_count; recheck hot_cap), `tests/test_commands.py`
+(/status строка), `tests/test_config.py` (описания — уже проверяются общим тестом).
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

@@ -186,6 +186,32 @@ class StickersConfig(BaseModel):
         return value
 
 
+class HotWindowConfig(BaseModel):
+    """Горячее окно после `/life` и `/say` — полчаса живее обычного (CLAUDE.md,
+    "горячее окно после /life и /say"). Вне окна поведение не меняется ни на шаг.
+    """
+
+    enabled: bool = Field(default=True, description="Включает горячее окно после /life и /say")
+    minutes: int = Field(
+        default=30, ge=0, le=720, description="Длительность горячего окна после /life и /say"
+    )
+    mention_max_delay_sec: int = Field(
+        default=120,
+        ge=0,
+        le=3600,
+        description="Потолок задержки ответа на обращение в горячем окне",
+    )
+    ambient_probability: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Шанс ambient-реплики в горячем окне вместо ambient_probability",
+    )
+    ambient_cap: int = Field(
+        default=4, ge=0, le=50, description="Потолок ambient-реплик за одно горячее окно"
+    )
+
+
 class BehaviourConfig(BaseModel):
     quiet_window: tuple[str, str] = Field(
         default=("02:00", "07:00"), description="Окно полной тишины, включая прямые обращения"
@@ -217,6 +243,10 @@ class BehaviourConfig(BaseModel):
     )
     stickers: StickersConfig = Field(
         default_factory=StickersConfig, description="Стикеры вместо текста, второй вызов моделью"
+    )
+    hot_window: HotWindowConfig = Field(
+        default_factory=HotWindowConfig,
+        description="Горячее окно живее обычного после /life и /say",
     )
 
     # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает

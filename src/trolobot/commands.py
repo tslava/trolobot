@@ -404,6 +404,20 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     life_events = await deps.db.life_events()
     life_unsent = sum(1 for event in life_events if event.announced_at is None)
 
+    hot_until_raw = await deps.db.get_state("hot_until")
+    try:
+        hot_until = int(hot_until_raw) if hot_until_raw is not None else None
+    except ValueError:
+        hot_until = None
+    if hot_until is not None and hot_until > now:
+        hot_ambient_count = int(await deps.db.get_state("hot_ambient_count") or "0")
+        hot_line = (
+            f"hot window: до {local_dt(hot_until, tz).strftime('%H:%M')} "
+            f"({hot_ambient_count}/{cfg.behaviour.hot_window.ambient_cap})"
+        )
+    else:
+        hot_line = "hot window: нет"
+
     lines = [
         f"Паника: {'да' if panic else 'нет'}",
         f"Стоп до: {stop_until}",
@@ -420,6 +434,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"Pending: {pending}",
         f"Night queue: {night_queue}",
         f"life events: {len(life_events)} ({life_unsent})",
+        hot_line,
     ]
     await _reply(message, "\n".join(lines))
 
