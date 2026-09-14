@@ -196,6 +196,7 @@ class FakeDeps:
     responder: object | None
     bot_user_id: int
     bot_username: str
+    sticker_catalog_enabled: int = 0
 
 
 # --- вспомогательные конструкторы -------------------------------------------------

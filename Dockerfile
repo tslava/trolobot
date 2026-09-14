@@ -30,7 +30,7 @@ WORKDIR /app
 COPY --from=builder --chown=bot:bot /app/.venv /app/.venv
 COPY --chown=bot:bot pyproject.toml uv.lock ./
 COPY --chown=bot:bot src ./src
-COPY --chown=bot:bot config.yaml few_shot.yaml places_manual.yaml ./
+COPY --chown=bot:bot config.yaml few_shot.yaml places_manual.yaml stickers.yaml ./
 COPY --chown=bot:bot prompts ./prompts
 
 # /app/data — точка монтирования bind-volume из docker-compose.yml (см. README:

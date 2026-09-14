@@ -1,6 +1,7 @@
 """Responder — оркестратор генерации и отправки (PLAN.md, этап 3).
 
-Единственный модуль, который зовёт ``bot.send_message``/``bot.send_chat_action``.
+Единственный модуль, который зовёт ``bot.send_message``/``bot.send_sticker``/
+``bot.send_chat_action``.
 Всё остальное (гейт, БД, LLM, промпт, фильтр) уже готово — этот модуль их склеивает:
 
 - дебаунс входящих PASS (один ``asyncio.Task`` на чат, таймер сбрасывается каждым
@@ -11,7 +12,7 @@
 - утренний джоб и джоб «просто так».
 
 ``Bot`` из aiogram инжектируется как объект, реализующий ``_BotLike`` — узкий
-протокол с ``send_message``/``send_chat_action`` — чтобы тесты этого модуля не
+протокол с ``send_message``/``send_sticker``/``send_chat_action`` — чтобы тесты этого модуля не
 тянули aiogram и подделывали бота простым классом. По той же причине ``clock``
 и ``sleep`` инжектируются (по умолчанию — реальные время и ``asyncio.sleep``):
 тесты подменяют их на управляемые фейки и не ждут реальных секунд.
@@ -68,6 +69,7 @@ from trolobot.prompt import (
     render_context,
     situation_addressed,
 )
+from trolobot.stickers import Sticker, StickerChooser, recent_sticker_ids, sticker_allowed
 from trolobot.timeutil import day_key, in_window, local_date, parse_hhmm, seconds_until, week_key
 
 logger = logging.getLogger(__name__)
@@ -129,6 +131,20 @@ _FILTER_RECENT_REPLIES_LIMIT = 50
 # каждый PASS в чате без модели заспамит лог.
 _NO_MODEL_WARN_INTERVAL_SEC = 600
 
+# Стикер имеет смысл предлагать только на прямое обращение или ambient — morning и
+# spontaneous реагируют "в пустоту", там стикер выглядел бы неуместно (CLAUDE.md,
+# "Интерфейсы: стикеры"), поэтому в этот набор не входят.
+_STICKER_ELIGIBLE_TRIGGER_VALUES = (*_ADDRESS_TRIGGER_VALUES, Trigger.AMBIENT.value)
+
+# "replies_since_sticker" ещё никогда не выставлялся (стикер в этом чате ни разу не
+# отправлялся) — считаем, что реплик "после последнего стикера" было предостаточно,
+# min_replies_between не может это заблокировать.
+_NO_STICKER_YET_REPLIES_SINCE = 10**9
+
+# Пауза перед отправкой стикера — короткая и фиксированная, а не по длине надписи
+# (у стикера нет "длины текста ответа", это не то же самое, что typing перед текстом).
+_STICKER_TYPING_RANGE_SEC = (2.0, 3.0)
+
 
 def _unique_participant_names(context_rows: list[MessageRow]) -> list[str]:
     """Уникальные display_name не-ботов из context_rows, в порядке первого появления."""
@@ -152,6 +168,10 @@ class _BotLike(Protocol):
 
     async def send_message(
         self, chat_id: int, text: str, *, reply_to_message_id: int | None = None
+    ) -> _SentMessageLike: ...
+
+    async def send_sticker(
+        self, chat_id: int, sticker: str, *, reply_to_message_id: int | None = None
     ) -> _SentMessageLike: ...
 
     async def send_chat_action(self, chat_id: int, action: str) -> object: ...
@@ -194,6 +214,7 @@ class Responder:
         cfg_getter: Callable[[], Config],
         llm: LLMClient,
         judge: Judge | None = None,
+        sticker_chooser: StickerChooser | None = None,
         patterns_getter: Callable[[], Patterns],
         prompt_store: _PromptStoreLike,
         rng: random.Random,
@@ -207,6 +228,7 @@ class Responder:
         self.cfg_getter = cfg_getter
         self.llm = llm
         self.judge = judge
+        self.sticker_chooser = sticker_chooser
         self.patterns_getter = patterns_getter
         self.prompt_store = prompt_store
         self.rng = rng
@@ -867,24 +889,54 @@ class Responder:
             if after_count > 0 or delay_sec > cfg.behaviour.reply_as_reply_after_sec:
                 reply_to_message_id = trigger_msg_id
 
-        await self._run_typing(reply.text)
-
-        sent = await self.bot.send_message(
-            self.chat_id, reply.text, reply_to_message_id=reply_to_message_id
+        # Второй, дешёвый вызов LLM: готовый (прошедший фильтр) текст может быть
+        # заменён стикером из каталога — основная модель про стикеры не знает
+        # вообще (CLAUDE.md, "Интерфейсы: стикеры"). None -> отправляем текст,
+        # как раньше.
+        sticker = await self._maybe_choose_sticker(
+            cfg=cfg,
+            tz=tz,
+            trigger_value=trigger_value,
+            reply_text=reply.text,
+            trigger_text=trigger_text,
+            now=now,
         )
 
+        if sticker is not None:
+            await self._run_typing("…", duration=self.rng.uniform(*_STICKER_TYPING_RANGE_SEC))
+            sticker_sent = await self.bot.send_sticker(
+                self.chat_id, sticker.file_id, reply_to_message_id=reply_to_message_id
+            )
+            sent_message_id = sticker_sent.message_id
+            # Номер стикера в тексте (CLAUDE.md) — так он попадает в recent_replies/
+            # контекст модели, в /last, и по нему recent_sticker_ids восстанавливает
+            # "недавно использованные" при следующем выборе.
+            sent_text = f"[стикер #{sticker.id}] {sticker.text}"
+            send_reason = "send:sticker"
+        else:
+            await self._run_typing(reply.text)
+            text_sent = await self.bot.send_message(
+                self.chat_id, reply.text, reply_to_message_id=reply_to_message_id
+            )
+            sent_message_id = text_sent.message_id
+            sent_text = reply.text
+            send_reason = f"send:{record_trigger}"
+
         await self.db.insert_bot_reply(
-            tg_message_id=sent.message_id,
+            tg_message_id=sent_message_id,
             reply_to_tg_message_id=reply_to_message_id,
             trigger=record_trigger,
             trigger_tg_message_id=trigger_msg_id,
-            text=reply.text,
+            text=sent_text,
             prompt_version=self.prompt_store.prompt_version(),
             few_shot_version=self.prompt_store.few_shot_version(),
             delay_sec=delay_sec,
             created_at=now,
         )
 
+        # Счётчики бюджета обращений/ambient/spontaneous — общий хвост, один и тот
+        # же независимо от того, ушёл текст или стикер (различаются только способ
+        # отправки и то, что легло в bot_replies.text выше).
         if is_address:
             await self.db.increment_state(day_key("mention_count", now, tz))
             await self.db.set_state("last_mention_reply_at", str(now))
@@ -899,19 +951,70 @@ class Responder:
             await self.db.increment_state(week_key("spontaneous_count", now, tz))
         # morning: счётчики не меняются — не входит в бюджет обращений.
 
+        if sticker is not None:
+            await self.db.increment_state(day_key("sticker_count", now, tz))
+            await self.db.set_state("replies_since_sticker", "0")
+        else:
+            await self.db.increment_state("replies_since_sticker")
+
         await self.db.insert_filter_log(
             trigger_tg_message_id=trigger_msg_id,
             candidate_text=reply.text,
             verdict="pass",
             stage="send",
-            reason=f"send:{record_trigger}",
+            reason=send_reason,
             shadow=False,
             created_at=now,
         )
         await self._finish_pending(pending_id, now)
 
-    async def _run_typing(self, text: str) -> None:
-        duration = len(text) / _CHARS_PER_SEC
+    async def _maybe_choose_sticker(
+        self,
+        *,
+        cfg: Config,
+        tz: str,
+        trigger_value: str,
+        reply_text: str,
+        trigger_text: str,
+        now: int,
+    ) -> Sticker | None:
+        """None без единого похода в БД/сеть, если чузера нет или триггер не
+        подходит (morning/spontaneous — "не вклиниваться со стикером туда, где и
+        текст сам по себе необязателен"). Иначе — проверка бюджета
+        (``sticker_allowed``, до вызова чузера: "min_replies_between не выдержан
+        -> чузер не вызывается вовсе", CLAUDE.md) и, если он не заблокирован,
+        сам выбор."""
+        if self.sticker_chooser is None:
+            return None
+        if trigger_value not in _STICKER_ELIGIBLE_TRIGGER_VALUES:
+            return None
+
+        stickers_cfg = cfg.behaviour.stickers
+        replies_since_raw = await self.db.get_state("replies_since_sticker")
+        replies_since = (
+            int(replies_since_raw)
+            if replies_since_raw is not None
+            else _NO_STICKER_YET_REPLIES_SINCE
+        )
+        count_today_raw = await self.db.get_state(day_key("sticker_count", now, tz))
+        count_today = int(count_today_raw) if count_today_raw is not None else 0
+        if not sticker_allowed(
+            cfg=stickers_cfg, replies_since=replies_since, count_today=count_today
+        ):
+            return None
+
+        recent_texts = await self.db.recent_bot_replies(stickers_cfg.recent_window * 3)
+        exclude_ids = recent_sticker_ids(recent_texts, stickers_cfg.recent_window)
+        return await self.sticker_chooser.choose(
+            reply_text=reply_text, trigger_text=trigger_text, exclude_ids=exclude_ids, now=now
+        )
+
+    async def _run_typing(self, text: str, *, duration: float | None = None) -> None:
+        """typing-цикл на ``duration`` секунд. По умолчанию (``None``) — по длине
+        ``text`` (обычный текстовый ответ); явный ``duration`` — короткая пауза
+        перед стикером, у которого "длины ответа" не существует."""
+        if duration is None:
+            duration = len(text) / _CHARS_PER_SEC
         elapsed = 0.0
         while elapsed < duration:
             await self.bot.send_chat_action(self.chat_id, _TYPING_ACTION)
