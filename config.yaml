@@ -41,7 +41,7 @@ behaviour:
   stickers:
     enabled: true
     min_replies_between: 4             # сколько текстовых реплик должно пройти после стикера
-    daily_cap: 5
+    daily_cap: 1                       # не больше одного стикера в день (решение владельца)
     recent_window: 10                  # столько последних использованных стикеров не повторять
     model: ""                          # пусто -> llm.judge_model (та же дешёвая модель, что судья)
     max_tokens: 60

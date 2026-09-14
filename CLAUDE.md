@@ -713,7 +713,7 @@ async def react(bot: ReactionBotLike, db: Database, *, chat_id: int, tg_message_
 class StickersConfig(BaseModel):
     enabled: bool = True
     min_replies_between: int = Field(default=4, ge=0, le=50)  # текстовых реплик после стикера
-    daily_cap: int = Field(default=5, ge=0, le=50)
+    daily_cap: int = Field(default=1, ge=0, le=50)
     recent_window: int = Field(default=10, ge=0, le=50)       # столько последних не повторять
     model: str = ""                                            # пусто -> cfg.llm.judge_model
     max_tokens: int = Field(default=60, ge=10, le=300)

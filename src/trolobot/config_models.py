@@ -119,7 +119,7 @@ class StickersConfig(BaseModel):
     enabled: bool = True
     # Сколько текстовых реплик должно пройти после стикера, прежде чем следующий разрешён.
     min_replies_between: int = Field(default=4, ge=0, le=50)
-    daily_cap: int = Field(default=5, ge=0, le=50)
+    daily_cap: int = Field(default=1, ge=0, le=50)
     # Столько последних использованных стикеров (по id) не повторять.
     recent_window: int = Field(default=10, ge=0, le=50)
     model: str = ""
