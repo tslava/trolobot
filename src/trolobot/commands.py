@@ -398,6 +398,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     reactions = int(await deps.db.get_state(day_key("reaction_count", now, tz)) or "0")
     stickers = int(await deps.db.get_state(day_key("sticker_count", now, tz)) or "0")
     followup_calls = int(await deps.db.get_state(day_key("followup_calls", now, tz)) or "0")
+    vision_count = int(await deps.db.get_state(day_key("vision_count", now, tz)) or "0")
 
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
@@ -448,6 +449,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"life events: {len(life_events)} ({life_unsent})",
         hot_line,
         f"followup calls: {followup_calls}/{cfg.behaviour.followup.daily_cap}",
+        f"vision: {vision_count}/{cfg.behaviour.vision.daily_cap}",
         checkin_line,
     ]
     await _reply(message, "\n".join(lines))

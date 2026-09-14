@@ -25,6 +25,7 @@ from trolobot.retention import retention_loop
 from trolobot.settings import Settings
 from trolobot.stickers import StickerChooser, load_catalog
 from trolobot.stores import ConfigStore, PromptStore
+from trolobot.vision import VisionDescriber
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,12 @@ async def main() -> None:
             # каждом вызове, а не один раз при старте.
             followup_prompt = settings.followup_prompt_path.read_text(encoding="utf-8")
             deps.followup = FollowupChecker(llm, config_store.get, followup_prompt)
+
+            # Зрение на фото (CLAUDE.md, "зрение на фото") — как и followup,
+            # создаётся вместе с остальными LLM-зависимыми компонентами; enabled и
+            # модель проверяются на каждом снимке, а не один раз при старте.
+            vision_prompt = settings.vision_prompt_path.read_text(encoding="utf-8")
+            deps.vision = VisionDescriber(llm, config_store.get, vision_prompt)
 
             # Каталог стикеров — офлайн-файл (CLAUDE.md, "Интерфейсы: стикеры"),
             # правится stickers_fill.py и владельцем руками. Пустой/отсутствующий

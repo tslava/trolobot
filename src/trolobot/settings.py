@@ -23,5 +23,6 @@ class Settings(BaseSettings):
     judge_prompt_path: Path = Path("prompts/judge.txt")
     sticker_prompt_path: Path = Path("prompts/sticker.txt")
     followup_prompt_path: Path = Path("prompts/followup.txt")
+    vision_prompt_path: Path = Path("prompts/vision.txt")
     stickers_path: Path = Path("stickers.yaml")
     log_level: str = "INFO"

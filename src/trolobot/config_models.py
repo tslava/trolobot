@@ -285,6 +285,53 @@ class CheckinConfig(BaseModel):
         return value
 
 
+class VisionConfig(BaseModel):
+    """Зрение на фото (CLAUDE.md, "Интерфейсы: зрение на фото"). Снимок из чата
+    описывается моделью со зрением одной-двумя фразами, и описание становится
+    текстом сообщения («[фото: ...]») — дальше гейт и генерация работают с ним как
+    с обычным текстом. Стоит денег, поэтому описывается не каждое фото: повод
+    (обращение или горячее окно), иногда кубик, и всегда под суточным потолком
+    со своим счётчиком ``vision_calls``.
+    """
+
+    enabled: bool = Field(default=True, description="Включает описание фото моделью со зрением")
+    model: str = Field(
+        default="", description="Модель со зрением для описания фото; пусто -> llm.main_model"
+    )
+    max_tokens: int = Field(
+        default=120, ge=20, le=500, description="Лимит токенов ответа модели со зрением"
+    )
+    daily_cap: int = Field(
+        default=20, ge=0, le=500, description="Потолок описаний фото в сутки, свой счётчик"
+    )
+    ambient_probability: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Шанс описать фото, присланное без повода (не обращение, не окно)",
+    )
+    max_width: int = Field(
+        default=1024,
+        ge=256,
+        le=4096,
+        description="Берётся самый большой размер фото не шире этого, пикселей",
+    )
+    max_chars: int = Field(
+        default=200, ge=40, le=500, description="Потолок длины описания фото, символов"
+    )
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
+
+
 class BehaviourConfig(BaseModel):
     quiet_window: tuple[str, str] = Field(
         default=("02:00", "07:00"), description="Окно полной тишины, включая прямые обращения"
@@ -328,6 +375,10 @@ class BehaviourConfig(BaseModel):
     checkin: CheckinConfig = Field(
         default_factory=CheckinConfig,
         description="Периодическая проверка «вернулся» после закрытия горячего окна",
+    )
+    vision: VisionConfig = Field(
+        default_factory=VisionConfig,
+        description="Описание фото моделью со зрением вместо плейсхолдера «[фото]»",
     )
 
     # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает

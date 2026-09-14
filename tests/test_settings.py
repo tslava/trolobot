@@ -27,6 +27,7 @@ def test_settings_from_env_minimal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.config_path == Path("config.yaml")
     assert settings.few_shot_path == Path("few_shot.yaml")
     assert settings.prompt_path == Path("prompts/system.txt")
+    assert settings.vision_prompt_path == Path("prompts/vision.txt")
     assert settings.log_level == "INFO"
 
 

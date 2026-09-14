@@ -1580,6 +1580,36 @@ async def test_status_shows_followup_calls_today_count(
     assert f"followup calls: 7/{cap}" in sent[0]
 
 
+async def test_status_shows_vision_zero_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.vision.daily_cap
+    assert f"vision: 0/{cap}" in sent[0]
+
+
+async def test_status_shows_vision_today_count(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    db.state[day_key("vision_count", now, config.persona.timezone)] = "4"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.vision.daily_cap
+    assert f"vision: 4/{cap}" in sent[0]
+
+
 async def test_status_shows_checkin_none_by_default(
     monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
 ) -> None:

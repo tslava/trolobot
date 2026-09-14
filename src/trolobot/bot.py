@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import BinaryIO, Protocol
 
 from aiogram import Router
+from aiogram.exceptions import AiogramError
 from aiogram.types import Message
 
 from trolobot.config_models import Config
@@ -34,6 +36,14 @@ from trolobot.responder import Responder
 from trolobot.sanitize import media_placeholder, normalize_text, sanitize_display_name, stable_n
 from trolobot.settings import Settings
 from trolobot.stores import ConfigStore, PromptStore
+from trolobot.timeutil import day_key
+from trolobot.vision import (
+    PhotoSizeLike,
+    VisionDescriber,
+    photo_text,
+    pick_photo_size,
+    should_describe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +58,21 @@ _LOG_TEXT_MAX_LEN = 200
 FOLLOWUP_REASONS: frozenset[str] = frozenset(
     {"gate:dice", "gate:not_live", "gate:ambient_cap", "gate:ambient_cooldown", "gate:hot_cap"}
 )
+
+
+class BotLike(ReactionBotLike, Protocol):
+    """Узкий протокол вместо ``aiogram.Bot`` для всего, что хендлер делает с ботом:
+    реакции (``set_message_reaction``, унаследован от ``ReactionBotLike``) и скачивание
+    фото для зрения (``download``). Тесты подделывают его без aiogram.
+
+    Сигнатура ``download`` — подмножество ``aiogram.Bot.download``
+    (``file: str | Downloadable``, ``destination: BinaryIO | Path | str | None``,
+    плюс ``timeout``/``chunk_size``/``seek`` со значениями по умолчанию): протоколу
+    достаточно того, что нужно здесь (file_id строкой, ответ в память), а настоящий
+    ``Bot`` принимает больше и потому структурно подходит.
+    """
+
+    async def download(self, file: str, destination: BinaryIO | None = None) -> BinaryIO | None: ...
 
 
 @dataclass(slots=True)
@@ -79,10 +104,14 @@ class Deps:
     # (CLAUDE.md, "внимание как у живого человека"). None — LLM не настроен, PASS
     # по FOLLOWUP_REASONS не проверяется вовсе, поведение как без followup.
     followup: FollowupChecker | None = None
-    # Узкий протокол (set_message_reaction) вместо aiogram.Bot — только для реакций
-    # (reactions.py). None в discovery/тестах без реального бота — тогда реакция
-    # просто не ставится, сообщение всё равно пишется и гейтится как обычно.
-    bot: ReactionBotLike | None = None
+    # Узкий протокол (set_message_reaction + download) вместо aiogram.Bot — для
+    # реакций (reactions.py) и для скачивания фото зрением (vision.py). None в
+    # discovery/тестах без реального бота — тогда реакция просто не ставится, фото
+    # не описывается, а сообщение всё равно пишется и гейтится как обычно.
+    bot: BotLike | None = None
+    # Описание фото моделью со зрением (CLAUDE.md, "зрение на фото"). None — LLM не
+    # настроен, фото остаётся плейсхолдером "[фото]", как до этой фичи.
+    vision: VisionDescriber | None = None
     # Сколько enabled-стикеров в каталоге (stickers.yaml) — считается один раз в
     # app.py при старте, только для /status ("(N в каталоге)"). Каталог не меняется
     # на горячую (в отличие от config_overrides), поэтому фиксированное число, а не
@@ -92,6 +121,111 @@ class Deps:
     # не спамить лог на каждое следующее сообщение того же участника.
     warned_user_ids: set[int] = field(default_factory=set)
     clock: Callable[[], int] = field(default_factory=lambda: lambda: int(time.time()))
+
+
+def _int_state(raw: str | None) -> int | None:
+    """int(raw) с дефолтом None; мусор в значении -> WARNING, не падать."""
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("bot: garbage value %r in state, using default", raw)
+        return None
+
+
+async def _describe_photo(
+    deps: Deps,
+    describer: VisionDescriber,
+    bot: BotLike,
+    *,
+    sizes: Sequence[PhotoSizeLike],
+    caption: str,
+    reply_to_bot: bool,
+    tg_message_id: int,
+    now: int,
+) -> str:
+    """Текст, который ляжет в ``messages.text`` вместо фото (CLAUDE.md, "зрение на фото").
+
+    Зовётся ДО ``insert_message``, чтобы описание попало и в БД, и в контекст, и в
+    гейт — дальше фото ничем не отличается от обычного текста. Любой отказ (кубик,
+    потолок, ошибка скачивания, ошибка модели) заканчивается привычным «[фото]»:
+    фото не должно ломать обработку сообщения.
+    """
+    cfg = deps.config_getter()
+    vision_cfg = cfg.behaviour.vision
+    patterns = deps.patterns_getter()
+
+    addressed = (
+        reply_to_bot or patterns.mentions_bot(caption) or patterns.name_trigger(caption) is not None
+    )
+    hot_until = _int_state(await deps.db.get_state("hot_until"))
+    hot = hot_until is not None and hot_until > now
+
+    count_key = day_key("vision_count", now, cfg.persona.timezone)
+    count_today = _int_state(await deps.db.get_state(count_key)) or 0
+
+    if not should_describe(
+        addressed=addressed, hot=hot, count_today=count_today, cfg=vision_cfg, rng=deps.rng
+    ):
+        await deps.db.insert_filter_log(
+            trigger_tg_message_id=tg_message_id,
+            candidate_text=None,
+            verdict="cut",
+            stage="vision",
+            reason="vision:skipped",
+            shadow=False,
+            created_at=now,
+        )
+        return photo_text(None, caption)
+
+    description: str | None = None
+    size = pick_photo_size(sizes, vision_cfg.max_width)
+    if size is not None:
+        image: bytes | None = None
+        try:
+            downloaded = await bot.download(size.file_id)
+            if downloaded is None:
+                logger.warning("vision: bot.download вернул пусто для сообщения %s", tg_message_id)
+            else:
+                image = downloaded.read()
+        except (AiogramError, OSError) as exc:
+            # Фото удалено, файл слишком большой, сеть отвалилась — не повод ронять
+            # хендлер: сообщение всё равно запишется как "[фото]".
+            logger.warning("vision: не удалось скачать фото сообщения %s: %s", tg_message_id, exc)
+        if image is not None:
+            # mime фиксирован: телеграм отдаёт превью message.photo всегда как JPEG.
+            description = await describer.describe(
+                image, mime="image/jpeg", caption=caption, now=now
+            )
+
+    if description is None:
+        await deps.db.insert_filter_log(
+            trigger_tg_message_id=tg_message_id,
+            candidate_text=None,
+            verdict="cut",
+            stage="vision",
+            reason="vision:failed",
+            shadow=False,
+            created_at=now,
+        )
+        return photo_text(None, caption)
+
+    # Счётчик /status (статистика описаний). Потолок вызовов держит LLMClient по
+    # своему счётчику vision_calls — неудачная попытка тратит его, но не эту
+    # статистику, небольшое расхождение допустимо и заложено контрактом.
+    await deps.db.increment_state(count_key)
+    await deps.db.insert_filter_log(
+        trigger_tg_message_id=tg_message_id,
+        candidate_text=description,
+        verdict="pass",
+        stage="vision",
+        reason="vision:described",
+        shadow=False,
+        created_at=now,
+    )
+    logger.info("vision: %s", description)
+    return photo_text(description, caption)
 
 
 def build_router(deps: Deps) -> Router:
@@ -156,18 +290,42 @@ def build_router(deps: Deps) -> Router:
                 )
             display_name = f"Участник {stable_n(user_id)}"
 
+        reply_to_tg_message_id = (
+            message.reply_to_message.message_id if message.reply_to_message is not None else None
+        )
+        reply_to_bot = (
+            message.reply_to_message is not None
+            and message.reply_to_message.from_user is not None
+            and message.reply_to_message.from_user.id == deps.bot_user_id
+        )
+        created_at = int(message.date.timestamp())
+
         text = normalize_text(message.text or message.caption)
+        photo_sizes = list(message.photo or ())
+        if (
+            photo_sizes
+            and deps.vision is not None
+            and deps.bot is not None
+            and deps.config_getter().behaviour.vision.enabled
+        ):
+            # Зрение (CLAUDE.md, "зрение на фото"): описание заменяет плейсхолдер и
+            # уходит в БД вместе с подписью — строго до insert_message.
+            text = await _describe_photo(
+                deps,
+                deps.vision,
+                deps.bot,
+                sizes=photo_sizes,
+                caption=text,
+                reply_to_bot=reply_to_bot,
+                tg_message_id=message.message_id,
+                now=created_at,
+            )
         if not text:
             text = media_placeholder(message) or ""
         if not text:
             # Сервисное сообщение без текста и без медиа (вошёл/вышел и т.п.) — не пишем.
             return
 
-        reply_to_tg_message_id = (
-            message.reply_to_message.message_id if message.reply_to_message is not None else None
-        )
-
-        created_at = int(message.date.timestamp())
         await deps.db.insert_message(
             tg_message_id=message.message_id,
             chat_id=message.chat.id,
@@ -180,11 +338,6 @@ def build_router(deps: Deps) -> Router:
         )
         logger.info("%s: %s", display_name, text[:_LOG_TEXT_MAX_LEN])
 
-        reply_to_bot = (
-            message.reply_to_message is not None
-            and message.reply_to_message.from_user is not None
-            and message.reply_to_message.from_user.id == deps.bot_user_id
-        )
         gate_message = GateMessage(
             chat_id=message.chat.id,
             tg_message_id=message.message_id,
