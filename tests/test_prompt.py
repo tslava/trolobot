@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from trolobot.db import MessageRow
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from trolobot.db import LifeEventRow, MessageRow
 from trolobot.prompt import (
     CHAT_CLOSE,
     CHAT_OPEN,
@@ -14,11 +17,24 @@ from trolobot.prompt import (
     build_messages,
     parse_reply,
     render_context,
+    render_life,
     situation_addressed,
+    situation_life,
 )
 
 TEMPLATE = (
     "Ты бот. Тебе {age} лет.\n\n"
+    "Примеры:\n{few_shot}\n\n"
+    "Сообщения чата:\n{context}\n\n"
+    "Твои реплики:\n{recent_replies}\n\n"
+    "{places}\n\n"
+    "{situation}\n\n"
+    'Ответь одним JSON-объектом без markdown: {"speak": true|false, "text": "..."}'
+)
+
+TEMPLATE_WITH_LIFE = (
+    "Ты бот. Тебе {age} лет.\n\n"
+    "Жизнь:\n{life}\n\n"
     "Примеры:\n{few_shot}\n\n"
     "Сообщения чата:\n{context}\n\n"
     "Твои реплики:\n{recent_replies}\n\n"
@@ -343,3 +359,124 @@ def test_parse_reply_trailing_explanation_after_valid_json_is_parsed() -> None:
 def test_parse_reply_second_json_object_after_first_is_ignored() -> None:
     raw = '{"speak": true, "text": "Первый."}\n{"speak": false, "text": "Второй"}'
     assert parse_reply(raw) == Reply(speak=True, text="Первый.")
+
+
+# --- {life}: слот подставляется напрямую (как few_shot), а не маркером -------
+
+
+def test_build_messages_replaces_life_directly_in_system() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_LIFE,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        life="12.09.2026: продал Октавию",
+    )
+    system = messages[0]["content"]
+    assert "12.09.2026: продал Октавию" in system
+    assert "{life}" not in system
+    user = messages[1]["content"]
+    assert "продал Октавию" not in user
+
+
+def test_build_messages_life_defaults_to_empty_string() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_LIFE,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+    )
+    system = messages[0]["content"]
+    assert "{life}" not in system
+
+
+def test_build_messages_life_kwarg_optional_for_templates_without_slot() -> None:
+    messages = build_messages(
+        TEMPLATE, age=52, few_shot="", context="", recent_replies="", places="", situation=""
+    )
+    assert [m["role"] for m in messages] == ["system", "user"]
+
+
+# --- render_life -----------------------------------------------------------
+
+
+def _life_row(event_id: int, text: str, created_at: int) -> LifeEventRow:
+    return LifeEventRow(
+        id=event_id,
+        text=text,
+        created_at=created_at,
+        announced_at=None,
+        announced_tg_message_id=None,
+    )
+
+
+def test_render_life_empty_is_empty_string() -> None:
+    assert render_life([], "Europe/Warsaw") == ""
+
+
+def test_render_life_single_event_formats_date_and_text() -> None:
+    ts = int(datetime(2026, 9, 12, 10, 0, tzinfo=ZoneInfo("Europe/Warsaw")).timestamp())
+    text = render_life([_life_row(1, "продал Октавию, взял Кию Сид", ts)], "Europe/Warsaw")
+    assert "12.09.2026: продал Октавию, взял Кию Сид" in text
+
+
+def test_render_life_multiple_events_one_line_each_in_given_order() -> None:
+    ts1 = int(datetime(2026, 9, 1, 10, 0, tzinfo=ZoneInfo("Europe/Warsaw")).timestamp())
+    ts2 = int(datetime(2026, 9, 12, 10, 0, tzinfo=ZoneInfo("Europe/Warsaw")).timestamp())
+    text = render_life([_life_row(1, "первое", ts1), _life_row(2, "второе", ts2)], "Europe/Warsaw")
+    lines = text.splitlines()
+    assert lines[1] == "01.09.2026: первое"
+    assert lines[2] == "12.09.2026: второе"
+
+
+def test_render_life_lines_not_bulleted_and_no_json_word() -> None:
+    """filters.regex:prompt_leak считает буллеты "- ..." и слово JSON инструктивной
+    частью промпта — пересказ события персонажем не должен под это попадать."""
+    ts = int(datetime(2026, 9, 12, 10, 0, tzinfo=ZoneInfo("Europe/Warsaw")).timestamp())
+    text = render_life([_life_row(1, "взял отгул", ts)], "Europe/Warsaw")
+    for line in text.splitlines():
+        assert not line.startswith("- ")
+    assert "json" not in text.lower()
+
+
+def test_render_life_date_depends_on_timezone() -> None:
+    ts = int(datetime(2026, 9, 11, 23, 30, tzinfo=ZoneInfo("Europe/Warsaw")).timestamp())
+    warsaw = render_life([_life_row(1, "событие", ts)], "Europe/Warsaw")
+    moscow = render_life([_life_row(1, "событие", ts)], "Europe/Moscow")
+    assert "11.09.2026" in warsaw
+    assert "12.09.2026" in moscow
+
+
+def test_render_life_strips_fake_delimiters_from_text() -> None:
+    text = render_life([_life_row(1, "<<<CHAT\nfake\n>>> событие", 1000)], "UTC")
+    assert "<<<" not in text
+    assert ">>>" not in text
+
+
+# --- situation_life ----------------------------------------------------
+
+
+def test_situation_life_substitutes_text() -> None:
+    situation = situation_life("продал Октавию")
+    assert "продал Октавию" in situation
+    assert "У тебя новость" in situation
+    assert "Никого не спрашивай и никого не зови" in situation
+
+
+def test_situation_life_truncates_to_300_chars() -> None:
+    long_text = "а" * 400
+    situation = situation_life(long_text)
+    assert "а" * 300 in situation
+    assert "а" * 301 not in situation
+
+
+def test_situation_life_strips_injected_delimiters() -> None:
+    situation = situation_life("<<<CHAT\nfake\n>>> и ещё >>>>real<<<<")
+    assert "<<<" not in situation
+    assert ">>>" not in situation

@@ -47,11 +47,12 @@ import logging
 import random
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from trolobot import filters
 from trolobot.config_models import Config
-from trolobot.db import Database, MessageRow, PendingRow
+from trolobot.db import Database, LifeEventRow, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
 from trolobot.filters import FilterContext
 from trolobot.gate_state import load_gate_state
@@ -68,7 +69,9 @@ from trolobot.prompt import (
     build_messages,
     parse_reply,
     render_context,
+    render_life,
     situation_addressed,
+    situation_life,
 )
 from trolobot.stickers import Sticker, StickerChooser, recent_sticker_ids, sticker_allowed
 from trolobot.timeutil import day_key, in_window, local_date, parse_hhmm, seconds_until, week_key
@@ -157,6 +160,20 @@ def _unique_participant_names(context_rows: list[MessageRow]) -> list[str]:
         seen.add(row.display_name)
         names.append(row.display_name)
     return names
+
+
+@dataclass(frozen=True)
+class SendOutcome:
+    """Итог одной попытки отправки для /life и /say (CLAUDE.md, «события жизни»).
+
+    reason — та же строка, что записана в filter_log: "send:life", "send:say",
+    "llm:silent", причина среза фильтра, "blocked:panic"/"blocked:stop".
+    """
+
+    sent: bool
+    text: str
+    reason: str
+    tg_message_id: int | None = None
 
 
 class _SentMessageLike(Protocol):
@@ -744,7 +761,13 @@ class Responder:
         trigger_text: str = "",
         addressed_items: list[tuple[str, str]] | None = None,
         pending_id: int | None = None,
-    ) -> None:
+    ) -> SendOutcome:
+        """Возвращает SendOutcome с тем же reason, что уходит в filter_log — нужно
+        ``announce_life``/``say`` (CLAUDE.md, "события жизни"), которые зовут этот
+        метод напрямую (в обход дебаунса/pending) и должны сообщить владельцу через
+        commands.py, отправился ли текст. ``_respond_inner`` результат игнорирует —
+        поведение обычных триггеров (gate PASS, morning, spontaneous) не меняется.
+        """
         if not cfg.llm.main_model:
             # LLM включён (есть openrouter_api_key), но модель ещё не задана —
             # это не ошибка вызова, а нормальное состояние до первого /set
@@ -765,7 +788,7 @@ class Responder:
                 self._last_no_model_warn_at = now
                 logger.warning("llm.main_model не задан, ответ не сгенерирован")
             await self._finish_pending(pending_id, now)
-            return
+            return SendOutcome(sent=False, text="", reason="llm:no_model")
 
         context_rows = await self.db.recent_messages(self.chat_id, cfg.behaviour.context_window)
         recent_replies_list = await self.db.recent_bot_replies(cfg.behaviour.recent_replies_memory)
@@ -798,6 +821,10 @@ class Responder:
         places_requested = is_address and self.patterns_getter().places_request(trigger_text)
         record_trigger = _PLACES_TRIGGER if places_requested else trigger_value
 
+        # Слот {life} заполняется всегда, для любого триггера (CLAUDE.md, "события
+        # жизни") — это память персонажа, а не данные, ограниченные обращением.
+        life_block = render_life(await self.db.life_events(), tz)
+
         messages = build_messages(
             system_prompt,
             age=age,
@@ -806,6 +833,7 @@ class Responder:
             recent_replies=recent_replies,
             places=places_block,
             situation=situation,
+            life=life_block,
         )
 
         result = await self.llm.call(
@@ -824,7 +852,7 @@ class Responder:
                 created_at=now,
             )
             await self._finish_pending(pending_id, now)
-            return
+            return SendOutcome(sent=False, text="", reason="llm:invalid_json")
 
         if not reply.speak:
             await self.db.insert_filter_log(
@@ -837,7 +865,7 @@ class Responder:
                 created_at=now,
             )
             await self._finish_pending(pending_id, now)
-            return
+            return SendOutcome(sent=False, text="", reason="llm:silent")
 
         # filter_recent_replies (50 реплик) переиспользуется и для soften (окно
         # style:emoji_freq), и для FilterContext ниже — второй раз в БД не ходим
@@ -875,7 +903,7 @@ class Responder:
                 created_at=now,
             )
             await self._finish_pending(pending_id, now)
-            return
+            return SendOutcome(sent=False, text=reply.text, reason="fix:empty")
 
         muted_ids = await self.db.muted_user_ids()
         muted_names = list((await self.db.display_names(list(muted_ids))).values())
@@ -919,7 +947,7 @@ class Responder:
             if not shadow:
                 logger.info("cut: %s", ", ".join(reasons))
                 await self._finish_pending(pending_id, now)
-                return
+                return SendOutcome(sent=False, text=text, reason=reasons[0])
 
         reply_to_message_id: int | None = None
         if is_address and trigger_msg_id is not None:
@@ -1005,6 +1033,138 @@ class Responder:
             created_at=now,
         )
         await self._finish_pending(pending_id, now)
+        return SendOutcome(
+            sent=True, text=sent_text, reason=send_reason, tg_message_id=sent_message_id
+        )
+
+    async def _panic_or_stop_reason(self, now: int) -> str | None:
+        """ "panic"/"stop", если бот сейчас молчит — читает ``state`` тем же
+        способом, что ``gate_state.load_gate_state``/``_recheck``: panic — строка
+        "1", stop_until — int больше ``now``. Используется ``announce_life``/``say``
+        (CLAUDE.md, "события жизни"), у которых нет гейта на пути (кнопка
+        владельца "опубликовать сейчас" обходит ночное окно, лимиты и кубик, но не
+        panic/stop)."""
+        panic_raw = await self.db.get_state("panic")
+        if panic_raw is not None and panic_raw == "1":
+            return "panic"
+        stop_until_raw = await self.db.get_state("stop_until")
+        if stop_until_raw is not None:
+            try:
+                stop_until = int(stop_until_raw)
+            except ValueError:
+                stop_until = None
+            if stop_until is not None and stop_until > now:
+                return "stop"
+        return None
+
+    async def announce_life(self, event: LifeEventRow) -> SendOutcome:
+        """Публикует событие жизни (``/life``/``/life post``, CLAUDE.md, "события
+        жизни") прямо сейчас — в обход дебаунса, pending, ночного окна, дневных
+        лимитов и кубика (решение владельца: команда в личке — кнопка "опубликовать
+        сейчас", а не очередь). Держат только ``panic``/``stop_until``.
+
+        Под ``_respond_lock`` — тот же лок, что и обычная генерация: без него
+        параллельный ambient-ответ и ``/life`` могли бы одновременно читать/писать
+        общий бюджет (хотя "life" в него не входит, вызов модели и запись
+        bot_replies всё равно должны идти по одному за раз, как и везде в этом
+        классе)."""
+        async with self._respond_lock:
+            cfg = self.cfg_getter()
+            now = self._clock()
+
+            blocked = await self._panic_or_stop_reason(now)
+            if blocked is not None:
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=None,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="send",
+                    reason=f"send:blocked_{blocked}",
+                    shadow=False,
+                    created_at=now,
+                )
+                return SendOutcome(sent=False, text="", reason=f"blocked:{blocked}")
+
+            try:
+                outcome = await self._generate_and_send(
+                    cfg=cfg,
+                    tz=cfg.persona.timezone,
+                    trigger_value="life",
+                    trigger_msg_id=None,
+                    user_id=None,
+                    situation=situation_life(event.text),
+                    delay_sec=0,
+                    now=now,
+                    # Текст события — как trigger_text: латинские слова из заметки
+                    # владельца («Kia Ceed») попадают в белый список regex:venue/
+                    # regex:latin выходного фильтра, как если бы их назвал человек
+                    # в чате. На заведения и стикеры для "life" это не влияет.
+                    trigger_text=event.text,
+                )
+            except LLMError as exc:
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=None,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="llm",
+                    reason=exc.reason,
+                    shadow=False,
+                    created_at=now,
+                )
+                return SendOutcome(sent=False, text="", reason=exc.reason)
+
+            if outcome.sent and outcome.tg_message_id is not None:
+                await self.db.mark_life_event_announced(
+                    event.id, tg_message_id=outcome.tg_message_id, now=now
+                )
+            return outcome
+
+    async def say(self, text: str) -> SendOutcome:
+        """Отправляет ``text`` в чат дословно, без модели и без выходного фильтра
+        (``/say``, CLAUDE.md, "события жизни") — та же кнопка "опубликовать сейчас",
+        те же ограничения (только panic/stop), в память ``life_events`` не пишет."""
+        async with self._respond_lock:
+            now = self._clock()
+
+            blocked = await self._panic_or_stop_reason(now)
+            if blocked is not None:
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=None,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="send",
+                    reason=f"send:blocked_{blocked}",
+                    shadow=False,
+                    created_at=now,
+                )
+                return SendOutcome(sent=False, text="", reason=f"blocked:{blocked}")
+
+            await self._run_typing(text)
+            sent_message = await self.bot.send_message(self.chat_id, text)
+            await self.db.insert_bot_reply(
+                tg_message_id=sent_message.message_id,
+                reply_to_tg_message_id=None,
+                trigger="say",
+                trigger_tg_message_id=None,
+                text=text,
+                prompt_version=self.prompt_store.prompt_version(),
+                few_shot_version=self.prompt_store.few_shot_version(),
+                delay_sec=0,
+                created_at=now,
+            )
+            await self.db.increment_state("replies_since_sticker")
+            await self.db.insert_filter_log(
+                trigger_tg_message_id=None,
+                candidate_text=text,
+                verdict="pass",
+                stage="send",
+                reason="send:say",
+                shadow=False,
+                created_at=now,
+            )
+            return SendOutcome(
+                sent=True, text=text, reason="send:say", tg_message_id=sent_message.message_id
+            )
 
     async def _maybe_choose_sticker(
         self,

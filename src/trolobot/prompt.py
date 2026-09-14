@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
-from trolobot.db import MessageRow
+from trolobot.db import LifeEventRow, MessageRow
+from trolobot.timeutil import local_date
 
 CHAT_OPEN = "<<<CHAT"
 CHAT_CLOSE = ">>>"
@@ -48,6 +50,10 @@ SITUATION_MORNING = (
 SITUATION_SPONTANEOUS = (
     "В чате тихо. Если есть что сказать про свои дела одной фразой — скажи. "
     "Нет — промолчи. Никого не зови и ничего не спрашивай."
+)
+SITUATION_LIFE_TEMPLATE = (
+    "У тебя новость: «{text}». Расскажи о ней в чат одной-двумя фразами, "
+    "как рассказал бы приятелям. Никого не спрашивай и никого не зови."
 )
 # Одно обращение — короткая форма; несколько (накопились за схлопывание
 # дебаунс-буфера) — список с общей инструкцией: "живой тест" показал, что при
@@ -66,6 +72,12 @@ SITUATION_ADDRESSED_MULTI_FOOTER = (
 
 _ADDRESSED_TEXT_MAX_LEN = 300
 _ADDRESSED_ITEMS_MAX = 5
+
+_LIFE_TEXT_MAX_LEN = 300
+_LIFE_HEADER = (
+    "Что у тебя случилось за последнее время (это свежее и важнее того, что "
+    "написано выше; упоминай только к слову, не пересказывай список):"
+)
 
 _RECENT_REPLIES_EMPTY = "(пока не было)"
 _DATA_DISCLAIMER = (
@@ -88,7 +100,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
-_SLOT_RE = re.compile(r"\{(age|few_shot|context|recent_replies|places|situation)\}")
+_SLOT_RE = re.compile(r"\{(age|few_shot|life|context|recent_replies|places|situation)\}")
 
 
 def _strip_fake_delimiters(text: str) -> str:
@@ -140,6 +152,44 @@ def render_context(rows: list[MessageRow]) -> str:
     return "\n".join(f"{row.display_name}: {row.text}" for row in rows)
 
 
+def render_life(rows: Sequence[LifeEventRow], tz: str) -> str:
+    """Блок памяти о событиях жизни персонажа (CLAUDE.md, "события жизни").
+
+    Пусто -> "" (тогда весь абзац со слотом {life} в system.txt пропадает).
+    Иначе — заголовок и по строке на событие, дата локальная (timeutil.local_date,
+    tz), формат dd.mm.yyyy: "12.09.2026: продал Октавию, взял Кию Сид".
+
+    Строки НЕ начинаются с "- " и не содержат слова JSON: filters.regex:prompt_leak
+    считает инструктивной частью системного промпта именно строки-буллеты «- …»
+    и блок про JSON, а пересказ события персонажем утечкой не является.
+
+    Событие подставляется прямо в system (как few_shot, не как context/places) —
+    это память владельца о персонаже, а не недоверенный ввод участников чата, но
+    _strip_fake_delimiters всё равно применяется на всякий случай, чтобы поддельные
+    ``<<<``/``>>>`` внутри заметки не путали разметку user-сообщения.
+    """
+    if not rows:
+        return ""
+    lines = [_LIFE_HEADER]
+    for row in rows:
+        day = local_date(row.created_at, tz).strftime("%d.%m.%Y")
+        lines.append(f"{day}: {_strip_fake_delimiters(row.text)}")
+    return "\n".join(lines)
+
+
+def situation_life(text: str) -> str:
+    """Ситуация для announce_life: подстановка в SITUATION_LIFE_TEMPLATE.
+
+    Один слот {text} — через .replace, не re.sub/format (как в situation_addressed):
+    единственная подстановка не может спровоцировать повторную замену самой себя.
+    Текст обрезается до 300 символов и чистится от поддельных разделителей — тот
+    же приём, что и для обращений (_clean_addressed_text), но со своей константой
+    длины, потому что источник другой (заметка владельца, не сообщение участника).
+    """
+    cleaned = _strip_fake_delimiters(text).strip()[:_LIFE_TEXT_MAX_LEN]
+    return SITUATION_LIFE_TEMPLATE.replace("{text}", cleaned)
+
+
 def build_messages(
     template: str,
     *,
@@ -149,6 +199,7 @@ def build_messages(
     recent_replies: str,
     places: str,
     situation: str,
+    life: str = "",
 ) -> list[dict[str, str]]:
     """Собирает [system, user] для LLMClient.call().
 
@@ -160,11 +211,14 @@ def build_messages(
     что подставлено, повторно не трогается. Данные людей
     (context/recent_replies/places/situation) в system не попадают — только
     маркеры "см. ниже"; сами данные уходят вторым сообщением role=user,
-    context и recent_replies — внутри разделителей <<<CHAT ... >>>.
+    context и recent_replies — внутри разделителей <<<CHAT ... >>>. {life} —
+    исключение: это память владельца о персонаже (как few_shot), а не ввод
+    участников чата, поэтому подставляется в system напрямую, реальным значением.
     """
     slot_values = {
         "age": str(age),
         "few_shot": few_shot,
+        "life": life,
         "context": _CONTEXT_MARKER,
         "recent_replies": _RECENT_REPLIES_MARKER,
         "places": _PLACES_MARKER,

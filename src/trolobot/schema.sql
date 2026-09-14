@@ -115,6 +115,16 @@ CREATE TABLE few_shot_versions (
     version INTEGER PRIMARY KEY, body_yaml TEXT, note TEXT, active INTEGER, created_at INTEGER
 );
 
+-- События жизни персонажа (/life, CLAUDE.md "события жизни") — память, не
+-- переписка: retention.py её не трогает, чистит только /life rm.
+CREATE TABLE life_events (
+    id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    announced_at INTEGER,
+    announced_tg_message_id INTEGER
+);
+
 CREATE INDEX idx_messages_chat_created ON messages (chat_id, created_at);
 CREATE INDEX idx_messages_tg_message_id ON messages (tg_message_id);
 CREATE INDEX idx_bot_replies_created ON bot_replies (created_at);
@@ -122,4 +132,4 @@ CREATE INDEX idx_filter_log_created ON filter_log (created_at);
 CREATE INDEX idx_night_queue_answered ON night_queue (answered_at);
 CREATE INDEX idx_pending_replies_done_due ON pending_replies (done_at, due_at);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

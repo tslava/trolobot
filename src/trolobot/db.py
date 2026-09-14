@@ -20,10 +20,33 @@ import aiosqlite
 
 from trolobot.gate_types import RecentActivity, StateChange
 
-# Номерные миграции поверх исходной схемы (user_version == 1). Пока их нет —
-# schema.sql уже описывает всю схему этапов 1 и 6. Ключ — целевая версия,
-# значение — SQL-скрипт, применяемый через executescript.
-MIGRATIONS: dict[int, str] = {}
+# Номерные миграции поверх исходной схемы (user_version == 1). Ключ — целевая
+# версия, значение — SQL-скрипт, применяемый через executescript. Скрипт для
+# версии 2 — тот же CREATE TABLE IF NOT EXISTS, что и в schema.sql (для свежих
+# БД таблицу уже создаёт schema.sql, здесь IF NOT EXISTS на случай, если кто-то
+# всё же дойдёт сюда с уже существующей таблицей).
+MIGRATIONS: dict[int, str] = {
+    2: """
+    CREATE TABLE IF NOT EXISTS life_events (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        announced_at INTEGER,
+        announced_tg_message_id INTEGER
+    );
+    """
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LifeEventRow:
+    """Событие жизни персонажа, заведённое владельцем через /life (CLAUDE.md, «события жизни»)."""
+
+    id: int
+    text: str
+    created_at: int
+    announced_at: int | None
+    announced_tg_message_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,14 +737,19 @@ class Database:
             await conn.commit()
             return old_value
 
-    async def audit_stop(self, key: str, changed_by: int, now: int) -> None:
-        """Строка в config_audit без изменения config_overrides — для /stop и /panic."""
+    async def audit_stop(
+        self, key: str, changed_by: int, now: int, new_value: str | None = None
+    ) -> None:
+        """Строка в config_audit без изменения config_overrides — для /stop, /panic, /life, /say.
+
+        new_value — текст события/реплики для /life и /say; у переключателей None.
+        """
         conn = self._require_conn()
         async with self._write_lock:
             await conn.execute(
                 "INSERT INTO config_audit (key, old_value, new_value, changed_by, created_at) "
-                "VALUES (?, NULL, NULL, ?, ?)",
-                (key, changed_by, now),
+                "VALUES (?, NULL, ?, ?, ?)",
+                (key, new_value, changed_by, now),
             )
             await conn.commit()
 
@@ -1066,3 +1094,73 @@ class Database:
             cursor = await conn.execute(query, params)
             await conn.commit()
             return cursor.rowcount
+
+    # -- события жизни (/life, CLAUDE.md "события жизни") -------------------
+
+    async def insert_life_event(self, *, text: str, created_at: int) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO life_events (text, created_at, announced_at, "
+                "announced_tg_message_id) VALUES (?, ?, NULL, NULL)",
+                (text, created_at),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_life_event: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def life_events(self) -> list[LifeEventRow]:
+        """Все события, по created_at asc, id asc (старые сначала — как в промпте)."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, text, created_at, announced_at, announced_tg_message_id "
+            "FROM life_events ORDER BY created_at, id"
+        )
+        rows = await cursor.fetchall()
+        return [
+            LifeEventRow(
+                id=row["id"],
+                text=row["text"],
+                created_at=row["created_at"],
+                announced_at=row["announced_at"],
+                announced_tg_message_id=row["announced_tg_message_id"],
+            )
+            for row in rows
+        ]
+
+    async def life_event(self, event_id: int) -> LifeEventRow | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, text, created_at, announced_at, announced_tg_message_id "
+            "FROM life_events WHERE id = ?",
+            (event_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return LifeEventRow(
+            id=row["id"],
+            text=row["text"],
+            created_at=row["created_at"],
+            announced_at=row["announced_at"],
+            announced_tg_message_id=row["announced_tg_message_id"],
+        )
+
+    async def delete_life_event(self, event_id: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM life_events WHERE id = ?", (event_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def mark_life_event_announced(
+        self, event_id: int, *, tg_message_id: int, now: int
+    ) -> None:
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "UPDATE life_events SET announced_at = ?, announced_tg_message_id = ? WHERE id = ?",
+                (now, tg_message_id, event_id),
+            )
+            await conn.commit()

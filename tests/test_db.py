@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 from datetime import UTC, datetime
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from trolobot.db import Database, PlaceRow
@@ -22,6 +24,7 @@ EXPECTED_TABLES = {
     "config_audit",
     "prompt_versions",
     "few_shot_versions",
+    "life_events",
 }
 
 
@@ -34,7 +37,7 @@ async def test_connect_creates_all_tables_and_bumps_user_version(tmp_path: Path)
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 1
+        assert row[0] == 2
 
         cursor = await conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
@@ -71,7 +74,7 @@ async def test_reconnect_is_idempotent(tmp_path: Path) -> None:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 1
+        assert row[0] == 2
         messages = await db2.recent_messages(42, 10)
         assert len(messages) == 1
         assert messages[0].text == "привет"
@@ -1555,5 +1558,142 @@ async def test_mark_places_not_seen_already_not_operational_not_recounted(tmp_pa
         marked = await db.mark_places_not_seen([], now=2_000_000_000)
 
         assert marked == 0
+    finally:
+        await db.close()
+
+
+# --- life_events (/life, CLAUDE.md "события жизни") --------------------------
+
+
+def _schema_sql_v1() -> str:
+    """schema.sql, но как будто ещё нет life_events (реальная БД на сервере,
+    user_version == 1) — для теста миграции 1 -> 2."""
+    schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
+    life_events_block = (
+        '-- События жизни персонажа (/life, CLAUDE.md "события жизни") — память, не\n'
+        "-- переписка: retention.py её не трогает, чистит только /life rm.\n"
+        "CREATE TABLE life_events (\n"
+        "    id INTEGER PRIMARY KEY,\n"
+        "    text TEXT NOT NULL,\n"
+        "    created_at INTEGER NOT NULL,\n"
+        "    announced_at INTEGER,\n"
+        "    announced_tg_message_id INTEGER\n"
+        ");\n\n"
+    )
+    assert life_events_block in schema_sql
+    old_schema_sql = schema_sql.replace(life_events_block, "")
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 2;", "PRAGMA user_version = 1;")
+    assert "life_events" not in old_schema_sql
+    return old_schema_sql
+
+
+async def test_migrate_v1_to_v2_adds_life_events_and_keeps_existing_data(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bot.db"
+    conn = await aiosqlite.connect(path)
+    try:
+        await conn.executescript(_schema_sql_v1())
+        await conn.execute(
+            "INSERT INTO messages (tg_message_id, chat_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, is_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 42, 1, "A", "привет со старой схемы", None, 0, 1000),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    db = Database(path)
+    await db.connect()
+    try:
+        raw_conn = db._conn
+        assert raw_conn is not None
+
+        cursor = await raw_conn.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 2
+
+        cursor = await raw_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'life_events'"
+        )
+        assert await cursor.fetchone() is not None
+
+        messages = await db.recent_messages(42, 10)
+        assert len(messages) == 1
+        assert messages[0].text == "привет со старой схемы"
+
+        # Свежая таблица рабочая, не просто существует.
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=2000)
+        assert await db.life_event(event_id) is not None
+    finally:
+        await db.close()
+
+
+async def test_insert_and_get_life_event(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию, взял Кию Сид", created_at=1000)
+
+        event = await db.life_event(event_id)
+        assert event is not None
+        assert event.id == event_id
+        assert event.text == "продал Октавию, взял Кию Сид"
+        assert event.created_at == 1000
+        assert event.announced_at is None
+        assert event.announced_tg_message_id is None
+
+        assert await db.life_event(event_id + 1000) is None
+    finally:
+        await db.close()
+
+
+async def test_life_events_ordered_by_created_at_then_id(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        id_b = await db.insert_life_event(text="B", created_at=1000)
+        id_a = await db.insert_life_event(text="A", created_at=500)
+        id_c = await db.insert_life_event(text="C", created_at=1000)
+
+        rows = await db.life_events()
+
+        # created_at asc, id asc: A (500) первой; из двух с created_at=1000 —
+        # B раньше C, потому что вставлена раньше (меньший id).
+        assert [row.id for row in rows] == [id_a, id_b, id_c]
+        assert [row.text for row in rows] == ["A", "B", "C"]
+    finally:
+        await db.close()
+
+
+async def test_delete_life_event_removes_row_and_reports_missing(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=1000)
+
+        assert await db.delete_life_event(event_id) is True
+        assert await db.life_event(event_id) is None
+        assert await db.delete_life_event(event_id) is False
+    finally:
+        await db.close()
+
+
+async def test_mark_life_event_announced_sets_fields(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=1000)
+        before = await db.life_event(event_id)
+        assert before is not None
+        assert before.announced_at is None
+
+        await db.mark_life_event_announced(event_id, tg_message_id=555, now=2000)
+
+        event = await db.life_event(event_id)
+        assert event is not None
+        assert event.announced_at == 2000
+        assert event.announced_tg_message_id == 555
     finally:
         await db.close()

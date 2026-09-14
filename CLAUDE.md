@@ -918,6 +918,104 @@ settable, секция → None, overridden с default); `tests/test_commands.py
 `/get <prefix>` по-прежнему список с подсказкой, `/help` отвечает справкой, справка содержит `/stop`
 и `/mute`; `tests/test_stores.py` — `describe` через настоящий ConfigStore с override.
 
+## Интерфейсы: события жизни (/life) и прямая реплика (/say)
+
+Решение владельца: он сам решает, когда бот «сообщает новость о себе» («продал старую
+машину, взял другую»). Команда в личке — кнопка «опубликовать сейчас», не очередь:
+ночное окно, дневные лимиты, кубик и живость чата не проверяются, держат только
+`panic` и `stop_until`. Событие при этом ЗАПОМИНАЕТСЯ: попадает в системный промпт
+слотом `{life}` и не стареет — владелец не хочет править промпт руками, память
+живёт в БД и чистится только `/life rm`. Отдельно `/say <текст>` — отправить в чат
+ровно этот текст без модели, в память не писать.
+
+```python
+# schema.sql — новая таблица (для свежих БД) + PRAGMA user_version = 2; db.py MIGRATIONS[2] —
+# тот же CREATE TABLE IF NOT EXISTS для уже существующих БД (на сервере user_version == 1).
+CREATE TABLE life_events (
+    id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL,                  # заметка владельца, normalize_text
+    created_at INTEGER NOT NULL,
+    announced_at INTEGER,                # NULL — в чат ещё не ушло
+    announced_tg_message_id INTEGER
+);
+
+# db.py
+@dataclass(frozen=True, slots=True)
+class LifeEventRow: id: int; text: str; created_at: int; announced_at: int | None; announced_tg_message_id: int | None
+async def insert_life_event(self, *, text: str, created_at: int) -> int
+async def life_events(self) -> list[LifeEventRow]                    # по created_at asc, id asc
+async def life_event(self, event_id: int) -> LifeEventRow | None
+async def delete_life_event(self, event_id: int) -> bool
+async def mark_life_event_announced(self, event_id: int, *, tg_message_id: int, now: int) -> None
+# Retention их НЕ трогает (память персонажа, не переписка).
+
+# prompt.py
+# _SLOT_RE расширяется слотом life; build_messages получает kwarg life: str = "" (replay.py не меняется).
+def render_life(rows: Sequence[LifeEventRow], tz: str) -> str
+# Пусто -> "". Иначе заголовок + по строке на событие, дата локальная (timeutil.local_date, tz):
+#   "Что у тебя случилось за последнее время (это свежее и важнее того, что написано выше;
+#    упоминай только к слову, не пересказывай список):\n12.09.2026: продал Октавию, взял Кию Сид"
+# Строки НЕ начинаются с "- " и не содержат слова JSON: filters.regex:prompt_leak считает
+# инструктивной частью промпта именно буллеты «- …» и строки про JSON, а пересказ события
+# персонажем утечкой не является. Текст события — через _strip_fake_delimiters.
+SITUATION_LIFE_TEMPLATE = ("У тебя новость: «{text}». Расскажи о ней в чат одной-двумя фразами, "
+                           "как рассказал бы приятелям. Никого не спрашивай и никого не зови.")
+def situation_life(text: str) -> str         # обрезка до 300 симв., _strip_fake_delimiters, подстановка
+# prompts/system.txt: слот {life} отдельным абзацем после «Пьёшь мало…» и ПЕРЕД блоком правил.
+# После деплоя PromptStore сам заведёт новую версию промпта («seed from file»).
+
+# responder.py
+@dataclass(frozen=True)
+class SendOutcome: sent: bool; text: str; reason: str; tg_message_id: int | None = None   # id отправленного
+# reason — та же строка, что ушла в filter_log: "send:life", "send:say", "llm:silent", "llm:invalid_json",
+# "llm:<LLMError.reason>", первая причина среза фильтра ("regex:sentences"), "blocked:panic", "blocked:stop".
+# _generate_and_send теперь ВОЗВРАЩАЕТ SendOutcome (в каждой ветке выхода — то, что записано в filter_log);
+# _respond_inner результат игнорирует, поведение существующих триггеров не меняется. В shadow срез
+# фильтра по-прежнему отправляет — sent=True, reason="send:<trigger>".
+async def announce_life(self, event: LifeEventRow) -> SendOutcome
+# Под _respond_lock. panic == "1" -> blocked:panic; stop_until > now -> blocked:stop (filter_log stage="send",
+# verdict="cut", reason="send:blocked_panic"/"send:blocked_stop"). Иначе _generate_and_send(trigger="life",
+# trigger_msg_id=None, user_id=None, situation=situation_life(event.text), delay_sec=0, trigger_text=event.text —
+# латиница из заметки владельца («Kia Ceed») попадает в белый список regex:venue/regex:latin). LLMError ловится
+# здесь (как в _respond) -> filter_log + SendOutcome(sent=False, reason=e.reason). "life" не входит в
+# _AMBIENT_LIKE_TRIGGER_VALUES и _ADDRESS_TRIGGER_VALUES: без recheck бюджета, без заведений, без стикеров,
+# счётчики mention/ambient/spontaneous не трогаются (как morning). Успех -> db.mark_life_event_announced
+# по outcome.tg_message_id (не по «последней строке bot_replies»).
+async def say(self, text: str) -> SendOutcome
+# Под _respond_lock; те же blocked-проверки; _run_typing(text) -> bot.send_message(chat_id, text) ->
+# insert_bot_reply(trigger="say", trigger_tg_message_id=None, delay_sec=0) -> increment_state(
+# "replies_since_sticker") -> filter_log pass stage="send" reason="send:say". Фильтр и модель не участвуют.
+# Слот {life} заполняется в _generate_and_send ВСЕГДА, для любого триггера: life=render_life(await
+# self.db.life_events(), tz). FilterContext.system_prompt — как раньше (шаблон), ничего не меняется.
+
+# commands.py — личка, только владелец. _CommandsDeps.responder: object | None -> _ResponderLike | None
+# (Protocol с announce_life/say). Все команды пишут config_audit через db.audit_stop(key, changed_by, now,
+# new_value=<текст>) — параметр new_value: str | None = None добавлен к существующему методу
+# (key "life:add"/"life:rm"/"life:post"/"say", new_value — текст события/реплики).
+#   /life <текст>      normalize_text; пусто -> «Использование: /life <текст> | list | rm N | post N».
+#                      insert_life_event -> responder None -> «Записал #N. LLM не настроен, в чат не отправлено.»
+#                      иначе announce_life -> sent: «Записал #N. Отправлено: <text>»;
+#                      blocked: «Записал #N. Бот молчит (panic/stop) — /resume.»;
+#                      иначе «Записал #N. Не отправлено: <reason>» + строка «Кандидат: <text>», если text непустой.
+#   /life list         «#N dd.mm.yyyy ✓|— текст» по строке, старые сверху; пусто -> «Событий нет.»; обрезка 3500.
+#   /life rm N         delete -> «Событие #N удалено.» / «Нет события #N.»
+#   /life post N       повторно announce_life для существующего события (после среза фильтра или /resume);
+#                      ответы как у /life <текст>, без «Записал».
+#   /say <текст>       пусто -> «Использование: /say <текст>»; responder None -> «LLM-часть выключена, /say
+#                      недоступен.»; say -> «Отправлено.» / «Бот молчит (panic/stop) — /resume.»
+# _HELP_TEXT: строки «/life <текст> — новость о себе: запомнить и сразу рассказать в чате»,
+# «/life list | rm N | post N — события: список, удалить, повторить», «/say <текст> — сказать в чат дословно».
+# /status: строка «life events: <всего> (<не отправлено>)».
+```
+
+README.md: раздел «Команды» (таблица владельца) и короткий абзац «Память о событиях» в разделе про
+характер/промпт. Тесты: `tests/test_db.py` (миграция 1→2 на БД с данными; CRUD), `tests/test_prompt.py`
+(render_life пусто/несколько, формат даты по tz, без «- », situation_life обрезка и разделители),
+`tests/test_responder.py` (announce_life: отправлено и mark_announced; blocked panic/stop; срез фильтра при
+shadow=false -> sent=False с причиной; LLMError -> reason; say: текст ушёл дословно, bot_replies trigger="say",
+счётчики не тронуты; слот life подставляется в system для обычного ambient), `tests/test_commands.py`
+(все ветки /life и /say через фейковый responder, responder=None, аудит).
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»
