@@ -15,6 +15,7 @@ class Trigger(StrEnum):
     MENTION = "mention"  # @username в тексте
     REPLY = "reply"  # реплай на сообщение бота
     NAME = "name"  # слово из persona.name_triggers
+    FOLLOWUP = "followup"  # без обращения, но дешёвая проверка признала адресованным боту
     AMBIENT = "ambient"  # без обращения, внутрь живого разговора
 
 
@@ -57,6 +58,11 @@ class GateState:
     ambient_count_today: int  # ambient + spontaneous
     last_ambient_at: int | None
     recent: tuple[RecentActivity, ...]  # не-бот сообщения за live_talk.window_min, включая текущее
+    # Горячее окно после /life и /say (CLAUDE.md, "горячее окно"): дефолты в конце —
+    # чтобы существующие позиционные вызовы (replay.py, тесты) не ломались, окно
+    # там не открывается (hot_until всегда None).
+    hot_until: int | None = None
+    hot_ambient_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)

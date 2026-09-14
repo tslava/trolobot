@@ -23,17 +23,25 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from aiogram import F, Router
 from aiogram.types import Message, User
 
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
+from trolobot.db import LifeEventRow
 from trolobot.few_shot import FewShot
-from trolobot.sanitize import sanitize_display_name
+from trolobot.sanitize import normalize_text, sanitize_display_name
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, local_dt
+
+if TYPE_CHECKING:
+    # Только для аннотаций: "from __future__ import annotations" делает их строками,
+    # так что этот импорт не исполняется в рантайме. Прямой (не TYPE_CHECKING) импорт
+    # trolobot.responder сюда нежелателен — тянет aiogram-цепочку в commands.py и
+    # рискует циклическим импортом (bot.py и так импортирует и responder, и commands).
+    from trolobot.responder import SendOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +74,14 @@ _HELP_TEXT = (
     "/rollback <версия> — откат промпта на версию\n"
     "/ex last [n] — последние примеры few-shot\n"
     "/ex rm [n] — удалить n-й пример few-shot с конца\n"
+    "/life <текст> — новость о себе: запомнить и сразу рассказать в чате\n"
+    "/life list | rm N | post N — события: список, удалить, повторить\n"
+    "/say <текст> — сказать в чат дословно\n"
     "/help — эта справка"
 )
+
+# Общий текст использования — и для голого /life, и для /life rm|post без валидного N.
+_LIFE_USAGE = "Использование: /life <текст> | list | rm N | post N"
 
 
 class _MessageRowLike(Protocol):
@@ -123,7 +137,9 @@ class _DbLike(Protocol):
     async def get_state(self, key: str) -> str | None: ...
     async def set_state(self, key: str, value: str) -> None: ...
     async def delete_state(self, key: str) -> None: ...
-    async def audit_stop(self, key: str, changed_by: int, now: int) -> None: ...
+    async def audit_stop(
+        self, key: str, changed_by: int, now: int, new_value: str | None = None
+    ) -> None: ...
     async def add_mute(self, user_id: int, display_name: str, muted_by: int, now: int) -> None: ...
     async def remove_mute(self, user_id: int) -> bool: ...
     # Sequence (не list) в возвращаемом типе: list инвариантен по своему параметру,
@@ -140,6 +156,22 @@ class _DbLike(Protocol):
     async def load_pending(self) -> Sequence[object]: ...
     async def night_unanswered(self) -> Sequence[object]: ...
     async def prompt_versions(self) -> Sequence[_VersionRowLike]: ...
+    # -- события жизни (/life, CLAUDE.md "события жизни и /say") -------------
+    async def insert_life_event(self, *, text: str, created_at: int) -> int: ...
+    async def life_events(self) -> Sequence[LifeEventRow]: ...
+    async def life_event(self, event_id: int) -> LifeEventRow | None: ...
+    async def delete_life_event(self, event_id: int) -> bool: ...
+
+
+class _ResponderLike(Protocol):
+    """Подмножество Responder, нужное /life и /say (CLAUDE.md, «события жизни»).
+
+    Только эти два метода — не полный Responder. SendOutcome в аннотациях
+    приходит из TYPE_CHECKING-импорта выше (см. его комментарий про то, почему
+    commands.py не импортирует trolobot.responder напрямую)."""
+
+    async def announce_life(self, event: LifeEventRow) -> SendOutcome: ...
+    async def say(self, text: str) -> SendOutcome: ...
 
 
 class _ConfigStoreLike(Protocol):
@@ -169,9 +201,10 @@ class _PromptStoreLike(Protocol):
 class _CommandsDeps(Protocol):
     """Зависимости build_commands_router. bot.Deps потом дополнят этими полями.
 
-    responder не используется ни одной командой этого модуля (только /status,
-    которому нужен исключительно db) — тип ослаблен до object, чтобы не тянуть
-    сюда responder.py.
+    responder используется /life и /say (announce_life/say) через _ResponderLike —
+    структурный протокол, а не прямой тип Responder, чтобы commands.py не тянул
+    responder.py (и вместе с ним aiogram-цепочку) в рантайме. responder может быть
+    None (LLM-часть выключена, CLAUDE.md "Settings.openrouter_api_key None").
 
     Члены объявлены через ``@property``, а не как обычные атрибуты: commands.py
     только читает deps.* и никогда не присваивает — по PEP 544 обычный (settable)
@@ -191,7 +224,7 @@ class _CommandsDeps(Protocol):
     @property
     def db(self) -> _DbLike: ...
     @property
-    def responder(self) -> object | None: ...
+    def responder(self) -> _ResponderLike | None: ...
     @property
     def bot_user_id(self) -> int: ...
     @property
@@ -364,9 +397,38 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     llm_spent = float(await deps.db.get_state(day_key("llm_spent_usd", now, tz)) or "0")
     reactions = int(await deps.db.get_state(day_key("reaction_count", now, tz)) or "0")
     stickers = int(await deps.db.get_state(day_key("sticker_count", now, tz)) or "0")
+    followup_calls = int(await deps.db.get_state(day_key("followup_calls", now, tz)) or "0")
 
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
+
+    life_events = await deps.db.life_events()
+    life_unsent = sum(1 for event in life_events if event.announced_at is None)
+
+    hot_until_raw = await deps.db.get_state("hot_until")
+    try:
+        hot_until = int(hot_until_raw) if hot_until_raw is not None else None
+    except ValueError:
+        hot_until = None
+    if hot_until is not None and hot_until > now:
+        hot_ambient_count = int(await deps.db.get_state("hot_ambient_count") or "0")
+        hot_line = (
+            f"hot window: до {local_dt(hot_until, tz).strftime('%H:%M')} "
+            f"({hot_ambient_count}/{cfg.behaviour.hot_window.ambient_cap})"
+        )
+    else:
+        hot_line = "hot window: нет"
+
+    checkin_due_raw = await deps.db.get_state("checkin_due")
+    try:
+        checkin_due = int(checkin_due_raw) if checkin_due_raw is not None else None
+    except ValueError:
+        checkin_due = None
+    checkin_line = (
+        f"checkin: due {local_dt(checkin_due, tz).strftime('%H:%M')}"
+        if checkin_due is not None
+        else "checkin: нет"
+    )
 
     lines = [
         f"Паника: {'да' if panic else 'нет'}",
@@ -383,6 +445,10 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"({deps.sticker_catalog_enabled} в каталоге)",
         f"Pending: {pending}",
         f"Night queue: {night_queue}",
+        f"life events: {len(life_events)} ({life_unsent})",
+        hot_line,
+        f"followup calls: {followup_calls}/{cfg.behaviour.followup.daily_cap}",
+        checkin_line,
     ]
     await _reply(message, "\n".join(lines))
 
@@ -543,6 +609,158 @@ async def _cmd_ex_rm(message: Message, deps: _CommandsDeps, now: int, args: list
     await _reply(message, f"few-shot: версия {version} (удалён пример {n} с конца)")
 
 
+def _parse_int(raw: str) -> int | None:
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _command_arg_text(raw_text: str, tokens: list[str]) -> str:
+    """Текст после команды, с исходными пробелами/переносами внутри (для /say —
+    "дословно"), только внешние пробелы срезаны. args (tokens.split()) для этого
+    не годится — схлопывает внутренние пробелы."""
+    if not tokens:
+        return ""
+    return raw_text[len(tokens[0]) :].strip()
+
+
+def _is_blocked(outcome: SendOutcome) -> bool:
+    return outcome.reason in ("blocked:panic", "blocked:stop")
+
+
+def _life_outcome_text(outcome: SendOutcome) -> str:
+    """Общая часть ответа /life <текст> и /life post N после вызова announce_life."""
+    if outcome.sent:
+        return f"Отправлено: {outcome.text}"
+    if _is_blocked(outcome):
+        return "Бот молчит (panic/stop) — /resume."
+    text = f"Не отправлено: {outcome.reason}"
+    if outcome.text:
+        text += f"\nКандидат: {outcome.text}"
+    return text
+
+
+async def _cmd_life(
+    message: Message,
+    deps: _CommandsDeps,
+    now: int,
+    admin_user_id: int,
+    args: list[str],
+    raw_text: str,
+    tokens: list[str],
+) -> None:
+    sub = args[0].lower() if args else ""
+    if sub == "list":
+        await _cmd_life_list(message, deps)
+        return
+    if sub == "rm":
+        await _cmd_life_rm(message, deps, now, admin_user_id, args)
+        return
+    if sub == "post":
+        await _cmd_life_post(message, deps, now, admin_user_id, args)
+        return
+
+    text = normalize_text(_command_arg_text(raw_text, tokens))
+    if not text:
+        await _reply(message, _LIFE_USAGE)
+        return
+
+    event_id = await deps.db.insert_life_event(text=text, created_at=now)
+    await deps.db.audit_stop("life:add", admin_user_id, now, text)
+    logger.info("life add: #%s %r", event_id, text)
+
+    if deps.responder is None:
+        await _reply(message, f"Записал #{event_id}. LLM не настроен, в чат не отправлено.")
+        return
+
+    event = LifeEventRow(
+        id=event_id, text=text, created_at=now, announced_at=None, announced_tg_message_id=None
+    )
+    outcome = await deps.responder.announce_life(event)
+    await _reply(message, f"Записал #{event_id}. {_life_outcome_text(outcome)}")
+
+
+async def _cmd_life_list(message: Message, deps: _CommandsDeps) -> None:
+    tz = deps.config_store.get().persona.timezone
+    events = await deps.db.life_events()
+    if not events:
+        await _reply(message, "Событий нет.")
+        return
+    lines = [
+        f"#{event.id} {local_dt(event.created_at, tz).strftime('%d.%m.%Y')} "
+        f"{'✓' if event.announced_at is not None else '—'} {event.text}"
+        for event in events
+    ]
+    await _reply(message, "\n".join(lines))
+
+
+async def _cmd_life_rm(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    event_id = _parse_int(args[1]) if len(args) > 1 else None
+    if event_id is None:
+        await _reply(message, _LIFE_USAGE)
+        return
+    event = await deps.db.life_event(event_id)
+    if event is None:
+        await _reply(message, f"Нет события #{event_id}.")
+        return
+    await deps.db.delete_life_event(event_id)
+    await deps.db.audit_stop("life:rm", admin_user_id, now, event.text)
+    logger.info("life rm: #%s %r", event_id, event.text)
+    await _reply(message, f"Событие #{event_id} удалено.")
+
+
+async def _cmd_life_post(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    event_id = _parse_int(args[1]) if len(args) > 1 else None
+    if event_id is None:
+        await _reply(message, _LIFE_USAGE)
+        return
+    event = await deps.db.life_event(event_id)
+    if event is None:
+        await _reply(message, f"Нет события #{event_id}.")
+        return
+    await deps.db.audit_stop("life:post", admin_user_id, now, event.text)
+    logger.info("life post: #%s %r", event_id, event.text)
+
+    if deps.responder is None:
+        await _reply(message, "LLM не настроен, в чат не отправлено.")
+        return
+
+    outcome = await deps.responder.announce_life(event)
+    await _reply(message, _life_outcome_text(outcome))
+
+
+async def _cmd_say(
+    message: Message,
+    deps: _CommandsDeps,
+    now: int,
+    admin_user_id: int,
+    raw_text: str,
+    tokens: list[str],
+) -> None:
+    text = _command_arg_text(raw_text, tokens)
+    if not text:
+        await _reply(message, "Использование: /say <текст>")
+        return
+
+    await deps.db.audit_stop("say", admin_user_id, now, text)
+    logger.info("say: %r", text)
+
+    if deps.responder is None:
+        await _reply(message, "LLM-часть выключена, /say недоступен.")
+        return
+
+    outcome = await deps.responder.say(text)
+    if outcome.sent:
+        await _reply(message, "Отправлено.")
+    else:
+        await _reply(message, "Бот молчит (panic/stop) — /resume.")
+
+
 def build_commands_router(deps: _CommandsDeps) -> Router:
     """Собирает Router с одним хендлером-диспетчером команд.
 
@@ -624,6 +842,10 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_ex_last(message, deps, args)
                 elif cmd == "ex" and args and args[0].lower() == "rm":
                     await _cmd_ex_rm(message, deps, now, args)
+                elif cmd == "life":
+                    await _cmd_life(message, deps, now, admin_user_id, args, text, tokens)
+                elif cmd == "say":
+                    await _cmd_say(message, deps, now, admin_user_id, text, tokens)
                 elif cmd == "help":
                     await _reply(message, _HELP_TEXT)
                 else:

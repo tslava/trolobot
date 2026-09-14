@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
-from trolobot.db import MessageRow
+from trolobot.db import LifeEventRow, MessageRow
+from trolobot.timeutil import local_date
 
 CHAT_OPEN = "<<<CHAT"
 CHAT_CLOSE = ">>>"
@@ -49,6 +51,10 @@ SITUATION_SPONTANEOUS = (
     "В чате тихо. Если есть что сказать про свои дела одной фразой — скажи. "
     "Нет — промолчи. Никого не зови и ничего не спрашивай."
 )
+SITUATION_LIFE_TEMPLATE = (
+    "У тебя новость: «{text}». Расскажи о ней в чат одной-двумя фразами, "
+    "как рассказал бы приятелям. Никого не спрашивай и никого не зови."
+)
 # Одно обращение — короткая форма; несколько (накопились за схлопывание
 # дебаунс-буфера) — список с общей инструкцией: "живой тест" показал, что при
 # нескольких людях в контексте модель отвечает на самое заметное сообщение в
@@ -63,9 +69,43 @@ SITUATION_ADDRESSED_MULTI_FOOTER = (
     "Ответь одной фразой: тому, кому есть что сказать, или всем сразу. "
     "На разговор вокруг не отвечай."
 )
+# followup (CLAUDE.md, "внимание как у живого человека"): дешёвая проверка уже решила,
+# что сообщение, скорее всего, адресовано персонажу, но уверенности нет — в отличие
+# от situation_addressed (обращение распознано детерминированно: реплай/меншн/имя),
+# здесь модель явно предупреждается, что это только вероятность, и вправе промолчать.
+SITUATION_FOLLOWUP_SINGLE = (
+    "Вероятно, {name} сейчас написал тебе или о твоей теме: «{text}». "
+    "Если это так — ответь на это сообщение. "
+    "Если это не тебе и не про тебя — промолчи (speak: false)."
+)
+SITUATION_FOLLOWUP_MULTI_HEADER = "Вероятно, тебе или о твоей теме написали:"
+SITUATION_FOLLOWUP_MULTI_FOOTER = (
+    "Если это так — ответь одной фразой тому, кому есть что сказать, или всем сразу. "
+    "Если это не тебе и не про тебя — промолчи (speak: false)."
+)
+# checkin (CLAUDE.md, "внимание как у живого человека: вернулся проверить") — окно уже
+# закрылось, дешёвая проверка больше не работает, поэтому раз в after_min основная модель
+# сама смотрит на всё, что накопилось после её последней реплики, и решает, отвечать ли
+# и на что именно (reply_to). В отличие от followup, здесь несколько сообщений — норма
+# (не редкое схлопывание дебаунса), поэтому единой short-формы для одного сообщения нет.
+SITUATION_CHECKIN_HEADER = (
+    "Ты отвлёкся на свои дела и вернулся в чат. Вот что написали после твоей последней "
+    "реплики (номер, имя, текст):"
+)
+SITUATION_CHECKIN_FOOTER = (
+    "Если что-то из этого написано тебе или прямо продолжает твою тему — ответь одной "
+    "фразой, можно всем сразу, и укажи номер сообщения, на которое отвечаешь, в поле "
+    "reply_to. Если ничего тебе — промолчи (speak: false)."
+)
 
 _ADDRESSED_TEXT_MAX_LEN = 300
 _ADDRESSED_ITEMS_MAX = 5
+
+_LIFE_TEXT_MAX_LEN = 300
+_LIFE_HEADER = (
+    "Что у тебя случилось за последнее время (это свежее и важнее того, что "
+    "написано выше; упоминай только к слову, не пересказывай список):"
+)
 
 _RECENT_REPLIES_EMPTY = "(пока не было)"
 _DATA_DISCLAIMER = (
@@ -74,6 +114,14 @@ _DATA_DISCLAIMER = (
 )
 _RECENT_REPLIES_LABEL = "Твои последние реплики (не повторяйся):"
 _JSON_REMINDER = 'Ответь одним JSON-объектом без markdown: {"speak": true|false, "text": "..."}'
+# checkin (CLAUDE.md, "вернулся проверить") — та же форма ответа, плюс номер сообщения,
+# на которое отвечает модель (или null, если ни на одно). Публичная константа (без "_"),
+# потому что responder.py подставляет её вместо _JSON_REMINDER через
+# build_messages(json_reminder=...).
+JSON_REMINDER_CHECKIN = (
+    "Ответь одним JSON-объектом без markdown: "
+    '{"speak": true|false, "text": "...", "reply_to": <номер>|null}'
+)
 
 _CONTEXT_MARKER = "(сообщения чата — ниже, в отдельном блоке)"
 _RECENT_REPLIES_MARKER = "(твои последние реплики — ниже)"
@@ -88,7 +136,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
-_SLOT_RE = re.compile(r"\{(age|few_shot|context|recent_replies|places|situation)\}")
+_SLOT_RE = re.compile(r"\{(age|few_shot|life|context|recent_replies|places|situation)\}")
 
 
 def _strip_fake_delimiters(text: str) -> str:
@@ -135,9 +183,96 @@ def situation_addressed(items: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def situation_followup(items: list[tuple[str, str]]) -> str:
+    """Ситуация для триггера ``followup`` (CLAUDE.md, "внимание как у живого
+    человека") — та же форма, что ``situation_addressed`` (может накопиться
+    несколько поводов за время дебаунс-схлопывания одного pending), но с явной
+    оговоркой, что адресность не точная, а вероятная: обычный гейт такое
+    сообщение обращением не признал, это решение дешёвой проверки.
+
+    Потолок ``_ADDRESSED_ITEMS_MAX``, обрезка текста до ``_ADDRESSED_TEXT_MAX_LEN``,
+    вырезание поддельных разделителей — как у ``situation_addressed``.
+    """
+    trimmed = items[-_ADDRESSED_ITEMS_MAX:]
+    cleaned = [
+        (_strip_fake_delimiters(name).strip(), _clean_addressed_text(text))
+        for name, text in trimmed
+    ]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        name, text = cleaned[0]
+        return SITUATION_FOLLOWUP_SINGLE.replace("{name}", name).replace("{text}", text)
+
+    lines = [SITUATION_FOLLOWUP_MULTI_HEADER]
+    lines.extend(f"- {name}: «{text}»" for name, text in cleaned)
+    lines.append(SITUATION_FOLLOWUP_MULTI_FOOTER)
+    return "\n".join(lines)
+
+
+def situation_checkin(rows: Sequence[MessageRow]) -> str:
+    """Ситуация для триггера ``checkin`` (CLAUDE.md, "внимание как у живого
+    человека: вернулся проверить") — пронумерованный список сообщений,
+    накопившихся после последней реплики персонажа, плюс инструкция ответить
+    одной фразой на выбранное (номер уходит в поле ``reply_to`` JSON-ответа)
+    либо промолчать. Строки нумеруются с 1, имя и текст чистятся от поддельных
+    разделителей и обрезаются тем же лимитом, что и ``situation_addressed``
+    (``_ADDRESSED_TEXT_MAX_LEN`` символов). Пустой ``rows`` -> пустая строка —
+    вызывающий (responder.py) не должен звать генерацию без сообщений вовсе,
+    но на всякий случай это тоже "ничего не отвечать".
+    """
+    if not rows:
+        return ""
+    lines = [SITUATION_CHECKIN_HEADER]
+    for index, row in enumerate(rows, start=1):
+        name = _strip_fake_delimiters(row.display_name or "").strip()
+        text = _clean_addressed_text(row.text or "")
+        lines.append(f"{index}. {name}: {text}")
+    lines.append(SITUATION_CHECKIN_FOOTER)
+    return "\n".join(lines)
+
+
 def render_context(rows: list[MessageRow]) -> str:
     """ "Имя: текст" по строке, в хронологическом порядке (rows уже отсортированы)."""
     return "\n".join(f"{row.display_name}: {row.text}" for row in rows)
+
+
+def render_life(rows: Sequence[LifeEventRow], tz: str) -> str:
+    """Блок памяти о событиях жизни персонажа (CLAUDE.md, "события жизни").
+
+    Пусто -> "" (тогда весь абзац со слотом {life} в system.txt пропадает).
+    Иначе — заголовок и по строке на событие, дата локальная (timeutil.local_date,
+    tz), формат dd.mm.yyyy: "12.09.2026: продал Октавию, взял Кию Сид".
+
+    Строки НЕ начинаются с "- " и не содержат слова JSON: filters.regex:prompt_leak
+    считает инструктивной частью системного промпта именно строки-буллеты «- …»
+    и блок про JSON, а пересказ события персонажем утечкой не является.
+
+    Событие подставляется прямо в system (как few_shot, не как context/places) —
+    это память владельца о персонаже, а не недоверенный ввод участников чата, но
+    _strip_fake_delimiters всё равно применяется на всякий случай, чтобы поддельные
+    ``<<<``/``>>>`` внутри заметки не путали разметку user-сообщения.
+    """
+    if not rows:
+        return ""
+    lines = [_LIFE_HEADER]
+    for row in rows:
+        day = local_date(row.created_at, tz).strftime("%d.%m.%Y")
+        lines.append(f"{day}: {_strip_fake_delimiters(row.text)}")
+    return "\n".join(lines)
+
+
+def situation_life(text: str) -> str:
+    """Ситуация для announce_life: подстановка в SITUATION_LIFE_TEMPLATE.
+
+    Один слот {text} — через .replace, не re.sub/format (как в situation_addressed):
+    единственная подстановка не может спровоцировать повторную замену самой себя.
+    Текст обрезается до 300 символов и чистится от поддельных разделителей — тот
+    же приём, что и для обращений (_clean_addressed_text), но со своей константой
+    длины, потому что источник другой (заметка владельца, не сообщение участника).
+    """
+    cleaned = _strip_fake_delimiters(text).strip()[:_LIFE_TEXT_MAX_LEN]
+    return SITUATION_LIFE_TEMPLATE.replace("{text}", cleaned)
 
 
 def build_messages(
@@ -149,6 +284,8 @@ def build_messages(
     recent_replies: str,
     places: str,
     situation: str,
+    life: str = "",
+    json_reminder: str = _JSON_REMINDER,
 ) -> list[dict[str, str]]:
     """Собирает [system, user] для LLMClient.call().
 
@@ -160,11 +297,14 @@ def build_messages(
     что подставлено, повторно не трогается. Данные людей
     (context/recent_replies/places/situation) в system не попадают — только
     маркеры "см. ниже"; сами данные уходят вторым сообщением role=user,
-    context и recent_replies — внутри разделителей <<<CHAT ... >>>.
+    context и recent_replies — внутри разделителей <<<CHAT ... >>>. {life} —
+    исключение: это память владельца о персонаже (как few_shot), а не ввод
+    участников чата, поэтому подставляется в system напрямую, реальным значением.
     """
     slot_values = {
         "age": str(age),
         "few_shot": few_shot,
+        "life": life,
         "context": _CONTEXT_MARKER,
         "recent_replies": _RECENT_REPLIES_MARKER,
         "places": _PLACES_MARKER,
@@ -190,7 +330,7 @@ def build_messages(
         lines.append("")
         lines.append(clean_situation)
     lines.append("")
-    lines.append(_JSON_REMINDER)
+    lines.append(json_reminder)
 
     user = "\n".join(lines)
 
@@ -204,6 +344,10 @@ def build_messages(
 class Reply:
     speak: bool
     text: str
+    # Номер сообщения (1-based, индекс в checkin_rows), на которое отвечает модель —
+    # только для триггера "checkin" (CLAUDE.md, "вернулся проверить"); для остальных
+    # триггеров модель это поле не заполняет, и оно остаётся None.
+    reply_to: int | None = None
 
 
 def _strip_code_fence(text: str) -> str:
@@ -246,11 +390,24 @@ def parse_reply(raw: str) -> Reply | None:
             return None
         text = text_value.strip()
 
+        # "reply_to": int, null или отсутствует -> используется как есть/None;
+        # любой другой тип (строка, float, bool — bool исключён явно, т.к.
+        # isinstance(True, int) в Python истинно) -> None, это не срыв всего
+        # разбора, только этого необязательного поля (CLAUDE.md, "вернулся проверить").
+        reply_to_value = data.get("reply_to")
+        reply_to: int | None
+        if reply_to_value is None or isinstance(reply_to_value, bool):
+            reply_to = None
+        elif isinstance(reply_to_value, int):
+            reply_to = reply_to_value
+        else:
+            reply_to = None
+
         if speak:
             if not text:
                 return None
-            return Reply(speak=True, text=text)
-        return Reply(speak=False, text="")
+            return Reply(speak=True, text=text, reply_to=reply_to)
+        return Reply(speak=False, text="", reply_to=reply_to)
     except Exception:
         # Ответ модели — недоверенный внешний текст: любой сбой разбора (не JSON,
         # оборванная обёртка, неожиданный тип) означает "молчание", а не падение.

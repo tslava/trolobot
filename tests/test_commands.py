@@ -18,9 +18,11 @@ from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
 from trolobot.commands import build_commands_router
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
+from trolobot.db import LifeEventRow
 from trolobot.few_shot import FewShot
+from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
-from trolobot.timeutil import local_dt
+from trolobot.timeutil import day_key, local_dt
 
 OWN_CHAT_ID = -1001234567890
 FOREIGN_CHAT_ID = -100999
@@ -59,6 +61,7 @@ class FakeVersionRow:
 class FakeDb:
     state: dict[str, str] = field(default_factory=dict)
     audit_stop_calls: list[tuple[str, int, int]] = field(default_factory=list)
+    audit_values: dict[str, str | None] = field(default_factory=dict)
     add_mute_calls: list[tuple[int, str, int, int]] = field(default_factory=list)
     remove_mute_calls: list[int] = field(default_factory=list)
     bot_replies_by_id: dict[int, FakeBotReplyRow] = field(default_factory=dict)
@@ -71,6 +74,8 @@ class FakeDb:
     prompt_versions_value: list[FakeVersionRow] = field(
         default_factory=lambda: [FakeVersionRow(1), FakeVersionRow(2), FakeVersionRow(3)]
     )
+    life_events_store: dict[int, LifeEventRow] = field(default_factory=dict)
+    _next_life_event_id: int = 1
 
     async def get_state(self, key: str) -> str | None:
         return self.state.get(key)
@@ -81,8 +86,11 @@ class FakeDb:
     async def delete_state(self, key: str) -> None:
         self.state.pop(key, None)
 
-    async def audit_stop(self, key: str, changed_by: int, now: int) -> None:
+    async def audit_stop(
+        self, key: str, changed_by: int, now: int, new_value: str | None = None
+    ) -> None:
         self.audit_stop_calls.append((key, changed_by, now))
+        self.audit_values[key] = new_value
 
     async def add_mute(self, user_id: int, display_name: str, muted_by: int, now: int) -> None:
         self.add_mute_calls.append((user_id, display_name, muted_by, now))
@@ -112,6 +120,27 @@ class FakeDb:
 
     async def prompt_versions(self) -> list[FakeVersionRow]:
         return self.prompt_versions_value
+
+    async def insert_life_event(self, *, text: str, created_at: int) -> int:
+        event_id = self._next_life_event_id
+        self._next_life_event_id += 1
+        self.life_events_store[event_id] = LifeEventRow(
+            id=event_id,
+            text=text,
+            created_at=created_at,
+            announced_at=None,
+            announced_tg_message_id=None,
+        )
+        return event_id
+
+    async def life_events(self) -> list[LifeEventRow]:
+        return sorted(self.life_events_store.values(), key=lambda e: (e.created_at, e.id))
+
+    async def life_event(self, event_id: int) -> LifeEventRow | None:
+        return self.life_events_store.get(event_id)
+
+    async def delete_life_event(self, event_id: int) -> bool:
+        return self.life_events_store.pop(event_id, None) is not None
 
 
 @dataclass
@@ -191,6 +220,28 @@ class FakePromptStore:
 
 
 @dataclass
+class FakeResponder:
+    """Структурно подходит под commands._ResponderLike."""
+
+    announce_life_result: SendOutcome = field(
+        default_factory=lambda: SendOutcome(sent=True, text="Продал Октавию", reason="send:life")
+    )
+    say_result: SendOutcome = field(
+        default_factory=lambda: SendOutcome(sent=True, text="", reason="send:say")
+    )
+    announce_life_calls: list[LifeEventRow] = field(default_factory=list)
+    say_calls: list[str] = field(default_factory=list)
+
+    async def announce_life(self, event: LifeEventRow) -> SendOutcome:
+        self.announce_life_calls.append(event)
+        return self.announce_life_result
+
+    async def say(self, text: str) -> SendOutcome:
+        self.say_calls.append(text)
+        return self.say_result
+
+
+@dataclass
 class FakeDeps:
     """Структурно подходит под commands._CommandsDeps."""
 
@@ -198,7 +249,7 @@ class FakeDeps:
     config_store: FakeConfigStore
     prompt_store: FakePromptStore
     db: FakeDb
-    responder: object | None
+    responder: FakeResponder | None
     bot_user_id: int
     bot_username: str
     sticker_catalog_enabled: int = 0
@@ -271,7 +322,11 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def _deps(
-    *, settings: Settings, config: Config, db: FakeDb | None = None
+    *,
+    settings: Settings,
+    config: Config,
+    db: FakeDb | None = None,
+    responder: FakeResponder | None = None,
 ) -> tuple[FakeDeps, FakeDb, FakeConfigStore, FakePromptStore]:
     fake_db = db if db is not None else FakeDb()
     config_store = FakeConfigStore(cfg=config)
@@ -281,7 +336,7 @@ def _deps(
         config_store=config_store,
         prompt_store=prompt_store,
         db=fake_db,
-        responder=None,
+        responder=responder,
         bot_user_id=BOT_USER_ID,
         bot_username=BOT_USERNAME,
     )
@@ -970,6 +1025,371 @@ async def test_ex_rm(monkeypatch: pytest.MonkeyPatch, config: Config, sent: list
     assert sent == ["few-shot: версия 9 (удалён пример 1 с конца)"]
 
 
+# --- /life --------------------------------------------------------------------
+
+
+async def test_life_add_empty_text_replies_usage(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life")
+    await handler(message)
+
+    assert sent == ["Использование: /life <текст> | list | rm N | post N"]
+    assert db.life_events_store == {}
+    assert db.audit_stop_calls == []
+
+
+async def test_life_add_without_responder_only_records(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config, responder=None)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID),
+        from_user=_user(ADMIN_ID),
+        text="/life продал старую машину, взял другую",
+    )
+    await handler(message)
+
+    now = int(NOW.timestamp())
+    assert list(db.life_events_store.values()) == [
+        LifeEventRow(
+            id=1,
+            text="продал старую машину, взял другую",
+            created_at=now,
+            announced_at=None,
+            announced_tg_message_id=None,
+        )
+    ]
+    assert db.audit_stop_calls == [("life:add", ADMIN_ID, now)]
+    assert db.audit_values["life:add"] == "продал старую машину, взял другую"
+    assert sent == ["Записал #1. LLM не настроен, в чат не отправлено."]
+
+
+async def test_life_add_with_responder_sent(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(
+        announce_life_result=SendOutcome(
+            sent=True, text="Продал Октавию, взял Кию Сид.", reason="send:life"
+        )
+    )
+    deps, db, _, _ = _deps(settings=settings, config=config, responder=responder)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID),
+        from_user=_user(ADMIN_ID),
+        text="/life продал Октавию, взял Кию Сид",
+    )
+    await handler(message)
+
+    now = int(NOW.timestamp())
+    assert len(responder.announce_life_calls) == 1
+    assert responder.announce_life_calls[0].id == 1
+    assert responder.announce_life_calls[0].text == "продал Октавию, взял Кию Сид"
+    assert db.audit_stop_calls == [("life:add", ADMIN_ID, now)]
+    assert sent == ["Записал #1. Отправлено: Продал Октавию, взял Кию Сид."]
+
+
+async def test_life_add_blocked_by_panic(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(
+        announce_life_result=SendOutcome(sent=False, text="", reason="blocked:panic")
+    )
+    deps, _, _, _ = _deps(settings=settings, config=config, responder=responder)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life новость"
+    )
+    await handler(message)
+
+    assert sent == ["Записал #1. Бот молчит (panic/stop) — /resume."]
+
+
+async def test_life_add_not_sent_shows_reason_and_candidate(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(
+        announce_life_result=SendOutcome(sent=False, text="Продал тачку.", reason="regex:sentences")
+    )
+    deps, _, _, _ = _deps(settings=settings, config=config, responder=responder)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life новость"
+    )
+    await handler(message)
+
+    assert sent == ["Записал #1. Не отправлено: regex:sentences\nКандидат: Продал тачку."]
+
+
+async def test_life_add_not_sent_without_candidate_text(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(
+        announce_life_result=SendOutcome(sent=False, text="", reason="llm:silent")
+    )
+    deps, _, _, _ = _deps(settings=settings, config=config, responder=responder)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life новость"
+    )
+    await handler(message)
+
+    assert sent == ["Записал #1. Не отправлено: llm:silent"]
+
+
+async def test_life_list_empty(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life list")
+    await handler(message)
+
+    assert sent == ["Событий нет."]
+
+
+async def test_life_list_formats_rows_oldest_first(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.life_events_store[1] = LifeEventRow(
+        id=1,
+        text="продал Октавию",
+        created_at=int(datetime(2026, 1, 5, 9, 0, tzinfo=UTC).timestamp()),
+        announced_at=int(datetime(2026, 1, 5, 9, 1, tzinfo=UTC).timestamp()),
+        announced_tg_message_id=42,
+    )
+    db.life_events_store[2] = LifeEventRow(
+        id=2,
+        text="взял Кию Сид",
+        created_at=int(datetime(2026, 1, 9, 9, 0, tzinfo=UTC).timestamp()),
+        announced_at=None,
+        announced_tg_message_id=None,
+    )
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life list")
+    await handler(message)
+
+    assert sent == ["#1 05.01.2026 ✓ продал Октавию\n#2 09.01.2026 — взял Кию Сид"]
+
+
+async def test_life_rm_deletes_existing_event(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.life_events_store[3] = LifeEventRow(
+        id=3, text="продал тачку", created_at=1, announced_at=None, announced_tg_message_id=None
+    )
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life rm 3")
+    await handler(message)
+
+    now = int(NOW.timestamp())
+    assert 3 not in db.life_events_store
+    assert db.audit_stop_calls == [("life:rm", ADMIN_ID, now)]
+    assert sent == ["Событие #3 удалено."]
+
+
+async def test_life_rm_missing_event(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life rm 9")
+    await handler(message)
+
+    assert sent == ["Нет события #9."]
+    assert db.audit_stop_calls == []
+
+
+async def test_life_rm_without_number_replies_usage(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life rm")
+    await handler(message)
+
+    assert sent == ["Использование: /life <текст> | list | rm N | post N"]
+
+
+async def test_life_post_resends_existing_event_without_zapisal_prefix(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(
+        announce_life_result=SendOutcome(sent=True, text="Продал тачку.", reason="send:life")
+    )
+    deps, db, _, _ = _deps(settings=settings, config=config, responder=responder)
+    db.life_events_store[4] = LifeEventRow(
+        id=4, text="продал тачку", created_at=1, announced_at=None, announced_tg_message_id=None
+    )
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life post 4")
+    await handler(message)
+
+    now = int(NOW.timestamp())
+    assert len(responder.announce_life_calls) == 1
+    assert responder.announce_life_calls[0].id == 4
+    assert db.audit_stop_calls == [("life:post", ADMIN_ID, now)]
+    assert sent == ["Отправлено: Продал тачку."]
+
+
+async def test_life_post_missing_event(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life post 9")
+    await handler(message)
+
+    assert sent == ["Нет события #9."]
+
+
+async def test_life_post_without_responder(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config, responder=None)
+    db.life_events_store[5] = LifeEventRow(
+        id=5, text="продал тачку", created_at=1, announced_at=None, announced_tg_message_id=None
+    )
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/life post 5")
+    await handler(message)
+
+    assert sent == ["LLM не настроен, в чат не отправлено."]
+
+
+async def test_life_command_in_chat_does_nothing(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_chat(), from_user=_user(ADMIN_ID), text="/life новость")
+    await handler(message)
+
+    assert db.life_events_store == {}
+    assert sent == []
+
+
+# --- /say ---------------------------------------------------------------------
+
+
+async def test_say_empty_text_replies_usage(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/say")
+    await handler(message)
+
+    assert sent == ["Использование: /say <текст>"]
+    assert db.audit_stop_calls == []
+
+
+async def test_say_without_responder(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config, responder=None)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/say Всем привет"
+    )
+    await handler(message)
+
+    now = int(NOW.timestamp())
+    assert db.audit_stop_calls == [("say", ADMIN_ID, now)]
+    assert sent == ["LLM-часть выключена, /say недоступен."]
+
+
+async def test_say_sends_text_verbatim(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(say_result=SendOutcome(sent=True, text="", reason="send:say"))
+    deps, db, _, _ = _deps(settings=settings, config=config, responder=responder)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID),
+        from_user=_user(ADMIN_ID),
+        text="/say Всем   привет,   как дела?",
+    )
+    await handler(message)
+
+    now = int(NOW.timestamp())
+    assert responder.say_calls == ["Всем   привет,   как дела?"]
+    assert db.audit_stop_calls == [("say", ADMIN_ID, now)]
+    assert sent == ["Отправлено."]
+
+
+async def test_say_blocked_by_stop(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(say_result=SendOutcome(sent=False, text="", reason="blocked:stop"))
+    deps, _, _, _ = _deps(settings=settings, config=config, responder=responder)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/say Всем привет"
+    )
+    await handler(message)
+
+    assert sent == ["Бот молчит (panic/stop) — /resume."]
+
+
+async def test_say_command_in_chat_does_nothing(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_chat(), from_user=_user(ADMIN_ID), text="/say Всем привет")
+    await handler(message)
+
+    assert db.audit_stop_calls == []
+    assert sent == []
+
+
 # --- /status ------------------------------------------------------------------
 
 
@@ -1048,6 +1468,148 @@ async def test_status_shows_circuit_closed_when_key_expired(
     assert "Предохранитель LLM: закрыт, ошибок подряд: 5" in text
 
 
+async def test_status_shows_life_events_total_and_unsent(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.life_events_store[1] = LifeEventRow(
+        id=1, text="продал тачку", created_at=1, announced_at=1, announced_tg_message_id=42
+    )
+    db.life_events_store[2] = LifeEventRow(
+        id=2, text="взял другую", created_at=2, announced_at=None, announced_tg_message_id=None
+    )
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert len(sent) == 1
+    assert "life events: 2 (1)" in sent[0]
+
+
+async def test_status_shows_no_life_events_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "life events: 0 (0)" in sent[0]
+
+
+async def test_status_shows_hot_window_none_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "hot window: нет" in sent[0]
+
+
+async def test_status_shows_hot_window_open_until_local_time_and_count(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    hot_until = now + 900
+    db.state["hot_until"] = str(hot_until)
+    db.state["hot_ambient_count"] = "2"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    expected_time = local_dt(hot_until, config.persona.timezone).strftime("%H:%M")
+    cap = config.behaviour.hot_window.ambient_cap
+    assert f"hot window: до {expected_time} (2/{cap})" in sent[0]
+
+
+async def test_status_shows_hot_window_none_when_expired(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """hot_until в прошлом — /status не должен врать, что окно ещё открыто."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    db.state["hot_until"] = str(now - 10)
+    db.state["hot_ambient_count"] = "1"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "hot window: нет" in sent[0]
+
+
+async def test_status_shows_followup_calls_zero_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.followup.daily_cap
+    assert f"followup calls: 0/{cap}" in sent[0]
+
+
+async def test_status_shows_followup_calls_today_count(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    db.state[day_key("followup_calls", now, config.persona.timezone)] = "7"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.followup.daily_cap
+    assert f"followup calls: 7/{cap}" in sent[0]
+
+
+async def test_status_shows_checkin_none_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "checkin: нет" in sent[0]
+
+
+async def test_status_shows_checkin_due_local_time(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    due = now + 3600
+    db.state["checkin_due"] = str(due)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    expected_time = local_dt(due, config.persona.timezone).strftime("%H:%M")
+    assert f"checkin: due {expected_time}" in sent[0]
+
+
 # --- справка ------------------------------------------------------------------
 
 
@@ -1066,6 +1628,8 @@ async def test_unknown_command_replies_help(
     assert "/panic" in sent[0]
     assert "/stop" in sent[0]
     assert "/mute" in sent[0]
+    assert "/life" in sent[0]
+    assert "/say" in sent[0]
     assert "/help" in sent[0]
 
 

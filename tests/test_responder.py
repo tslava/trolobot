@@ -57,6 +57,16 @@ PROMPT_TEMPLATE = (
     "{context}\n{recent_replies}\n{places}\n{situation}"
 )
 
+# Слот {life} (CLAUDE.md, "события жизни") в обычном PROMPT_TEMPLATE намеренно
+# отсутствует — большинство тестов этого файла его не касаются. Этот вариант
+# нужен только тестам, которые проверяют, что life реально попадает в system.
+PROMPT_TEMPLATE_WITH_LIFE = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "{life}\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{situation}"
+)
+
 WARSAW = ZoneInfo("Europe/Warsaw")
 DAY_NOW = int(datetime(2026, 1, 10, 15, 0, tzinfo=WARSAW).timestamp())
 NIGHT_NOW = int(datetime(2026, 1, 10, 3, 0, tzinfo=WARSAW).timestamp())
@@ -226,10 +236,17 @@ class FakeClock:
         raise AssertionError("FakeClock.run_until_idle: не успокоилось")
 
 
-async def _drive(clock: FakeClock, coro: Awaitable[None]) -> asyncio.Task[None]:
-    """Заворачивает корутину в Task и прогоняет её до конца через FakeClock."""
-    task: asyncio.Task[None] = asyncio.ensure_future(coro)  # type: ignore[arg-type]
-    await clock.run_until(task)
+async def _drive[T](clock: FakeClock, coro: Awaitable[T]) -> asyncio.Task[T]:
+    """Заворачивает корутину в Task и прогоняет её до конца через FakeClock.
+
+    Обобщённая по возвращаемому типу — ``announce_life``/``say`` (CLAUDE.md, "события
+    жизни") возвращают ``SendOutcome``, а не ``None``, как обычные хендлеры этого
+    файла; ``FakeClock.run_until`` при этом сам типизирован под ``Task[None]``, потому
+    что использует только ``task.done()`` и не читает результат — приведение типа
+    здесь безопасно ровно поэтому.
+    """
+    task: asyncio.Task[T] = asyncio.ensure_future(coro)
+    await clock.run_until(task)  # type: ignore[arg-type]  # run_until не читает .result()
     return task
 
 
@@ -276,6 +293,17 @@ def _invalid_json_response() -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
+def _checkin_response(text: str, reply_to: int | None) -> httpx.Response:
+    """Ответ модели для триггера "checkin" (CLAUDE.md, "вернулся проверить") —
+    JSON с полем reply_to, как реально возвращает JSON_REMINDER_CHECKIN."""
+    content = json.dumps({"speak": True, "text": text, "reply_to": reply_to}, ensure_ascii=False)
+    body = {
+        "choices": [{"message": {"content": content}}],
+        "usage": {"cost": 0.001, "prompt_tokens": 10, "completion_tokens": 5},
+    }
+    return httpx.Response(200, json=body)
+
+
 def _fail_handler(_request: httpx.Request) -> httpx.Response:
     raise AssertionError("LLM не должен был вызываться")
 
@@ -302,6 +330,23 @@ class MinRandom:
 
     def randint(self, lo: int, hi: int) -> int:
         return lo
+
+    def uniform(self, lo: float, hi: float) -> float:
+        return lo
+
+
+class MaxRandom:
+    """Подделка random.Random, детерминированно отдающая максимум диапазона: .random()
+    -> 0.999999 (всегда последний, самый долгий бакет задержки), .randint(lo, hi) -> hi,
+    .uniform(lo, hi) -> lo. Нужна тестам потолка задержки горячего окна
+    (``hot_window.mention_max_delay_sec``), чтобы базовая (без потолка) задержка была
+    заведомо больше потолка и надёжно проверяла срабатывание/несрабатывание сдвига."""
+
+    def random(self) -> float:
+        return 0.999999
+
+    def randint(self, lo: int, hi: int) -> int:
+        return hi
 
     def uniform(self, lo: float, hi: float) -> float:
         return lo
@@ -393,6 +438,12 @@ def _make_responder(
         clock=clock.now,
         sleep=clock.sleep,
     )
+
+
+async def _noop_open_hot_window(_cfg: Config, _now: int) -> None:
+    """Подделка ``Responder._maybe_open_hot_window`` — для тестов, которые
+    проверяют состояние счётчиков ДО того, как общий хвост ``_generate_and_send``
+    откроет/продлит горячее окно (CLAUDE.md, "внимание как у живого человека")."""
 
 
 async def _tick_until(
@@ -1913,6 +1964,249 @@ async def test_maybe_spontaneous_skipped_outside_window(db: Database) -> None:
         await llm.aclose()
 
 
+# --- 18b. checkin_job / _maybe_checkin: «вернулся проверить» (CLAUDE.md, "внимание ---
+# --- как у живого человека"). ---
+
+
+async def _insert_bot_reply(db_: Database, *, created_at: int, tg_message_id: int = 1) -> None:
+    await db_.insert_bot_reply(
+        tg_message_id=tg_message_id,
+        reply_to_tg_message_id=None,
+        trigger="ambient",
+        trigger_tg_message_id=None,
+        text="реплика Фёдора",
+        prompt_version=1,
+        few_shot_version=1,
+        delay_sec=0,
+        created_at=created_at,
+    )
+
+
+async def test_maybe_checkin_schedules_due_from_closed_hot_window(db: Database) -> None:
+    """due считается от последнего известного (уже закрытого) hot_until, а не от now."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        hot_until = DAY_NOW - 10  # окно уже закрылось
+        await db.set_state("hot_until", str(hot_until))
+        await _insert_bot_reply(db, created_at=hot_until)
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        after_min_lo = cfg.behaviour.checkin.after_min[0]
+        assert await db.get_state("checkin_due") == str(hot_until + after_min_lo * 60)
+        assert await db.get_state("checkin_due_hot_until") == str(hot_until)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_skipped_while_hot_window_still_open(db: Database) -> None:
+    """Телефон ещё в руках — followup справляется, отдельная проверка не идёт,
+    checkin_due вообще не вычисляется."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("hot_until", str(DAY_NOW + 900))
+        await _insert_bot_reply(db, created_at=DAY_NOW - 100)
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert await db.get_state("checkin_due") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_no_new_messages_reschedules_without_llm_call(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _insert_bot_reply(db, created_at=last_reply_at)
+        # hot_window не выставлялся вовсе -> due_ref = last_reply_at (см. докстринг
+        # _maybe_checkin); due уже наступил.
+        await db.set_state("checkin_due", str(DAY_NOW - 10))
+        await db.set_state("checkin_due_hot_until", str(last_reply_at))
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert bot.sent == []
+        after_min_lo = cfg.behaviour.checkin.after_min[0]
+        assert await db.get_state("checkin_last_at") == str(DAY_NOW)
+        assert await db.get_state("checkin_due") == str(DAY_NOW + after_min_lo * 60)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_sends_reply_to_selected_message(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _checkin_response("Бывает, гараж зовёт.", 2))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _insert_bot_reply(db, created_at=last_reply_at)
+        await _insert_message(
+            db,
+            tg_message_id=701,
+            user_id=5,
+            display_name="Дима",
+            text="как сам, дед?",
+            created_at=last_reply_at + 10,
+        )
+        await _insert_message(
+            db,
+            tg_message_id=702,
+            user_id=6,
+            display_name="Аня",
+            text="федя, ты живой вообще?",
+            created_at=last_reply_at + 20,
+        )
+        await db.set_state("checkin_due", str(DAY_NOW - 10))
+        await db.set_state("checkin_due_hot_until", str(last_reply_at))
+
+        await _drive(clock, responder._maybe_checkin())
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Бывает, гараж зовёт."
+        assert bot.sent[0][2] == 702  # reply_to=2 -> второе сообщение (Аня, tg 702)
+
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:checkin") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_speak_false_logs_silent_and_reschedules(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _silent_response())
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _insert_bot_reply(db, created_at=last_reply_at)
+        await _insert_message(
+            db,
+            tg_message_id=800,
+            user_id=5,
+            display_name="Дима",
+            text="привет",
+            created_at=last_reply_at + 10,
+        )
+        await db.set_state("checkin_due", str(DAY_NOW - 10))
+        await db.set_state("checkin_due_hot_until", str(last_reply_at))
+
+        await responder._maybe_checkin()
+
+        assert len(calls) == 1
+        assert bot.sent == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("llm:silent") == 1
+        after_min_lo = cfg.behaviour.checkin.after_min[0]
+        assert await db.get_state("checkin_last_at") == str(DAY_NOW)
+        assert await db.get_state("checkin_due") == str(DAY_NOW + after_min_lo * 60)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_dead_topic_deletes_due_and_skips(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        topic_max_hours = cfg.behaviour.checkin.topic_max_hours
+        last_reply_at = DAY_NOW - (topic_max_hours + 1) * 3600
+        await _insert_bot_reply(db, created_at=last_reply_at)
+        await db.set_state("checkin_due", str(DAY_NOW - 10))
+        await db.set_state("checkin_due_hot_until", str(last_reply_at))
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert await db.get_state("checkin_due") is None
+        assert await db.get_state("checkin_due_hot_until") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_blocked_by_panic(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("panic", "1")
+        await _insert_bot_reply(db, created_at=DAY_NOW - 20000)
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert await db.get_state("checkin_due") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_blocked_by_stop(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("stop_until", str(DAY_NOW + 1000))
+        await _insert_bot_reply(db, created_at=DAY_NOW - 20000)
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert await db.get_state("checkin_due") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_blocked_during_quiet_window(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(NIGHT_NOW)  # 3:00 — внутри quiet_window по умолчанию (02:00-07:00)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_bot_reply(db, created_at=NIGHT_NOW - 20000)
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert await db.get_state("checkin_due") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 # --- 19. Сериализация генерации: второй ambient PASS ждёт лок, пока первый висит ---
 # --- в LLM, и после освобождения лока перепроверка кулдауна режет его. ---
 
@@ -1921,6 +2215,13 @@ async def test_ambient_generation_is_serialized_and_recheck_blocks_second(
     db: Database,
 ) -> None:
     cfg = _config()
+    # Горячее окно выключено намеренно: этот тест про сериализацию генерации и
+    # перепроверку дневного бюджета/кулдауна ambient, а не про горячее окно —
+    # с ним включённым первая отправка открывала бы окно и снимала кулдаун для
+    # второй (CLAUDE.md, "внимание как у живого человека": окно открывается
+    # после любой отправки), что смешивало бы два независимых поведения в одном
+    # тесте. Горячее окно проверяется отдельными тестами ниже.
+    cfg.behaviour.hot_window.enabled = False
     started = asyncio.Event()
     release = asyncio.Event()
     calls: list[httpx.Request] = []
@@ -2661,6 +2962,806 @@ async def test_sticker_chooser_not_called_when_min_replies_between_not_elapsed(
         assert bot.sent_stickers == []
         assert len(bot.sent) == 1
         assert await db.get_state("replies_since_sticker") == "2"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- события жизни (/life) и прямая реплика (/say), CLAUDE.md ---------------
+
+
+async def test_announce_life_sends_and_marks_event_announced(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ну вот, продал таки."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        event_id = await db.insert_life_event(
+            text="продал Октавию, взял Кию Сид", created_at=DAY_NOW
+        )
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        task = await _drive(clock, responder.announce_life(event))
+        outcome = task.result()
+
+        assert outcome.sent is True
+        assert outcome.text == "Ну вот, продал таки."
+        assert outcome.reason == "send:life"
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Ну вот, продал таки."
+        assert bot.sent[0][2] is None  # не реплай
+
+        announced = await db.life_event(event_id)
+        assert announced is not None
+        assert announced.announced_tg_message_id is not None
+
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == "life"
+        assert last[0].tg_message_id == announced.announced_tg_message_id
+        # now зафиксирован в начале announce_life, до typing-паузы — тот же момент,
+        # что и bot_replies.created_at (clock.now() после _drive уже другой:
+        # typing-цикл успел продвинуть FakeClock вперёд).
+        assert announced.announced_at == last[0].created_at
+
+        # Ситуация (пересказ новости) уходит в user-сообщение, не в system.
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "продал Октавию, взял Кию Сид" in user_content
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "send:life" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_does_not_touch_mention_or_ambient_counters(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        task = await _drive(clock, responder.announce_life(event))
+        assert task.result().sent is True
+
+        tz = cfg.persona.timezone
+        assert await db.get_state(day_key("mention_count", clock.now(), tz)) is None
+        assert await db.get_state(day_key("ambient_count", clock.now(), tz)) is None
+        assert await db.get_state("last_mention_reply_at") is None
+        assert await db.get_state("last_ambient_at") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_never_chooses_sticker(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    chooser = FakeStickerChooser(sticker=Sticker(id=1, file_id="F1", text="Т", enabled=True))
+    responder = _make_responder(db, cfg, llm, bot, clock, sticker_chooser=chooser)
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        await _drive(clock, responder.announce_life(event))
+
+        assert chooser.calls == []
+        assert bot.sent_stickers == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_blocked_by_panic(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("panic", "1")
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        outcome = await responder.announce_life(event)
+
+        assert outcome.sent is False
+        assert outcome.reason == "blocked:panic"
+        assert bot.sent == []
+        still = await db.life_event(event_id)
+        assert still is not None
+        assert still.announced_at is None
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "send:blocked_panic" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_blocked_by_stop(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("stop_until", str(DAY_NOW + 1000))
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        outcome = await responder.announce_life(event)
+
+        assert outcome.sent is False
+        assert outcome.reason == "blocked:stop"
+        assert bot.sent == []
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "send:blocked_stop" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_llm_error_returns_reason_and_does_not_send(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: httpx.Response(500, text="boom"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        outcome = await responder.announce_life(event)
+
+        assert outcome.sent is False
+        assert outcome.reason == "llm:http"
+        assert bot.sent == []
+        still = await db.life_event(event_id)
+        assert still is not None
+        assert still.announced_at is None
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "llm:http" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_filter_cut_not_shadow_returns_sent_false_with_candidate(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    cfg.filters.shadow = False
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(ok=False, reason="regex:length", reasons=("regex:length",))
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        outcome = await responder.announce_life(event)
+
+        assert outcome.sent is False
+        assert outcome.text == "Кандидат."
+        assert outcome.reason == "regex:length"
+        assert bot.sent == []
+
+        still = await db.life_event(event_id)
+        assert still is not None
+        assert still.announced_at is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_latin_from_note_passes_venue_filter(db: Database) -> None:
+    """Латинское название из заметки владельца («Kia Ceed») не режется regex:venue:
+    текст события уходит как trigger_text и попадает в белый список фильтра."""
+    cfg = _config()
+    cfg.filters.shadow = False
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Взял Kia Ceed, старую продал."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        event_id = await db.insert_life_event(
+            text="продал Октавию, взял Kia Ceed 2015 года", created_at=DAY_NOW
+        )
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        task = await _drive(clock, responder.announce_life(event))
+        outcome = task.result()
+
+        assert outcome.sent is True
+        assert outcome.reason == "send:life"
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+
+
+async def test_announce_life_shadow_mode_still_sends(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    cfg.filters.shadow = True
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(ok=False, reason="regex:length", reasons=("regex:length",))
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        task = await _drive(clock, responder.announce_life(event))
+        outcome = task.result()
+
+        assert outcome.sent is True
+        assert outcome.reason == "send:life"
+        assert len(bot.sent) == 1
+
+        announced = await db.life_event(event_id)
+        assert announced is not None
+        assert announced.announced_at is not None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_life_slot_filled_in_system_for_ordinary_ambient_reply(db: Database) -> None:
+    """CLAUDE.md: слот {life} заполняется ВСЕГДА, для любого триггера — не только
+    для announce_life."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_LIFE)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+    try:
+        await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW - 100)
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=900, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        payload = _payload(calls[0])
+        system_content = payload["messages"][0]["content"]  # type: ignore[index]
+        assert "продал Октавию" in system_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_say_sends_text_verbatim_without_model(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        task = await _drive(clock, responder.say("Ну здарова, короче да."))
+        outcome = task.result()
+
+        assert outcome.sent is True
+        assert outcome.text == "Ну здарова, короче да."
+        assert outcome.reason == "send:say"
+        assert calls == []  # модель не вызывалась
+        assert len(bot.sent) == 1
+        assert bot.sent[0][1] == "Ну здарова, короче да."
+
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == "say"
+        assert last[0].text == "Ну здарова, короче да."
+        assert last[0].trigger_tg_message_id is None
+
+        assert await db.get_state("replies_since_sticker") == "1"
+
+        tz = cfg.persona.timezone
+        assert await db.get_state(day_key("mention_count", clock.now(), tz)) is None
+        assert await db.get_state(day_key("ambient_count", clock.now(), tz)) is None
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "send:say" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_say_blocked_by_panic(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("panic", "1")
+
+        outcome = await responder.say("текст")
+
+        assert outcome.sent is False
+        assert outcome.reason == "blocked:panic"
+        assert bot.sent == []
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_say_blocked_by_stop(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("stop_until", str(DAY_NOW + 1000))
+
+        outcome = await responder.say("текст")
+
+        assert outcome.sent is False
+        assert outcome.reason == "blocked:stop"
+        assert bot.sent == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Горячее окно после /life и /say (CLAUDE.md, "горячее окно"): announce_life/say
+# открывают/продлевают окно, обращения ограничены mention_max_delay_sec, ambient
+# в окне живёт своим бюджетом (hot_ambient_count) вместо дневного.
+# ---------------------------------------------------------------------------
+
+
+async def test_announce_life_opens_hot_window(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Продал, ага."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        task = await _drive(clock, responder.announce_life(event))
+        assert task.result().sent is True
+
+        # now зафиксирован в начале announce_life, до typing-паузы (та же логика,
+        # что и у announced_at в test_announce_life_sends_and_marks_event_announced).
+        hot_until_raw = await db.get_state("hot_until")
+        assert hot_until_raw == str(DAY_NOW + cfg.behaviour.hot_window.minutes * 60)
+        assert await db.get_state("hot_ambient_count") == "0"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_does_not_open_hot_window_when_disabled(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.hot_window.enabled = False
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Продал, ага."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        await _drive(clock, responder.announce_life(event))
+
+        assert await db.get_state("hot_until") is None
+        assert await db.get_state("hot_ambient_count") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_does_not_open_hot_window_when_not_sent(db: Database) -> None:
+    """Заблокировано panic'ом -> outcome.sent=False -> окно не открывается."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("panic", "1")
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        outcome = await responder.announce_life(event)
+        assert outcome.sent is False
+
+        assert await db.get_state("hot_until") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_announce_life_extends_existing_hot_window_and_resets_counter(db: Database) -> None:
+    """Повторный /life внутри уже открытого окна продлевает его заново от now и
+    сбрасывает счётчик — старые ambient-реплики этого окна не переносятся в новое."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("И такое бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("hot_until", str(DAY_NOW + 60))
+        await db.set_state("hot_ambient_count", "3")
+
+        event_id = await db.insert_life_event(text="взял новую собаку", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        await _drive(clock, responder.announce_life(event))
+
+        expected_hot_until = DAY_NOW + cfg.behaviour.hot_window.minutes * 60
+        assert await db.get_state("hot_until") == str(expected_hot_until)
+        assert await db.get_state("hot_ambient_count") == "0"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_say_opens_hot_window(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        task = await _drive(clock, responder.say("Ну здарова."))
+        assert task.result().sent is True
+
+        assert await db.get_state("hot_until") == str(
+            DAY_NOW + cfg.behaviour.hot_window.minutes * 60
+        )
+        assert await db.get_state("hot_ambient_count") == "0"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_say_does_not_open_hot_window_when_blocked(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("stop_until", str(DAY_NOW + 1000))
+
+        outcome = await responder.say("текст")
+        assert outcome.sent is False
+
+        assert await db.get_state("hot_until") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_mention_delay_capped_by_hot_window(db: Database) -> None:
+    """Без окна (MaxRandom) обычный бакет отдал бы 3600с — в окне ответ на
+    обращение не может быть отложен дальше mention_max_delay_sec."""
+    cfg = _config()
+    cfg.behaviour.hot_window.mention_max_delay_sec = 120
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MaxRandom())
+    try:
+        await db.set_state("hot_until", str(DAY_NOW + 1000))
+
+        msg = _gate_message(tg_message_id=30, user_id=5, text="фёдор, как сам?", created_at=DAY_NOW)
+        await responder._handle_debounced(Trigger.NAME, msg, "Дима")
+
+        rows = await db.load_pending()
+        assert len(rows) == 1
+        assert rows[0].due_at == DAY_NOW + cfg.behaviour.hot_window.mention_max_delay_sec
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_mention_delay_not_capped_outside_hot_window(db: Database) -> None:
+    """Тот же сценарий (MaxRandom, долгий бакет), но без открытого окна — потолок
+    не применяется, задержка остаётся обычной (не связана с mention_max_delay_sec)."""
+    cfg = _config()
+    cfg.behaviour.hot_window.mention_max_delay_sec = 120
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MaxRandom())
+    try:
+        msg = _gate_message(tg_message_id=31, user_id=5, text="фёдор, как сам?", created_at=DAY_NOW)
+        await responder._handle_debounced(Trigger.NAME, msg, "Дима")
+
+        rows = await db.load_pending()
+        assert len(rows) == 1
+        assert rows[0].due_at - DAY_NOW > cfg.behaviour.hot_window.mention_max_delay_sec
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_mention_earliest_capped_by_hot_window(db: Database) -> None:
+    """Кулдаун-сдвиг (earliest) в окне тоже ограничен mention_max_delay_sec: без
+    этого ограничения earliest был бы DAY_NOW-10+200=DAY_NOW+190."""
+    cfg = _config()
+    cfg.behaviour.mention_chat_cooldown_sec = 200
+    cfg.behaviour.hot_window.mention_max_delay_sec = 120
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        await db.set_state("hot_until", str(DAY_NOW + 1000))
+        await db.set_state("last_mention_reply_at", str(DAY_NOW - 10))
+
+        msg = _gate_message(tg_message_id=32, user_id=5, text="фёдор, ты где", created_at=DAY_NOW)
+        await responder._handle_debounced(Trigger.NAME, msg, "Дима")
+
+        rows = await db.load_pending()
+        assert len(rows) == 1
+        # earliest без окна был бы DAY_NOW+190; окно ограничивает его DAY_NOW+120,
+        # MinRandom.randint -> 5 сверху earliest.
+        assert rows[0].due_at == DAY_NOW + 120 + 5
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_ambient_recheck_hot_cap_blocks_send_in_hot_window(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.hot_window.ambient_cap = 1
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("hot_until", str(DAY_NOW + 1000))
+        await db.set_state("hot_ambient_count", "1")
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=900,
+                user_id=None,
+                situation="",
+                delay_sec=0,
+            ),
+        )
+
+        assert calls == []
+        assert bot.sent == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:recheck_hot_cap") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_ambient_reply_in_hot_window_increments_hot_counter_not_daily(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("hot_until", str(DAY_NOW + 1000))
+        # _maybe_open_hot_window сброшен намеренно: этот тест проверяет, какой
+        # счётчик инкрементится ДО хвоста, открывающего/продлевающего окно
+        # (CLAUDE.md, "внимание как у живого человека" — окно теперь открывается
+        # после любой успешной отправки, а не только announce_life/say, и сразу
+        # обнулило бы hot_ambient_count тем же вызовом). Что окно действительно
+        # переоткрывается после ambient-ответа, проверяет отдельный тест ниже.
+        responder._maybe_open_hot_window = _noop_open_hot_window  # type: ignore[method-assign]
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=900,
+                user_id=None,
+                situation="",
+                delay_sec=0,
+            ),
+        )
+
+        assert len(bot.sent) == 1
+        tz = cfg.persona.timezone
+        assert await db.get_state(day_key("ambient_count", clock.now(), tz)) is None
+        assert await db.get_state("last_ambient_at") is None
+        assert await db.get_state("hot_ambient_count") == "1"
+
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == "ambient"  # bot_replies.trigger остаётся ambient
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "send:ambient_hot" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_ambient_reply_outside_hot_window_uses_daily_budget_as_before(db: Database) -> None:
+    """Регрессия: без ранее открытого окна ambient-ответ по-прежнему тратит дневной
+    бюджет (не "горячий"), но общий хвост ``_generate_and_send`` теперь открывает
+    свежее горячее окно после ЛЮБОЙ успешной отправки (CLAUDE.md, "внимание как у
+    живого человека") — hot_ambient_count после этого "0" (только что открытое
+    окно), а не отсутствует, как было до этого решения владельца."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=900,
+                user_id=None,
+                situation="",
+                delay_sec=0,
+            ),
+        )
+
+        tz = cfg.persona.timezone
+        assert await db.get_state(day_key("ambient_count", clock.now(), tz)) == "1"
+        assert await db.get_state("last_ambient_at") is not None
+        assert await db.get_state("hot_ambient_count") == "0"
+        hot_until_raw = await db.get_state("hot_until")
+        assert hot_until_raw is not None
+        assert int(hot_until_raw) > clock.now()
+
+        logs = await db.filter_log_summary(clock.now() - 10)
+        assert any(reason == "send:ambient" for reason, _count in logs)
+        assert not any(reason == "send:ambient_hot" for reason, _count in logs)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_morning_reply_opens_hot_window(db: Database) -> None:
+    """Общий хвост _generate_and_send открывает окно после ЛЮБОЙ успешной
+    отправки, включая утреннюю реплику (CLAUDE.md, "внимание как у живого
+    человека") — не только announce_life/say."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Доброе утро, был занят."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.enqueue_night(
+            tg_message_id=200,
+            user_id=5,
+            display_name="Дима",
+            text="фёдор ты тут?",
+            created_at=DAY_NOW - 3600,
+        )
+
+        await _drive(clock, responder._run_morning_once())
+
+        assert len(bot.sent) == 1
+        hot_until_raw = await db.get_state("hot_until")
+        assert hot_until_raw is not None
+        assert int(hot_until_raw) > DAY_NOW  # окно открыто в будущее от момента ответа
+        assert await db.get_state("hot_ambient_count") == "0"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Followup: дешёвая проверка "это мне?" превращает сообщение в обращение
+# (CLAUDE.md, "внимание как у живого человека"). bot.py уже отфильтровал
+# кандидатов по FOLLOWUP_REASONS/hot_until/checker.check() — responder.py
+# получает on_gate_pass(gm, Trigger.FOLLOWUP, display_name) и обязан вести
+# себя как с любым другим обращением (mention/reply/name).
+# ---------------------------------------------------------------------------
+
+
+async def test_followup_creates_pending_like_other_address_triggers(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает такое."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_message(
+            db,
+            tg_message_id=700,
+            user_id=5,
+            display_name="Дима",
+            text="ну и денёк выдался",
+            created_at=DAY_NOW,
+        )
+        msg = _gate_message(
+            tg_message_id=700, user_id=5, text="ну и денёк выдался", created_at=DAY_NOW
+        )
+        await responder.on_gate_pass(msg, Trigger.FOLLOWUP, "Дима")
+        assert responder._debounce_task is not None
+        await clock.run_until(responder._debounce_task)
+
+        pending_rows = await db.load_pending()
+        assert len(pending_rows) == 1
+        assert pending_rows[0].trigger == "followup"
+
+        await clock.run_until(responder._pending_tasks[pending_rows[0].id])
+
+        assert len(calls) == 1
+        payload = _payload(calls[0])
+        user_content = payload["messages"][1]["content"]  # type: ignore[index]
+        assert "Вероятно, Дима сейчас написал тебе или о твоей теме" in user_content
+
+        last = await db.last_bot_replies(1)
+        assert last[0].trigger == "followup"
+
+        tz = cfg.persona.timezone
+        assert await db.get_state(day_key("mention_count", clock.now(), tz)) == "1"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_followup_mention_delay_capped_by_hot_window(db: Database) -> None:
+    """followup — обращение (CLAUDE.md), поэтому в горячем окне его задержка тоже
+    ограничена mention_max_delay_sec, как у mention/reply/name."""
+    cfg = _config()
+    cfg.behaviour.hot_window.mention_max_delay_sec = 120
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает такое."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.set_state("hot_until", str(DAY_NOW + 1000))
+        msg = _gate_message(
+            tg_message_id=701, user_id=5, text="ну и денёк выдался", created_at=DAY_NOW
+        )
+        await responder._handle_debounced(Trigger.FOLLOWUP, msg, "Дима")
+
+        rows = await db.load_pending()
+        assert len(rows) == 1
+        assert rows[0].due_at == DAY_NOW + cfg.behaviour.hot_window.mention_max_delay_sec
     finally:
         await responder.shutdown()
         await llm.aclose()

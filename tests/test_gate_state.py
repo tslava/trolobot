@@ -49,6 +49,8 @@ async def test_load_gate_state_empty_db_gives_defaults(tmp_path: Path) -> None:
         assert state.ambient_count_today == 0
         assert state.last_ambient_at is None
         assert state.recent == ()
+        assert state.hot_until is None
+        assert state.hot_ambient_count == 0
     finally:
         await db.close()
 
@@ -70,6 +72,8 @@ async def test_load_gate_state_reads_filled_keys(tmp_path: Path) -> None:
         await db.set_state("last_ambient_at", "333")
         await db.set_state(day_key("mention_count", now, CONFIG.persona.timezone), "5")
         await db.set_state(day_key("ambient_count", now, CONFIG.persona.timezone), "7")
+        await db.set_state("hot_until", str(now + 1800))
+        await db.set_state("hot_ambient_count", "2")
 
         conn = db._conn
         assert conn is not None
@@ -91,6 +95,8 @@ async def test_load_gate_state_reads_filled_keys(tmp_path: Path) -> None:
         assert state.last_mention_reply_at_user == 222
         assert state.ambient_count_today == 7
         assert state.last_ambient_at == 333
+        assert state.hot_until == now + 1800
+        assert state.hot_ambient_count == 2
     finally:
         await db.close()
 

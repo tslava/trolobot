@@ -18,9 +18,10 @@ from aiogram.types import Message
 
 from trolobot.config_models import Config
 from trolobot.db import Database
+from trolobot.followup import FollowupChecker
 from trolobot.gate import should_consider
 from trolobot.gate_state import load_gate_state
-from trolobot.gate_types import GateMessage, Verdict
+from trolobot.gate_types import GateMessage, Trigger, Verdict
 from trolobot.patterns import Patterns
 from trolobot.reactions import (
     REACT_REASONS,
@@ -38,6 +39,15 @@ logger = logging.getLogger(__name__)
 
 # Обрезка текста в INFO-логе (PLAN.md: лог "Имя: текст").
 _LOG_TEXT_MAX_LEN = 200
+
+# Причины DROP, на которых имеет смысл дешёвая проверка followup (CLAUDE.md,
+# "внимание как у живого человека") — все они означают "сообщение без обращения,
+# которое обычный гейт не признал ambient-репликой". gate:dice здесь — тот же
+# кубик, что и без горячего окна (шаг 11/10h), не оставлять без шанса на followup
+# только потому, что кубик выпал не в пользу ambient-ответа.
+FOLLOWUP_REASONS: frozenset[str] = frozenset(
+    {"gate:dice", "gate:not_live", "gate:ambient_cap", "gate:ambient_cooldown", "gate:hot_cap"}
+)
 
 
 @dataclass(slots=True)
@@ -65,6 +75,10 @@ class Deps:
     prompt_store: PromptStore
     bot_username: str = ""
     responder: Responder | None = None
+    # Дешёвая проверка «это мне?» для сообщений без обращения в горячем окне
+    # (CLAUDE.md, "внимание как у живого человека"). None — LLM не настроен, PASS
+    # по FOLLOWUP_REASONS не проверяется вовсе, поведение как без followup.
+    followup: FollowupChecker | None = None
     # Узкий протокол (set_message_reaction) вместо aiogram.Bot — только для реакций
     # (reactions.py). None в discovery/тестах без реального бота — тогда реакция
     # просто не ставится, сообщение всё равно пишется и гейтится как обычно.
@@ -208,6 +222,61 @@ def build_router(deps: Deps) -> Router:
             await deps.db.apply_state_changes(decision.state_changes)
 
             if decision.verdict is Verdict.DROP:
+                if (
+                    decision.reason in FOLLOWUP_REASONS
+                    and deps.followup is not None
+                    and cfg.behaviour.followup.enabled
+                    and state.hot_until is not None
+                    and now < state.hot_until
+                ):
+                    # Телефон в руках (CLAUDE.md, "внимание как у живого человека"):
+                    # горячее окно ещё открыто, а сообщение без обращения гейт не
+                    # признал ambient-репликой — дешёвая проверка решает, не
+                    # адресовано ли оно боту всё же. context_rows без текущего
+                    # сообщения (оно уже записано insert_message выше).
+                    followup_cfg = cfg.behaviour.followup
+                    context_rows = await deps.db.recent_messages(
+                        gate_message.chat_id, followup_cfg.context_messages + 1
+                    )
+                    context_rows = [
+                        row
+                        for row in context_rows
+                        if row.tg_message_id != gate_message.tg_message_id
+                    ]
+                    recent_replies = await deps.db.recent_bot_replies(followup_cfg.recent_replies)
+                    addressed = await deps.followup.check(
+                        text=text,
+                        display_name=display_name,
+                        context_rows=context_rows,
+                        recent_replies=recent_replies,
+                        now=now,
+                    )
+                    if addressed:
+                        await deps.db.insert_filter_log(
+                            trigger_tg_message_id=gate_message.tg_message_id,
+                            candidate_text=text,
+                            verdict="pass",
+                            stage="followup",
+                            reason="followup:yes",
+                            shadow=False,
+                            created_at=now,
+                        )
+                        logger.info("followup pass: %s", text[:_LOG_TEXT_MAX_LEN])
+                        if deps.responder is not None:
+                            await deps.responder.on_gate_pass(
+                                gate_message, Trigger.FOLLOWUP, display_name
+                            )
+                        return
+                    await deps.db.insert_filter_log(
+                        trigger_tg_message_id=gate_message.tg_message_id,
+                        candidate_text=None,
+                        verdict="cut",
+                        stage="followup",
+                        reason="followup:no",
+                        shadow=False,
+                        created_at=now,
+                    )
+
                 await deps.db.insert_filter_log(
                     trigger_tg_message_id=gate_message.tg_message_id,
                     candidate_text=None,

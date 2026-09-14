@@ -17,6 +17,7 @@ from aiogram import Bot, Dispatcher
 from trolobot.bot import Deps, build_router
 from trolobot.commands import build_commands_router
 from trolobot.db import Database
+from trolobot.followup import FollowupChecker
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
 from trolobot.responder import Responder
@@ -46,6 +47,7 @@ async def main() -> None:
     retention_task: asyncio.Task[None] | None = None
     morning_task: asyncio.Task[None] | None = None
     spontaneous_task: asyncio.Task[None] | None = None
+    checkin_task: asyncio.Task[None] | None = None
     llm: LLMClient | None = None
     responder: Responder | None = None
     try:
@@ -114,6 +116,13 @@ async def main() -> None:
             judge_prompt = settings.judge_prompt_path.read_text(encoding="utf-8")
             judge: Judge | None = Judge(llm, config_store.get, judge_prompt)
 
+            # Дешёвая проверка «это мне?» в горячем окне (CLAUDE.md, "внимание как
+            # у живого человека") — создаётся вместе с остальными LLM-зависимыми
+            # компонентами, как только есть ключ; enabled/model проверяются на
+            # каждом вызове, а не один раз при старте.
+            followup_prompt = settings.followup_prompt_path.read_text(encoding="utf-8")
+            deps.followup = FollowupChecker(llm, config_store.get, followup_prompt)
+
             # Каталог стикеров — офлайн-файл (CLAUDE.md, "Интерфейсы: стикеры"),
             # правится stickers_fill.py и владельцем руками. Пустой/отсутствующий
             # файл -> пустой каталог, чузер не создаётся, всё остальное работает
@@ -145,6 +154,7 @@ async def main() -> None:
             await responder.restore_pending()
             morning_task = asyncio.create_task(responder.morning_job())
             spontaneous_task = asyncio.create_task(responder.spontaneous_job())
+            checkin_task = asyncio.create_task(responder.checkin_job())
 
         logger.info(
             "started as @%s, allowed_chat_id=%s, discovery=%s",
@@ -155,7 +165,7 @@ async def main() -> None:
 
         await dispatcher.start_polling(bot, allowed_updates=["message", "edited_message"])
     finally:
-        for task in (spontaneous_task, morning_task, retention_task):
+        for task in (checkin_task, spontaneous_task, morning_task, retention_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from trolobot.config_models import Config
+from trolobot.config_models import Config, HotWindowConfig
 from trolobot.gate import should_consider
 from trolobot.gate_types import (
     GateMessage,
@@ -125,6 +125,8 @@ def make_state(
     ambient_count_today: int = 0,
     last_ambient_at: int | None = None,
     recent: tuple[RecentActivity, ...] = (),
+    hot_until: int | None = None,
+    hot_ambient_count: int = 0,
 ) -> GateState:
     return GateState(
         panic=panic,
@@ -137,6 +139,8 @@ def make_state(
         ambient_count_today=ambient_count_today,
         last_ambient_at=last_ambient_at,
         recent=recent,
+        hot_until=hot_until,
+        hot_ambient_count=hot_ambient_count,
     )
 
 
@@ -539,6 +543,104 @@ def test_ambient_pass_state_changes_empty() -> None:
     decision = default_call(cfg=make_cfg(ambient_probability=1.0), rng=FixedRandom(0.0))
     assert decision.verdict == Verdict.PASS
     assert decision.state_changes == ()
+
+
+# ---------------------------------------------------------------------------
+# Горячее окно после /life и /say (CLAUDE.md, "горячее окно"): пока
+# state.hot_until открыт, шаг 9 (not_live) пропускается, шаг 10 заменяется на
+# gate:hot_cap, шаг 11 — кости с hot_window.ambient_probability -> pass:ambient_hot.
+# ---------------------------------------------------------------------------
+
+
+def test_hot_window_skips_not_live_check() -> None:
+    """Разговор мёртвый (один автор), но окно открыто и кости благосклонны —
+    not_live не должен сработать вовсе."""
+    cfg = make_cfg(hot_window=HotWindowConfig(enabled=True, ambient_probability=1.0, ambient_cap=5))
+    state = make_state(recent=SINGLE_AUTHOR_RECENT, hot_until=DAY + 1000, hot_ambient_count=0)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(0.0))
+    assert decision.verdict == Verdict.PASS
+    assert decision.trigger == Trigger.AMBIENT
+    assert decision.reason == "pass:ambient_hot"
+
+
+def test_hot_window_hot_cap_drops() -> None:
+    cfg = make_cfg(hot_window=HotWindowConfig(enabled=True, ambient_probability=1.0, ambient_cap=2))
+    state = make_state(recent=LIVE_RECENT, hot_until=DAY + 1000, hot_ambient_count=2)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(0.0))
+    assert decision.verdict == Verdict.DROP
+    assert decision.reason == "gate:hot_cap"
+
+
+def test_hot_window_hot_cap_boundary_passes() -> None:
+    cfg = make_cfg(hot_window=HotWindowConfig(enabled=True, ambient_probability=1.0, ambient_cap=2))
+    state = make_state(recent=LIVE_RECENT, hot_until=DAY + 1000, hot_ambient_count=1)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(0.0))
+    assert decision.verdict == Verdict.PASS
+    assert decision.reason == "pass:ambient_hot"
+
+
+def test_hot_window_dice_uses_hot_probability_not_ambient_probability() -> None:
+    """behaviour.ambient_probability мал (дропнул бы вне окна), а
+    hot_window.ambient_probability велик — в окне используется именно он."""
+    cfg = make_cfg(
+        ambient_probability=0.0,
+        hot_window=HotWindowConfig(enabled=True, ambient_probability=0.9, ambient_cap=5),
+    )
+    state = make_state(recent=LIVE_RECENT, hot_until=DAY + 1000)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(0.5))
+    assert decision.verdict == Verdict.PASS
+    assert decision.reason == "pass:ambient_hot"
+
+
+def test_hot_window_dice_drop_uses_hot_probability() -> None:
+    cfg = make_cfg(
+        ambient_probability=1.0,
+        hot_window=HotWindowConfig(enabled=True, ambient_probability=0.1, ambient_cap=5),
+    )
+    state = make_state(recent=LIVE_RECENT, hot_until=DAY + 1000)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(0.5))
+    assert decision.verdict == Verdict.DROP
+    assert decision.reason == "gate:dice"
+
+
+def test_hot_window_expired_falls_back_to_normal_path() -> None:
+    """hot_until в прошлом — окно закрыто, обычные шаги 9-11 в силе."""
+    cfg = make_cfg(hot_window=HotWindowConfig(enabled=True, ambient_probability=1.0, ambient_cap=5))
+    state = make_state(recent=SINGLE_AUTHOR_RECENT, hot_until=DAY - 1)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(0.0))
+    assert decision.verdict == Verdict.DROP
+    assert decision.reason == "gate:not_live"
+
+
+def test_hot_window_disabled_falls_back_to_normal_path() -> None:
+    """hot_window.enabled=false — окно игнорируется, даже если hot_until открыт."""
+    cfg = make_cfg(
+        hot_window=HotWindowConfig(enabled=False, ambient_probability=1.0, ambient_cap=5)
+    )
+    state = make_state(recent=SINGLE_AUTHOR_RECENT, hot_until=DAY + 1000)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(0.0))
+    assert decision.verdict == Verdict.DROP
+    assert decision.reason == "gate:not_live"
+
+
+def test_hot_window_no_hot_until_falls_back_to_normal_path() -> None:
+    """hot_until отсутствует (None) — обычное поведение, даже если окно включено."""
+    cfg = make_cfg(hot_window=HotWindowConfig(enabled=True, ambient_probability=1.0, ambient_cap=5))
+    state = make_state(recent=LIVE_RECENT, hot_until=None)
+    decision = default_call(state=state, cfg=cfg, rng=FixedRandom(1.0))
+    assert decision.verdict == Verdict.DROP
+    assert decision.reason == "gate:dice"
+
+
+def test_hot_window_address_bypasses_hot_branch_entirely() -> None:
+    """Прямое обращение не проходит через ambient-ветку вовсе, окно тут ни при чём."""
+    cfg = make_cfg(hot_window=HotWindowConfig(enabled=True, ambient_probability=1.0, ambient_cap=0))
+    state = make_state(recent=SINGLE_AUTHOR_RECENT, hot_until=DAY + 1000, hot_ambient_count=99)
+    msg = make_msg(text="фёдор, привет")
+    decision = default_call(msg=msg, state=state, cfg=cfg, rng=FixedRandom(0.0))
+    assert decision.verdict == Verdict.PASS
+    assert decision.trigger == Trigger.NAME
+    assert decision.reason == "pass:name"
 
 
 # ---------------------------------------------------------------------------

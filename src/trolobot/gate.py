@@ -23,6 +23,14 @@
     ``earliest`` в постановке/схлопывании pending).
 7.  ночь (без обращения)                     -> DROP ``gate:night``
 8.  логистика                                -> DROP ``gate:logistics``
+
+    Горячее окно после ``/life``/``/say`` (``state.hot_until``, CLAUDE.md,
+    "горячее окно"): пока оно открыто, шаги 9-11 заменяются на:
+    9h. лимит ambient-реплик за окно         -> DROP ``gate:hot_cap``
+    10h. кости с ``hot_window.ambient_probability`` -> DROP ``gate:dice``;
+         иначе PASS ``pass:ambient_hot`` (шаг 9, "не живой разговор", пропускается).
+
+    Вне окна — как раньше:
 9.  не живой разговор                        -> DROP ``gate:not_live``
 10. дневной лимит ambient / кулдаун чата     -> DROP ``gate:ambient_cap``
     / ``gate:ambient_cooldown``
@@ -148,6 +156,18 @@ def should_consider(
     # 8. логистический фильтр
     if patterns.logistics(msg.text) is not None:
         return _drop("gate:logistics")
+
+    # Горячее окно после /life и /say (решение владельца, CLAUDE.md): пока оно
+    # открыто, живость чата (шаг 9) не проверяется, а дневной лимит/кулдаун
+    # ambient (шаг 10) заменяются своим бюджетом на окно и своей вероятностью.
+    hot_window = behaviour.hot_window
+    hot = hot_window.enabled and state.hot_until is not None and now < state.hot_until
+    if hot:
+        if state.hot_ambient_count >= hot_window.ambient_cap:
+            return _drop("gate:hot_cap")
+        if rng.random() >= hot_window.ambient_probability:
+            return _drop("gate:dice")
+        return Decision(verdict=Verdict.PASS, trigger=Trigger.AMBIENT, reason="pass:ambient_hot")
 
     # 9. живой разговор
     if not _is_live(state, cfg):
