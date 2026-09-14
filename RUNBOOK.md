@@ -19,10 +19,13 @@
 В личке с ботом:
 
 - `/status` — паника, стоп, версии промпта/few-shot, модели, shadow, счётчики
-  дня (ambient/mention/llm_calls/llm_spent/reactions), pending, night queue.
+  дня (ambient/mention/llm_calls/llm_spent/reactions/stickers), pending, night queue.
 - `/why 168` — сводка причин молчания за неделю (`stage:reason count`),
   отсортировано по частоте. Главный сигнал: одна причина резко доминирует —
-  повод разбираться раньше месячного цикла.
+  повод разбираться раньше месячного цикла. `send:sticker` — реплика ушла
+  стикером, а не текстом; частое `send:sticker` рядом с малым числом реплик —
+  повод снизить `behaviour.stickers.daily_cap` или поднять
+  `min_replies_between` через `/set`.
 - Проверить баланс OpenRouter ([openrouter.ai/credits](https://openrouter.ai/credits)) —
   без пополнения запросы режутся по длине задолго до нуля на счету (см.
   «Инциденты с телефона» ниже).
@@ -109,7 +112,39 @@ sqlite3 data/bot.db "SELECT name, fact FROM places;"
 `operational=0` и бот перестаёт его называть — ничего дополнительно делать не
 нужно. Без ключа Google — `--manual-only` (см. README, «Заведения», п.3).
 
-**3. Проверка бэкапов.**
+**3. Обновление каталога стикеров.**
+
+Нужно только после того, как набор стикеров в Telegram поменялся (добавлены/
+убраны стикеры). `stickers.yaml` копируется в образ вместе с `config.yaml` —
+правки `text`/`when`/`enabled`, сделанные руками в репозитории, доезжают на
+прод обычным пушем. Пересобрать каталог из набора — внутри контейнера:
+
+```bash
+ssh owner@host
+cd /opt/trolobot
+sudo -u bot docker compose -f docker-compose.yml --env-file deploy.env \
+  exec bot python -m trolobot.stickers_fill <имя_набора> --dry-run   # сначала посмотреть таблицу
+sudo -u bot docker compose -f docker-compose.yml --env-file deploy.env \
+  exec bot python -m trolobot.stickers_fill <имя_набора>             # настоящий прогон, пишет stickers.yaml
+```
+
+Скрипт мержит с уже существующим `stickers.yaml`: правки владельца (`text`,
+`when`, `enabled`) у уже известных стикеров (по `file_id`) не теряются, новые
+получают следующие id, пропавшие из набора остаются в файле, но выключаются
+(`enabled: false`). Результат — **обязательно проверить руками** (`text`/`when`
+для новых стикеров — черновик модели со зрением, не то, что реально написано)
+и закоммитить `stickers.yaml` в `main`, иначе следующий деплой откатит правки
+к тому, что было в репозитории. Перезапуск контейнера не обязателен —
+`stickers.yaml` читается на старте, но текущий прогон уже что-то поменял на
+диске внутри контейнера, а не в репозитории.
+
+Выключить стикеры совсем, без правки каталога: `/set behaviour.stickers.enabled
+false` (обратно — `/set behaviour.stickers.enabled true`) или руками выключить
+отдельные (`enabled: false` в `stickers.yaml`, коммит и деплой). В `/why`
+`send:sticker` — реплика ушла стикером; `react:error`/иные `stage:reason` со
+стикерами не связаны, это реакции-эмодзи (другой модуль, см. выше).
+
+**4. Проверка бэкапов.**
 
 ```bash
 ssh owner@host "ls -lh /opt/trolobot/backups"
