@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from trolobot import filters
+from trolobot.chat_memory import render_chat_memory
 from trolobot.config_models import Config, HotWindowConfig
 from trolobot.db import Database, LifeEventRow, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
@@ -935,6 +936,13 @@ class Responder:
         # жизни") — это память персонажа, а не данные, ограниченные обращением.
         life_block = render_life(await self.db.life_events(), tz)
 
+        # Слот {chat_memory} (CLAUDE.md, "долгая память чата") — тоже всегда и для
+        # любого триггера: пересказы прошедших недель живут дольше самих сообщений
+        # и заменяют персонажу то, что уже вычистил ретеншн.
+        chat_memory_block = render_chat_memory(
+            await self.db.chat_memories(cfg.behaviour.chat_memory.in_prompt), tz
+        )
+
         # checkin (CLAUDE.md, "вернулся проверить") — единственный триггер, где модель
         # сама указывает, на какое из перечисленных в situation сообщений отвечает
         # (поле "reply_to"); остальные триггеры используют обычное JSON-напоминание
@@ -951,6 +959,7 @@ class Responder:
             places=places_block,
             situation=situation,
             life=life_block,
+            chat_memory=chat_memory_block,
             **build_messages_kwargs,
         )
 

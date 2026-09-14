@@ -136,7 +136,9 @@ _GT_RUN_RE = re.compile(r">{3,}")
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
-_SLOT_RE = re.compile(r"\{(age|few_shot|life|context|recent_replies|places|situation)\}")
+_SLOT_RE = re.compile(
+    r"\{(age|few_shot|life|chat_memory|context|recent_replies|places|situation)\}"
+)
 
 
 def _strip_fake_delimiters(text: str) -> str:
@@ -285,6 +287,7 @@ def build_messages(
     places: str,
     situation: str,
     life: str = "",
+    chat_memory: str = "",
     json_reminder: str = _JSON_REMINDER,
 ) -> list[dict[str, str]]:
     """Собирает [system, user] для LLMClient.call().
@@ -300,11 +303,14 @@ def build_messages(
     context и recent_replies — внутри разделителей <<<CHAT ... >>>. {life} —
     исключение: это память владельца о персонаже (как few_shot), а не ввод
     участников чата, поэтому подставляется в system напрямую, реальным значением.
+    {chat_memory} — такое же исключение: это уже сжатый моделью пересказ прошедших
+    недель (chat_memory.py), память персонажа, а не сырые сообщения участников.
     """
     slot_values = {
         "age": str(age),
         "few_shot": few_shot,
         "life": life,
+        "chat_memory": chat_memory,
         "context": _CONTEXT_MARKER,
         "recent_replies": _RECENT_REPLIES_MARKER,
         "places": _PLACES_MARKER,

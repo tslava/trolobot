@@ -34,7 +34,17 @@ MIGRATIONS: dict[int, str] = {
         announced_at INTEGER,
         announced_tg_message_id INTEGER
     );
-    """
+    """,
+    3: """
+    CREATE TABLE IF NOT EXISTS chat_memory (
+        id INTEGER PRIMARY KEY,
+        period_start INTEGER NOT NULL,
+        period_end INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_memory_period_end ON chat_memory (period_end);
+    """,
 }
 
 
@@ -47,6 +57,21 @@ class LifeEventRow:
     created_at: int
     announced_at: int | None
     announced_tg_message_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ChatMemoryRow:
+    """Пересказ одного периода чата (CLAUDE.md, "долгая память чата").
+
+    ``period_start`` включительно, ``period_end`` исключительно — обе границы
+    приходятся на локальную полночь (persona.timezone), см. chat_memory.py.
+    """
+
+    id: int
+    period_start: int
+    period_end: int
+    text: str
+    created_at: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +94,11 @@ class PurgeStats:
     pending_replies: int
     filter_log_texts: int
     state_keys: int
+    # Пересказы долгой памяти чата живут по своему сроку (behaviour.chat_memory.keep_days),
+    # а не по message_retention_days, поэтому чистятся отдельным вызовом из run_retention —
+    # у поля есть дефолт, чтобы уже существующий код, собирающий PurgeStats позиционно,
+    # не ломался (CLAUDE.md, "долгая память чата").
+    chat_memory_deleted: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1191,3 +1221,178 @@ class Database:
                 (now, tg_message_id, event_id),
             )
             await conn.commit()
+
+    # -- долгая память чата (CLAUDE.md, "долгая память чата") ----------------
+
+    async def insert_chat_memory(
+        self, *, period_start: int, period_end: int, text: str, created_at: int
+    ) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO chat_memory (period_start, period_end, text, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (period_start, period_end, text, created_at),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_chat_memory: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def chat_memories(self, limit: int) -> list[ChatMemoryRow]:
+        """Последние ``limit`` пересказов, возвращаются хронологически (старые сначала).
+
+        ``limit <= 0`` -> пустой список: ``behaviour.chat_memory.in_prompt = 0``
+        означает «память в промпт не подмешивать», и лишнего запроса тут не нужно.
+        """
+        if limit <= 0:
+            return []
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, period_start, period_end, text, created_at FROM chat_memory "
+            "ORDER BY period_end DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = list(await cursor.fetchall())
+        rows.reverse()
+        return [
+            ChatMemoryRow(
+                id=row["id"],
+                period_start=row["period_start"],
+                period_end=row["period_end"],
+                text=row["text"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def chat_memory(self, memory_id: int) -> ChatMemoryRow | None:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, period_start, period_end, text, created_at FROM chat_memory WHERE id = ?",
+            (memory_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return ChatMemoryRow(
+            id=row["id"],
+            period_start=row["period_start"],
+            period_end=row["period_end"],
+            text=row["text"],
+            created_at=row["created_at"],
+        )
+
+    async def chat_memory_count(self) -> int:
+        """Сколько пересказов лежит в БД всего — для строки /status; списком их
+        тянуть незачем (за год их набирается полсотни и больше)."""
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT COUNT(*) AS n FROM chat_memory")
+        row = await cursor.fetchone()
+        return 0 if row is None else int(row["n"])
+
+    async def delete_chat_memory(self, memory_id: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM chat_memory WHERE id = ?", (memory_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def last_chat_memory_end(self) -> int | None:
+        """max(period_end) — с этого момента начинается следующий период пересказа."""
+        conn = self._require_conn()
+        cursor = await conn.execute("SELECT MAX(period_end) AS end FROM chat_memory")
+        row = await cursor.fetchone()
+        if row is None or row["end"] is None:
+            return None
+        return int(row["end"])
+
+    async def purge_chat_memory_older_than(self, cutoff: int) -> int:
+        """Удаляет пересказы, чей период закончился раньше ``cutoff`` (по period_end)."""
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM chat_memory WHERE period_end < ?", (cutoff,))
+            await conn.commit()
+            return int(cursor.rowcount)
+
+    async def first_message_at(self, chat_id: int) -> int | None:
+        """created_at самого раннего сообщения чата — точка отсчёта для догоняющего
+        прогона долгой памяти (chat_memory.run_due), когда пересказов ещё нет."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT MIN(created_at) AS first FROM messages WHERE chat_id = ?", (chat_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None or row["first"] is None:
+            return None
+        return int(row["first"])
+
+    async def messages_between(
+        self,
+        chat_id: int,
+        start: int,
+        end: int,
+        *,
+        exclude_user_ids: Iterable[int] = (),
+    ) -> list[MessageRow]:
+        """Человеческие сообщения чата за ``[start, end)``, хронологически.
+
+        ``exclude_user_ids`` — замьюченные участники: их сообщения в пересказ не
+        попадают вовсе (осознанное решение по приватности, CLAUDE.md, "долгая
+        память чата").
+        """
+        conn = self._require_conn()
+        excluded = sorted({int(user_id) for user_id in exclude_user_ids})
+        sql = (
+            "SELECT id, tg_message_id, chat_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, is_bot, created_at FROM messages "
+            "WHERE chat_id = ? AND is_bot = 0 AND created_at >= ? AND created_at < ?"
+        )
+        params: list[int] = [chat_id, start, end]
+        if excluded:
+            placeholders = ",".join("?" for _ in excluded)
+            sql += f" AND (user_id IS NULL OR user_id NOT IN ({placeholders}))"
+            params.extend(excluded)
+        sql += " ORDER BY created_at, id"
+        cursor = await conn.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [
+            MessageRow(
+                id=row["id"],
+                tg_message_id=row["tg_message_id"],
+                chat_id=row["chat_id"],
+                user_id=row["user_id"],
+                display_name=row["display_name"],
+                text=row["text"],
+                reply_to_tg_message_id=row["reply_to_tg_message_id"],
+                is_bot=bool(row["is_bot"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def bot_replies_between(self, start: int, end: int) -> list[BotReplyRow]:
+        """Реплики бота за ``[start, end)``, хронологически — вторая половина
+        материала для пересказа периода."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, tg_message_id, trigger, trigger_tg_message_id, text, prompt_version, "
+            "few_shot_version, delay_sec, created_at FROM bot_replies "
+            "WHERE created_at >= ? AND created_at < ? ORDER BY created_at, id",
+            (start, end),
+        )
+        rows = await cursor.fetchall()
+        return [
+            BotReplyRow(
+                id=row["id"],
+                tg_message_id=row["tg_message_id"],
+                trigger=row["trigger"],
+                trigger_tg_message_id=row["trigger_tg_message_id"],
+                text=row["text"],
+                prompt_version=row["prompt_version"],
+                few_shot_version=row["few_shot_version"],
+                delay_sec=row["delay_sec"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]

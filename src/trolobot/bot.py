@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from aiogram import Router
 from aiogram.types import Message
 
+from trolobot.chat_memory import ChatMemorizer
 from trolobot.config_models import Config
 from trolobot.db import Database
 from trolobot.followup import FollowupChecker
@@ -88,6 +89,9 @@ class Deps:
     # на горячую (в отличие от config_overrides), поэтому фиксированное число, а не
     # геттер, достаточно.
     sticker_catalog_enabled: int = 0
+    # Долгая память чата (CLAUDE.md, "долгая память чата") — нужна только команде
+    # /memory run; сам пересказ крутит фоновый таск. None — LLM не настроен.
+    memorizer: ChatMemorizer | None = None
     # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
     # не спамить лог на каждое следующее сообщение того же участника.
     warned_user_ids: set[int] = field(default_factory=set)

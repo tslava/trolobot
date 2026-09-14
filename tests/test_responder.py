@@ -67,6 +67,15 @@ PROMPT_TEMPLATE_WITH_LIFE = (
     "{context}\n{recent_replies}\n{places}\n{situation}"
 )
 
+# То же самое для слота {chat_memory} (CLAUDE.md, "долгая память чата").
+PROMPT_TEMPLATE_WITH_CHAT_MEMORY = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "{chat_memory}\n"
+    "{life}\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{situation}"
+)
+
 WARSAW = ZoneInfo("Europe/Warsaw")
 DAY_NOW = int(datetime(2026, 1, 10, 15, 0, tzinfo=WARSAW).timestamp())
 NIGHT_NOW = int(datetime(2026, 1, 10, 3, 0, tzinfo=WARSAW).timestamp())
@@ -3762,6 +3771,97 @@ async def test_followup_mention_delay_capped_by_hot_window(db: Database) -> None
         rows = await db.load_pending()
         assert len(rows) == 1
         assert rows[0].due_at == DAY_NOW + cfg.behaviour.hot_window.mention_max_delay_sec
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_chat_memory_slot_filled_in_system_for_ordinary_ambient_reply(db: Database) -> None:
+    """CLAUDE.md, "долгая память чата": слот заполняется всегда, для любого триггера."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_CHAT_MEMORY)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+    try:
+        await db.insert_chat_memory(
+            period_start=DAY_NOW - 14 * 86400,
+            period_end=DAY_NOW - 7 * 86400,
+            text="Илья хвастался велосипедом",
+            created_at=DAY_NOW - 7 * 86400,
+        )
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=900, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        system_content = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Илья хвастался велосипедом" in system_content
+        assert "{chat_memory}" not in system_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_chat_memory_slot_empty_when_no_memories(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_CHAT_MEMORY)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=900, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        system_content = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "{chat_memory}" not in system_content
+        assert "Что было в чате раньше" not in system_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_chat_memory_slot_limited_by_in_prompt(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.chat_memory.in_prompt = 1
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_CHAT_MEMORY)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+    try:
+        await db.insert_chat_memory(
+            period_start=DAY_NOW - 21 * 86400,
+            period_end=DAY_NOW - 14 * 86400,
+            text="давняя неделя",
+            created_at=DAY_NOW - 14 * 86400,
+        )
+        await db.insert_chat_memory(
+            period_start=DAY_NOW - 14 * 86400,
+            period_end=DAY_NOW - 7 * 86400,
+            text="свежая неделя",
+            created_at=DAY_NOW - 7 * 86400,
+        )
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=900, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        system_content = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "свежая неделя" in system_content
+        assert "давняя неделя" not in system_content
     finally:
         await responder.shutdown()
         await llm.aclose()

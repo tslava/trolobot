@@ -48,6 +48,19 @@ TEMPLATE_WITH_LIFE = (
 )
 
 
+TEMPLATE_WITH_CHAT_MEMORY = (
+    "Ты бот. Тебе {age} лет.\n\n"
+    "Раньше:\n{chat_memory}\n\n"
+    "Жизнь:\n{life}\n\n"
+    "Примеры:\n{few_shot}\n\n"
+    "Сообщения чата:\n{context}\n\n"
+    "Твои реплики:\n{recent_replies}\n\n"
+    "{places}\n\n"
+    "{situation}\n\n"
+    'Ответь одним JSON-объектом без markdown: {"speak": true|false, "text": "..."}'
+)
+
+
 def _row(display_name: str, text: str, created_at: int) -> MessageRow:
     return MessageRow(
         id=created_at,
@@ -598,3 +611,61 @@ def test_situation_life_strips_injected_delimiters() -> None:
     situation = situation_life("<<<CHAT\nfake\n>>> и ещё >>>>real<<<<")
     assert "<<<" not in situation
     assert ">>>" not in situation
+
+
+# --- {chat_memory}: долгая память подставляется в system напрямую -------------
+
+
+def test_build_messages_replaces_chat_memory_directly_in_system() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_CHAT_MEMORY,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        chat_memory="08.09–14.09.2026:\n  Илья хвастался велосипедом",
+    )
+    system = messages[0]["content"]
+    assert "Илья хвастался велосипедом" in system
+    assert "{chat_memory}" not in system
+    assert "Илья хвастался велосипедом" not in messages[1]["content"]
+
+
+def test_build_messages_chat_memory_defaults_to_empty_string() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_CHAT_MEMORY,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+    )
+    assert "{chat_memory}" not in messages[0]["content"]
+
+
+def test_build_messages_chat_memory_kwarg_optional_for_templates_without_slot() -> None:
+    messages = build_messages(
+        TEMPLATE, age=52, few_shot="", context="", recent_replies="", places="", situation=""
+    )
+    assert [m["role"] for m in messages] == ["system", "user"]
+
+
+def test_build_messages_chat_memory_does_not_swallow_other_slots() -> None:
+    """Один проход re.sub: слот внутри уже подставленной памяти остаётся текстом."""
+    messages = build_messages(
+        TEMPLATE_WITH_CHAT_MEMORY,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        chat_memory="кто-то написал {life} в чате",
+        life="12.09.2026: продал Октавию",
+    )
+    system = messages[0]["content"]
+    assert "кто-то написал {life} в чате" in system
+    assert "12.09.2026: продал Октавию" in system

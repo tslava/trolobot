@@ -285,6 +285,62 @@ class CheckinConfig(BaseModel):
         return value
 
 
+class ChatMemoryConfig(BaseModel):
+    """Долгая память чата (CLAUDE.md, "долгая память чата"): раз в неделю модель
+    сжимает прошедшие разговоры в несколько строк, пересказ живёт в БД дольше
+    самих сообщений (``message_retention_days``) и подмешивается в системный промпт.
+    """
+
+    enabled: bool = Field(default=True, description="Включает пересказы прошедших разговоров")
+    period_days: int = Field(
+        default=7, ge=1, le=31, description="Длина одного периода пересказа в сутках"
+    )
+    run_window: tuple[str, str] = Field(
+        default=("04:00", "06:00"), description="Окно локального времени HH:MM для прогона памяти"
+    )
+    in_prompt: int = Field(
+        default=8, ge=0, le=52, description="Сколько последних пересказов класть в промпт"
+    )
+    keep_days: int = Field(
+        default=365, ge=7, le=3650, description="Сколько суток хранить пересказы в БД"
+    )
+    max_messages: int = Field(
+        default=600,
+        ge=50,
+        le=5000,
+        description="Потолок сообщений на один пересказ, берутся последние",
+    )
+    max_chars: int = Field(
+        default=700, ge=100, le=3000, description="Потолок длины одного пересказа в символах"
+    )
+    max_tokens: int = Field(
+        default=400, ge=50, le=2000, description="Лимит токенов ответа модели на пересказ"
+    )
+    model: str = Field(default="", description="Модель для пересказа; пусто -> llm.main_model")
+    backfill_periods: int = Field(
+        default=4, ge=0, le=12, description="Сколько прошлых периодов догнать при первом прогоне"
+    )
+
+    @field_validator("run_window")
+    @classmethod
+    def _validate_run_window(cls, value: tuple[str, str]) -> tuple[str, str]:
+        return (_validate_hhmm(value[0]), _validate_hhmm(value[1]))
+
+    def run_window_time(self) -> tuple[time, time]:
+        return (parse_hhmm(self.run_window[0]), parse_hhmm(self.run_window[1]))
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
+
+
 class BehaviourConfig(BaseModel):
     quiet_window: tuple[str, str] = Field(
         default=("02:00", "07:00"), description="Окно полной тишины, включая прямые обращения"
@@ -328,6 +384,10 @@ class BehaviourConfig(BaseModel):
     checkin: CheckinConfig = Field(
         default_factory=CheckinConfig,
         description="Периодическая проверка «вернулся» после закрытия горячего окна",
+    )
+    chat_memory: ChatMemoryConfig = Field(
+        default_factory=ChatMemoryConfig,
+        description="Долгая память чата: пересказы прошедших разговоров по неделям",
     )
 
     # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает
