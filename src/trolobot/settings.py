@@ -24,5 +24,6 @@ class Settings(BaseSettings):
     sticker_prompt_path: Path = Path("prompts/sticker.txt")
     followup_prompt_path: Path = Path("prompts/followup.txt")
     memory_prompt_path: Path = Path("prompts/memory.txt")
+    vision_prompt_path: Path = Path("prompts/vision.txt")
     stickers_path: Path = Path("stickers.yaml")
     log_level: str = "INFO"
