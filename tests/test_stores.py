@@ -118,6 +118,57 @@ async def test_flat_marks_overridden_keys(tmp_path: Path) -> None:
         await db.close()
 
 
+async def test_describe_returns_none_for_unknown_or_section(tmp_path: Path) -> None:
+    store, db = await _make_config_store(tmp_path)
+    try:
+        assert store.describe("behaviour.no_such_key") is None
+        assert store.describe("behaviour.live_talk") is None
+    finally:
+        await db.close()
+
+
+async def test_describe_before_override_shows_default_as_value(tmp_path: Path) -> None:
+    store, db = await _make_config_store(tmp_path)
+    try:
+        info = store.describe("behaviour.daily_cap")
+
+        assert info is not None
+        assert info.value == "3"
+        assert info.default == "3"
+        assert info.overridden is False
+        assert info.type_name == "int"
+        assert info.bounds == "0..50"
+        assert info.description
+    finally:
+        await db.close()
+
+
+async def test_describe_after_override_shows_new_value_and_old_default(tmp_path: Path) -> None:
+    store, db = await _make_config_store(tmp_path)
+    try:
+        await store.set("behaviour.daily_cap", "9", changed_by=1, now=1000)
+
+        info = store.describe("behaviour.daily_cap")
+
+        assert info is not None
+        assert info.value == "9"
+        assert info.default == "3"
+        assert info.overridden is True
+    finally:
+        await db.close()
+
+
+async def test_describe_persona_key_not_settable(tmp_path: Path) -> None:
+    store, db = await _make_config_store(tmp_path)
+    try:
+        info = store.describe("persona.name")
+
+        assert info is not None
+        assert info.settable is False
+    finally:
+        await db.close()
+
+
 async def test_set_bot_username_enables_mentions_bot(tmp_path: Path) -> None:
     store, db = await _make_config_store(tmp_path)
     try:

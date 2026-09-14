@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-from trolobot.config import flatten_config, load_config
+from trolobot.config import KeyInfo, describe_key, flatten_config, load_config
 from trolobot.config_models import Config
 from trolobot.db import Database
 from trolobot.few_shot import FewShot, render_few_shot
@@ -63,6 +63,7 @@ class ConfigStore:
         self._bot_username = ""
         self._overrides: dict[str, str] = {}
         self.current: Config = Config()
+        self._base: Config = Config()
         self._patterns = _rebuild_patterns(self.current, self._bot_username)
         # Сериализует load/set/unset: без лока два параллельных /set (или /set и
         # рестарт-load) могли бы прочитать один и тот же снимок _overrides, оба
@@ -81,6 +82,7 @@ class ConfigStore:
         cfg = load_config(self._path, overrides)
         self._overrides = overrides
         self.current = cfg
+        self._base = load_config(self._path)
         self._patterns = _rebuild_patterns(cfg, self._bot_username)
         return cfg
 
@@ -89,6 +91,9 @@ class ConfigStore:
 
     def patterns(self) -> Patterns:
         return self._patterns
+
+    def describe(self, key: str) -> KeyInfo | None:
+        return describe_key(self.current, self._base, self._overrides, key)
 
     def set_bot_username(self, username: str) -> None:
         self._bot_username = username

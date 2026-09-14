@@ -569,6 +569,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiogram" },
     { name = "aiosqlite" },
+    { name = "annotated-types" },
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -588,6 +589,7 @@ dev = [
 requires-dist = [
     { name = "aiogram", specifier = ">=3.31" },
     { name = "aiosqlite", specifier = ">=0.22" },
+    { name = "annotated-types", specifier = ">=0.8" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2.13" },
     { name = "pydantic-settings", specifier = ">=2.15" },

@@ -28,6 +28,7 @@ from typing import Protocol
 from aiogram import F, Router
 from aiogram.types import Message, User
 
+from trolobot.config import KeyInfo
 from trolobot.config_models import Config
 from trolobot.few_shot import FewShot
 from trolobot.sanitize import sanitize_display_name
@@ -40,21 +41,32 @@ logger = logging.getLogger(__name__)
 _MAX_REPLY_LEN = 3500
 # Превью тела промпта в /prompt без "full" (CLAUDE.md, "Интерфейсы этапа 6").
 _PROMPT_PREVIEW_LEN = 1500
+# Подсказка в конце /get — список (не карточка одного ключа).
+_GET_LIST_HINT = "* — переопределено через /set. Описание ключа: /get <ключ>"
 
 _HELP_TEXT = (
     "Команды:\n"
+    "\n"
+    "В чате (всем участникам):\n"
+    "/stop — тишина на 24 часа для всего чата\n"
+    "/mute — без реплая: замьютить себя; реплаем на другого — только владелец\n"
+    "/unmute — без реплая: снять мьют с себя; реплаем на другого — только владелец\n"
+    "/ex add — реплаем на ответ бота, только владелец: добавить пару в few-shot\n"
+    "\n"
+    "В личке (только владелец):\n"
     "/panic — стоп навсегда, до /resume\n"
     "/resume — снять панику и /stop\n"
     "/status — краткое состояние бота\n"
     "/last [n] — последние реплики бота (по умолчанию 5, максимум 20)\n"
     "/why [hours] — сводка причин молчания за N часов (по умолчанию 1)\n"
-    "/get [prefix] — текущие параметры конфига\n"
-    "/set <ключ> <значение> — изменить параметр без рестарта\n"
+    "/get [ключ|префикс] — параметры конфига; точный ключ — описание, тип и диапазон\n"
+    "/set <ключ> <значение> — изменить параметр без рестарта; списки — в YAML: [a, b]\n"
     "/unset <ключ> — сбросить параметр к дефолту из yaml\n"
     "/prompt [full] — текущий системный промпт\n"
     "/rollback <версия> — откат промпта на версию\n"
     "/ex last [n] — последние примеры few-shot\n"
-    "/ex rm [n] — удалить n-й пример few-shot с конца"
+    "/ex rm [n] — удалить n-й пример few-shot с конца\n"
+    "/help — эта справка"
 )
 
 
@@ -139,6 +151,7 @@ class _ConfigStoreLike(Protocol):
     ) -> tuple[str | None, str]: ...
     async def unset(self, key: str, changed_by: int, now: int) -> str | None: ...
     def flat(self) -> list[tuple[str, str, bool]]: ...
+    def describe(self, key: str) -> KeyInfo | None: ...
 
 
 class _PromptStoreLike(Protocol):
@@ -407,21 +420,46 @@ async def _cmd_why(message: Message, deps: _CommandsDeps, now: int, args: list[s
     await _reply(message, "\n".join(lines) if lines else "Пусто.")
 
 
+def _render_key_card(info: KeyInfo) -> str:
+    lines = [f"{info.key}: {info.value}"]
+    type_line = f"тип: {info.type_name}, {info.bounds}" if info.bounds else f"тип: {info.type_name}"
+    lines.append(type_line)
+    if info.description:
+        lines.append(info.description)
+    if info.overridden:
+        lines.append(f"переопределён, в yaml: {info.default}")
+    if not info.settable:
+        lines.append("меняется только в config.yaml")
+    return "\n".join(lines)
+
+
 async def _cmd_get(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
-    prefix = args[0] if args else ""
+    arg = args[0] if args else ""
+    if arg:
+        info = deps.config_store.describe(arg)
+        if info is not None:
+            await _reply(message, _render_key_card(info))
+            return
+
     lines = [
         f"{key}{'*' if overridden else ''}: {value}"
         for key, value, overridden in deps.config_store.flat()
-        if key.startswith(prefix)
+        if key.startswith(arg)
     ]
-    await _reply(message, "\n".join(lines) if lines else "Пусто.")
+    if not lines:
+        await _reply(message, "Пусто.")
+        return
+    lines.append(_GET_LIST_HINT)
+    await _reply(message, "\n".join(lines))
 
 
 async def _cmd_set(
     message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
 ) -> None:
     if len(args) < 2:
-        await _reply(message, "Использование: /set <ключ> <значение>")
+        await _reply(
+            message, "Использование: /set <ключ> <значение>. Ключи: /get, описание: /get <ключ>"
+        )
         return
     key, value = args[0], " ".join(args[1:])
     old, new = await deps.config_store.set(key, value, admin_user_id, now)
@@ -586,6 +624,8 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_ex_last(message, deps, args)
                 elif cmd == "ex" and args and args[0].lower() == "rm":
                     await _cmd_ex_rm(message, deps, now, args)
+                elif cmd == "help":
+                    await _reply(message, _HELP_TEXT)
                 else:
                     await _reply(message, _HELP_TEXT)
         except Exception as exc:
