@@ -367,3 +367,71 @@ async def test_creates_own_http_client_when_none_injected() -> None:
         pass  # конструктор не упал и не потребовал http — этого достаточно
     finally:
         await client.aclose()
+
+
+async def test_call_delegates_to_call_raw_and_counts_budget() -> None:
+    """``call`` — тонкая обёртка над ``call_raw`` (CLAUDE.md, "Интерфейсы: стикеры"):
+    тот же запрос, тот же учёт llm_calls/llm_spent_usd."""
+    cfg = Config()
+    store = FakeStore()
+    handler, calls = _counting_handler(lambda _req: _ok_response(content="Привет!"))
+    client = _client(handler, cfg, store)
+    try:
+        result = await client.call(MESSAGES, model="openrouter/foo", max_tokens=100, now=NOW)
+    finally:
+        await client.aclose()
+
+    assert result.text == "Привет!"
+    calls_key = day_key("llm_calls", NOW, cfg.persona.timezone)
+    spent_key = day_key("llm_spent_usd", NOW, cfg.persona.timezone)
+    assert store.state[calls_key] == "1"
+    assert float(store.state[spent_key]) == pytest.approx(0.001)
+    assert len(calls) == 1
+
+
+async def test_call_raw_accepts_vision_content_and_counts_budget() -> None:
+    """``call_raw`` принимает content-массив (текст + картинка, stickers_fill.py) —
+    тот же учёт бюджета, что у обычного текстового ``call``."""
+    cfg = Config()
+    store = FakeStore()
+    handler, calls = _counting_handler(lambda _req: _ok_response(content='{"text": "надпись"}'))
+    client = _client(handler, cfg, store)
+    vision_messages: list[dict[str, object]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "распознай"},
+                {"type": "image_url", "image_url": {"url": "data:image/webp;base64,AAAA"}},
+            ],
+        }
+    ]
+    try:
+        result = await client.call_raw(
+            vision_messages, model="vision/model", max_tokens=120, now=NOW
+        )
+    finally:
+        await client.aclose()
+
+    assert result.text == '{"text": "надпись"}'
+    calls_key = day_key("llm_calls", NOW, cfg.persona.timezone)
+    assert store.state[calls_key] == "1"
+    assert len(calls) == 1
+    payload = json.loads(calls[0].content)
+    assert payload["messages"] == vision_messages
+    assert payload["model"] == "vision/model"
+
+
+async def test_call_raw_respects_circuit_and_caps_same_as_call() -> None:
+    cfg = Config()
+    cfg.llm.daily_calls_cap = 0
+    store = FakeStore()
+    handler, calls = _counting_handler(lambda _req: _ok_response())
+    client = _client(handler, cfg, store)
+    try:
+        with pytest.raises(LLMError) as excinfo:
+            await client.call_raw(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    assert excinfo.value.reason == "llm:calls_cap"
+    assert len(calls) == 0

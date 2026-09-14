@@ -89,6 +89,26 @@ class LLMClient:
         max_tokens: int,
         now: int,
     ) -> LLMResult:
+        """Обёртка над ``call_raw`` для текстовых сообщений (``content: str``).
+
+        Существующие вызывающие (Responder, Judge, places_fill) работают только
+        с текстом — узкий тип параметра здесь сохранён, чтобы их код не менялся.
+        """
+        return await self.call_raw(messages, model=model, max_tokens=max_tokens, now=now)
+
+    async def call_raw(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        max_tokens: int,
+        now: int,
+    ) -> LLMResult:
+        """То же самое, что ``call``, но ``content`` сообщения может быть не только
+        строкой — content-массивом ``[{"type": "text", ...}, {"type": "image_url", ...}]``
+        для запросов со зрением (``stickers_fill.py``, распознавание надписи на стикере).
+        Вся логика (бюджет, calls_cap, circuit, учёт трат) — здесь, единственная точка
+        вызова модели; ``call`` не дублирует её, только сужает тип."""
         if not model:
             # Пустая модель — ошибка конфигурации (main_model ещё не выбран), а не
             # сбой вызова: пусть решает вызывающий (Responder), ретраев тут нет.
