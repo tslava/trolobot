@@ -60,6 +60,7 @@ from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
 from trolobot.patterns import Patterns
 from trolobot.places import render_places_menu
+from trolobot.postprocess import soften
 from trolobot.prompt import (
     SITUATION_LATE,
     SITUATION_MORNING,
@@ -838,7 +839,44 @@ class Responder:
             await self._finish_pending(pending_id, now)
             return
 
+        # filter_recent_replies (50 реплик) переиспользуется и для soften (окно
+        # style:emoji_freq), и для FilterContext ниже — второй раз в БД не ходим
+        # (CLAUDE.md, "Интерфейсы: пост-обработка").
         filter_recent_replies = await self.db.recent_bot_replies(_FILTER_RECENT_REPLIES_LIMIT)
+
+        # Мягкая правка ДО выходного фильтра: тире и слишком частые/лишние эмодзи —
+        # косметика, не нарушение характера, поэтому правится руками, а не срезается
+        # (CLAUDE.md, "Интерфейсы: пост-обработка").
+        fixed = soften(reply.text, recent_replies=filter_recent_replies, cfg=cfg.filters)
+        if fixed.fixes:
+            for fix_reason in fixed.fixes:
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=trigger_msg_id,
+                    candidate_text=reply.text,
+                    verdict="fix",
+                    stage="fix",
+                    reason=fix_reason,
+                    shadow=False,
+                    created_at=now,
+                )
+            logger.info("fix: %s", ", ".join(fixed.fixes))
+        text = fixed.text
+
+        if not text:
+            # Реплика состояла из одного эмодзи — после правки пусто, молчание,
+            # как при llm:silent.
+            await self.db.insert_filter_log(
+                trigger_tg_message_id=trigger_msg_id,
+                candidate_text=reply.text,
+                verdict="cut",
+                stage="fix",
+                reason="fix:empty",
+                shadow=False,
+                created_at=now,
+            )
+            await self._finish_pending(pending_id, now)
+            return
+
         muted_ids = await self.db.muted_user_ids()
         muted_names = list((await self.db.display_names(list(muted_ids))).values())
         participant_names = _unique_participant_names(context_rows)
@@ -860,7 +898,7 @@ class Responder:
             trigger_text=trigger_text,
             now=now,
         )
-        verdict = await filters.check_output(reply.text, filter_ctx, self.judge)
+        verdict = await filters.check_output(text, filter_ctx, self.judge)
         if not verdict.ok:
             shadow = cfg.filters.shadow
             # На каждую сработавшую причину — своя строка filter_log (для shadow-статистики
@@ -871,7 +909,7 @@ class Responder:
                 stage = reason.split(":", 1)[0] if reason else "filter"
                 await self.db.insert_filter_log(
                     trigger_tg_message_id=trigger_msg_id,
-                    candidate_text=reply.text,
+                    candidate_text=text,
                     verdict="cut",
                     stage=stage,
                     reason=reason,
@@ -897,7 +935,7 @@ class Responder:
             cfg=cfg,
             tz=tz,
             trigger_value=trigger_value,
-            reply_text=reply.text,
+            reply_text=text,
             trigger_text=trigger_text,
             now=now,
         )
@@ -914,12 +952,12 @@ class Responder:
             sent_text = f"[стикер #{sticker.id}] {sticker.text}"
             send_reason = "send:sticker"
         else:
-            await self._run_typing(reply.text)
+            await self._run_typing(text)
             text_sent = await self.bot.send_message(
-                self.chat_id, reply.text, reply_to_message_id=reply_to_message_id
+                self.chat_id, text, reply_to_message_id=reply_to_message_id
             )
             sent_message_id = text_sent.message_id
-            sent_text = reply.text
+            sent_text = text
             send_reason = f"send:{record_trigger}"
 
         await self.db.insert_bot_reply(
@@ -959,7 +997,7 @@ class Responder:
 
         await self.db.insert_filter_log(
             trigger_tg_message_id=trigger_msg_id,
-            candidate_text=reply.text,
+            candidate_text=text,
             verdict="pass",
             stage="send",
             reason=send_reason,
