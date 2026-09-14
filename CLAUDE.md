@@ -856,6 +856,68 @@ async def call_raw(self, messages: list[dict[str, Any]], *, model: str, max_toke
 # (<n enabled> в каталоге).
 ```
 
+## Интерфейсы: справка по ключам конфига
+
+Решение владельца: у `/set` нет подсказки, какие ключи существуют и что значат, а
+настраивать приходится с телефона, без репозитория. Источник описаний — сами
+pydantic-модели (`Field(description=...)`), не отдельный словарь: иначе он
+разъедется с полями. Комментарии в `config.yaml` остаются, но истина — модель.
+
+```python
+# config_models.py — у КАЖДОГО поля всех моделей Field(..., description="...") по-русски, одна
+# строка ≤ 90 символов, из комментариев config.yaml и CHARACTER.md раздел 6. Поля без Field()
+# оборачиваются: `name: str = Field(default="Фёдор", description="...")`. Диапазоны ge/le не
+# меняются. Вложенные секции (live_talk, spontaneous, reactions, stickers) тоже с description
+# у самого поля-секции ("что считается живым разговором").
+
+# config.py
+@dataclass(frozen=True)
+class KeyInfo:
+    key: str            # "behaviour.daily_cap"
+    value: str          # текущее значение строкой — тот же формат, что flatten_config
+    default: str        # значение из yaml БЕЗ overrides, тот же формат
+    overridden: bool
+    type_name: str      # "int" | "float" | "bool" | "str" | "list[str]" | "tuple[str, str]" |
+                        # "list[ReplyDelayBucket]" — по аннотации, через typing get_origin/get_args
+    bounds: str         # из metadata поля: "0..50" (ge/le), ">=1" (только ge), "" если границ нет
+    description: str    # Field.description или ""
+    settable: bool      # False для persona.* (меняется только в yaml) и для секций
+def describe_key(current: Config, base: Config, overrides: dict[str, str], key: str) -> KeyInfo | None
+# None — ключа нет (в т.ч. если key — секция, а не лист: "behaviour.live_talk"). Обход по
+# model_fields как в flatten_config. Для tuple/list bounds = "", type_name как выше.
+def flatten_config(cfg: Config) -> dict[str, str]     # без изменений
+
+# stores.py — ConfigStore
+# _load_locked дополнительно держит self._base = load_config(self._path) (yaml без overrides).
+def describe(self, key: str) -> KeyInfo | None        # describe_key(self.current, self._base, self._overrides, key)
+def flat(self) -> list[tuple[str, str, bool]]         # без изменений
+
+# commands.py
+# /get              — как раньше (ключ*: значение по строке) + последняя строка-подсказка:
+#                     "* — переопределено через /set. Описание ключа: /get <ключ>"
+# /get <prefix>     — если prefix РАВЕН существующему ключу (config_store.describe(prefix) не None) →
+#                     карточка ключа, иначе — список по префиксу как раньше, с той же подсказкой;
+#                     пусто → "Пусто." Карточка (plain text, 3–4 строки):
+#                       behaviour.daily_cap: 3
+#                       тип: int, 0..50            (bounds пустые → "тип: int")
+#                       <description>              (пустое → строка опускается)
+#                       переопределён, в yaml: 2   (только если overridden; иначе строка опускается)
+#                       меняется только в config.yaml   (только если not settable)
+# /help             — явная команда, тот же _HELP_TEXT, что и на неизвестную команду.
+# _HELP_TEXT дополняется: блок "В чате (всем участникам):" со /stop, /mute, /unmute и /ex add
+#   (реплаем на ответ бота, только владелец); строки /get и /set переписываются:
+#   "/get [ключ|префикс] — параметры конфига; точный ключ — описание, тип и диапазон"
+#   "/set <ключ> <значение> — изменить параметр без рестарта; списки — в YAML: [a, b]"
+#   плюс "/help — эта справка". Итоговый текст ≤ 3500 символов.
+# Ответ на /set без аргументов: "Использование: /set <ключ> <значение>. Ключи: /get, описание: /get <ключ>".
+```
+
+README.md, раздел «Команды»: строки `/get`, `/set`, добавить `/help`, короткий пример карточки.
+Тесты: `tests/test_config.py` — describe_key (int с границами, bool без, список, persona.* не
+settable, секция → None, overridden с default); `tests/test_commands.py` — `/get <ключ>` карточка,
+`/get <prefix>` по-прежнему список с подсказкой, `/help` отвечает справкой, справка содержит `/stop`
+и `/mute`; `tests/test_stores.py` — `describe` через настоящий ConfigStore с override.
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

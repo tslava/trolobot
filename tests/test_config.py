@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from trolobot.config import flatten_config, load_config
+from trolobot.config import describe_key, flatten_config, load_config
 from trolobot.config_models import (
     BehaviourConfig,
     Config,
@@ -230,3 +230,112 @@ def test_assistant_markers_are_not_validated_as_regex() -> None:
     # (например незакрытая скобка) не должна валиться на валидаторе.
     cfg = FiltersConfig(assistant_markers=["(это не закрытая скобка"])
     assert cfg.assistant_markers == ["(это не закрытая скобка"]
+
+
+# --- describe_key ------------------------------------------------------------------
+
+
+def test_describe_key_int_with_bounds() -> None:
+    base = load_config(CONFIG_PATH)
+    current = load_config(CONFIG_PATH, {"behaviour.daily_cap": "7"})
+
+    info = describe_key(current, base, {"behaviour.daily_cap": "7"}, "behaviour.daily_cap")
+
+    assert info is not None
+    assert info.key == "behaviour.daily_cap"
+    assert info.value == "7"
+    assert info.default == "3"
+    assert info.overridden is True
+    assert info.type_name == "int"
+    assert info.bounds == "0..50"
+    assert info.description
+    assert info.settable is True
+
+
+def test_describe_key_bool_without_bounds() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    info = describe_key(cfg, cfg, {}, "filters.shadow")
+
+    assert info is not None
+    assert info.type_name == "bool"
+    assert info.bounds == ""
+    assert info.overridden is False
+    assert info.value == "true"
+
+
+def test_describe_key_list_of_str() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    info = describe_key(cfg, cfg, {}, "filters.topic_stop")
+
+    assert info is not None
+    assert info.type_name == "list[str]"
+    assert info.bounds == ""
+
+
+def test_describe_key_tuple() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    info = describe_key(cfg, cfg, {}, "behaviour.quiet_window")
+
+    assert info is not None
+    assert info.type_name == "tuple[str, str]"
+
+
+def test_describe_key_list_of_models() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    info = describe_key(cfg, cfg, {}, "behaviour.reply_delay_buckets")
+
+    assert info is not None
+    assert info.type_name == "list[ReplyDelayBucket]"
+
+
+def test_describe_key_persona_not_settable() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    info = describe_key(cfg, cfg, {}, "persona.name")
+
+    assert info is not None
+    assert info.settable is False
+
+
+def test_describe_key_section_returns_none() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    assert describe_key(cfg, cfg, {}, "behaviour.live_talk") is None
+    assert describe_key(cfg, cfg, {}, "behaviour") is None
+    assert describe_key(cfg, cfg, {}, "") is None
+
+
+def test_describe_key_unknown_key_returns_none() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    assert describe_key(cfg, cfg, {}, "behaviour.no_such_key") is None
+    assert describe_key(cfg, cfg, {}, "nope.daily_cap") is None
+    assert describe_key(cfg, cfg, {}, "behaviour.daily_cap.extra") is None
+
+
+def test_describe_key_overridden_default_differs_from_value() -> None:
+    base = load_config(CONFIG_PATH)
+    current = load_config(CONFIG_PATH, {"filters.shadow": "false"})
+
+    info = describe_key(current, base, {"filters.shadow": "false"}, "filters.shadow")
+
+    assert info is not None
+    assert info.overridden is True
+    assert info.value == "false"
+    assert info.default == "true"
+    assert info.value != info.default
+
+
+def test_describe_key_all_leaf_keys_have_short_description() -> None:
+    cfg = Config()
+    flat = flatten_config(cfg)
+
+    for key in flat:
+        info = describe_key(cfg, cfg, {}, key)
+        assert info is not None, key
+        assert info.description, f"{key}: empty description"
+        assert len(info.description) <= 90, f"{key}: description too long ({len(info.description)})"

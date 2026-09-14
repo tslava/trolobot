@@ -16,6 +16,7 @@ import pytest
 from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
 
 from trolobot.commands import build_commands_router
+from trolobot.config import KeyInfo
 from trolobot.config_models import Config
 from trolobot.few_shot import FewShot
 from trolobot.settings import Settings
@@ -128,9 +129,13 @@ class FakeConfigStore:
             ("llm.main_model", "openrouter/x", False),
         ]
     )
+    describe_value: dict[str, KeyInfo | None] = field(default_factory=dict)
 
     def get(self) -> Config:
         return self.cfg
+
+    def describe(self, key: str) -> KeyInfo | None:
+        return self.describe_value.get(key)
 
     async def set(
         self, key: str, raw_value: str, changed_by: int, now: int
@@ -719,6 +724,20 @@ async def test_set_value_error_replies_with_error_text(
     assert sent == ["Ошибка: ambient_probability must be <= 1.0"]
 
 
+async def test_set_without_args_replies_with_usage(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, config_store, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/set")
+    await handler(message)
+
+    assert config_store.set_calls == []
+    assert sent == ["Использование: /set <ключ> <значение>. Ключи: /get, описание: /get <ключ>"]
+
+
 async def test_unset_replies_with_default(
     monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
 ) -> None:
@@ -762,6 +781,69 @@ async def test_get_all_and_with_prefix(
     assert "behaviour.daily_cap: 3" in sent[1]
     assert "behaviour.ambient_probability" in sent[1]
     assert "llm.main_model" not in sent[1]
+
+    hint = "* — переопределено через /set. Описание ключа: /get <ключ>"
+    assert sent[0].endswith(hint)
+    assert sent[1].endswith(hint)
+
+
+async def test_get_exact_key_shows_card(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, config_store, _ = _deps(settings=settings, config=config)
+    config_store.describe_value["behaviour.daily_cap"] = KeyInfo(
+        key="behaviour.daily_cap",
+        value="3",
+        default="3",
+        overridden=False,
+        type_name="int",
+        bounds="0..50",
+        description="сколько раз в сутки бот может влезть без адресации",
+        settable=True,
+    )
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/get behaviour.daily_cap"
+    )
+    await handler(message)
+
+    assert sent == [
+        "behaviour.daily_cap: 3\n"
+        "тип: int, 0..50\n"
+        "сколько раз в сутки бот может влезть без адресации"
+    ]
+
+
+async def test_get_exact_key_card_overridden_and_not_settable(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, config_store, _ = _deps(settings=settings, config=config)
+    config_store.describe_value["persona.name"] = KeyInfo(
+        key="persona.name",
+        value="Фёдор",
+        default="Фёдор Второй",
+        overridden=True,
+        type_name="str",
+        bounds="",
+        description="",
+        settable=False,
+    )
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/get persona.name"
+    )
+    await handler(message)
+
+    assert sent == [
+        "persona.name: Фёдор\n"
+        "тип: str\n"
+        "переопределён, в yaml: Фёдор Второй\n"
+        "меняется только в config.yaml"
+    ]
 
 
 # --- /last ------------------------------------------------------------------------
@@ -982,6 +1064,32 @@ async def test_unknown_command_replies_help(
     assert len(sent) == 1
     assert "/status" in sent[0]
     assert "/panic" in sent[0]
+    assert "/stop" in sent[0]
+    assert "/mute" in sent[0]
+    assert "/help" in sent[0]
+
+
+async def test_help_command_replies_with_same_help_text(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    unknown_msg = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/frobnicate"
+    )
+    await handler(unknown_msg)
+
+    help_msg = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/help", message_id=2
+    )
+    await handler(help_msg)
+
+    assert len(sent) == 2
+    assert sent[0] == sent[1]
+    assert "/stop" in sent[1]
+    assert "/mute" in sent[1]
 
 
 # --- суффикс @bot_username -----------------------------------------------------
