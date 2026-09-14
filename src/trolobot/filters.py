@@ -495,17 +495,6 @@ def _check_emoji_freq(text: str, recent_replies: list[str], window: int) -> bool
     return any(_has_emoji(reply) for reply in recent_replies[-window:])
 
 
-def _check_emoji_position(text: str) -> bool:
-    """style:emoji_position — после последнего эмодзи в тексте остаётся что-то,
-    кроме пробелов и точек (допускаются "Бывает 🙂" и "Бывает. 💩", но не "🙂 Бывает")."""
-    tokens = _emoji_tokens(text)
-    if not tokens:
-        return False
-    _, last_end = tokens[-1]
-    remainder = text[last_end:].replace(" ", "").replace(".", "")
-    return bool(remainder)
-
-
 def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
     """Слой 2: детерминированные правила, 0 мс. ``patterns`` — см. ``layer_regex``."""
     reasons: list[str] = []
@@ -531,8 +520,6 @@ def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
         reasons.append("style:emoji_count")
     if _check_emoji_freq(text, ctx.recent_replies, ctx.cfg.filters.emoji_recent_window):
         reasons.append("style:emoji_freq")
-    if _check_emoji_position(text):
-        reasons.append("style:emoji_position")
 
     return reasons
 

@@ -133,7 +133,9 @@ CASES: list[tuple[str, str, FilterContext, str | None]] = [
     ("emoji_allowed_after_dot_pass", "Бывает. 💩", _DEFAULT_CTX, None),
     ("emoji_allowed_thumbsup_skin_tone_pass", "Бывает 👍🏻", _DEFAULT_CTX, None),
     ("emoji_count_two_cut", "Бывает 🙂🙂", _DEFAULT_CTX, "style:emoji_count"),
-    ("emoji_position_start_cut", "🙂 Бывает", _DEFAULT_CTX, "style:emoji_position"),
+    # style:emoji_position удалено (владелец: эмодзи не обязано быть в конце,
+    # postprocess.py правит частоту/количество до фильтра, а не позицию).
+    ("emoji_start_pass", "🙂 Бывает", _DEFAULT_CTX, None),
     ("emoji_disallowed_cut", "Бывает 🚀", _DEFAULT_CTX, "regex:emoji"),
     (
         "emoji_freq_within_window_cut",
@@ -445,8 +447,7 @@ async def test_check_output_table(
 
 
 async def test_check_output_collects_all_matching_reasons() -> None:
-    # 🚀 вне filters.allowed_emoji -> regex:emoji по-прежнему срабатывает; эмодзи в
-    # самом конце реплики, чтобы не задеть style:emoji_position — тот проверяется отдельно.
+    # 🚀 вне filters.allowed_emoji -> regex:emoji по-прежнему срабатывает.
     text = "- Сделай так\n- И вот так тоже 🚀"
     verdict = await check_output(text, _DEFAULT_CTX)
     assert verdict.ok is False
