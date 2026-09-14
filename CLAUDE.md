@@ -419,8 +419,9 @@ def layer_rules(text, ctx) -> list[str]
 #   style:emoji_count   разрешённых эмодзи (filters.allowed_emoji) в реплике больше filters.emoji_max_per_reply
 #   style:emoji_freq    в реплике есть эмодзи И хотя бы в одной из последних filters.emoji_recent_window
 #                       recent_replies тоже есть эмодзи (любое, не только разрешённое)
-#   style:emoji_position эмодзи не в конце реплики — после последнего эмодзи, за вычетом пробелов
-#                       и точек, остаётся что-то ещё (буквы, цифры, другие знаки)
+# style:emoji_position удалено (правки этапа "эмодзи и тире"): требовало эмодзи строго в конце
+# реплики, что противоречит решению владельца ставить его к месту. postprocess.py правит
+# emoji_freq/emoji_count до фильтра, см. "Интерфейсы: пост-обработка".
 
 # judge.py — слой 3
 @dataclass(frozen=True) class JudgeVerdict: in_character: bool; risky: bool; obeyed_user: bool; reason: str
@@ -623,6 +624,61 @@ def validate_fact(raw: str) -> str | None      # только кириллица
 
 # tests/test_injections.py — строка про отзыв Google с командой: снять skip, проверить через validate_fact.
 ```
+
+## Интерфейсы: пост-обработка
+
+Решение владельца по живому чату: типографские тире (модель копирует их из
+самого промпта) и эмодзи, приклеенное к концу почти каждой реплики (пока
+`filters.shadow: true`, `style:emoji_freq` в выходном фильтре ничего не режет),
+— косметика, не нарушение характера. Молчание — слишком дорогая цена, поэтому
+такие правки делаются руками, детерминированно, ДО выходного фильтра, а не
+срезаются им. `filters.py` не меняется этим модулем, кроме удаления
+`style:emoji_position` (требовало эмодзи строго в конце — теперь противоречит
+характеру, эмодзи можно ставить к месту в середине фразы).
+
+```python
+# postprocess.py — чистые функции, без I/O. Детект эмодзи переиспользует примитивы
+# filters.py (_is_emoji_char/_is_emoji_modifier) — импорт в одну сторону, filters.py
+# postprocess не импортирует, цикла нет.
+@dataclass(frozen=True)
+class Fixed:
+    text: str
+    fixes: tuple[str, ...]      # причины в стиле filter_log: "fix:dash", "fix:emoji_freq", "fix:emoji_count"
+
+def normalize_dashes(text: str) -> str
+# «—» (U+2014), «–» (U+2013), «‒» (U+2012), «―» (U+2015) → «-». Пробелы вокруг не трогать («слово — слово» → «слово - слово»).
+# Дефис в словах («по-русски», «кто-то») уже «-» и не меняется.
+
+def strip_emoji(text: str) -> str
+# Убрать ВСЕ эмодзи (тот же детект, что regex:emoji в filters.py: категория So/Sk или диапазоны U+1F300–1FAFF, U+2600–27BF,
+# плюс хвостовые U+FE0F и модификаторы кожи U+1F3FB–1F3FF) вместе с одним прилегающим пробелом, чтобы не оставалось
+# двойных пробелов и висячих пробелов перед знаками препинания; strip() в конце.
+
+def keep_first_emoji(text: str) -> str
+# Оставить только первое эмодзи, остальные убрать тем же способом.
+
+def soften(text: str, *, recent_replies: Sequence[str], cfg: FiltersConfig) -> Fixed
+# Порядок: normalize_dashes (если что-то поменялось → "fix:dash") →
+# если в тексте есть эмодзи И хотя бы в одной из последних cfg.emoji_recent_window recent_replies есть эмодзи (любое) →
+# strip_emoji, "fix:emoji_freq" → иначе если разрешённых эмодзи больше cfg.emoji_max_per_reply → keep_first_emoji, "fix:emoji_count".
+# recent_replies — хронологически (как db.recent_bot_replies), последние = свежие. Записи стикеров «[стикер #N] …» из
+# recent_replies при подсчёте эмодзи не учитывать (там нет эмодзи, но на будущее — просто пропускать строки с этим префиксом).
+```
+
+`responder.py`, `_generate_and_send`: сразу после `reply = parse_reply(...)` и
+проверки `speak` (текст уже точно уйдёт в фильтр), ДО построения
+`FilterContext`/`check_output` — `filter_recent_replies =
+await self.db.recent_bot_replies(_FILTER_RECENT_REPLIES_LIMIT)` берётся один раз
+и переиспользуется и для `soften`, и для `FilterContext.recent_replies` (второй
+раз в БД не ходим); `fixed = soften(reply.text, recent_replies=filter_recent_replies,
+cfg=cfg.filters)`; `fixed.fixes` непустой → по строке `insert_filter_log(stage="fix",
+reason=<fix:*>, verdict="fix", shadow=False, candidate_text=<исходный текст>)` на
+каждую причину и `logger.info("fix: %s", ...)`; дальше везде (`check_output`,
+`_maybe_choose_sticker`, typing, `send_message`/`send_sticker`, `insert_bot_reply`,
+финальный `insert_filter_log(verdict="pass", stage="send", ...)`) используется
+`fixed.text`, не `reply.text`. `fixed.text` пустой (реплика была одним эмодзи) →
+`insert_filter_log(stage="fix", reason="fix:empty", verdict="cut", shadow=False)`,
+`_finish_pending`, молчание — тот же путь, что `llm:silent`.
 
 ## Интерфейсы: реакции
 
