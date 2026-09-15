@@ -25,7 +25,7 @@ import json
 import logging
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +36,7 @@ import pytest
 
 from trolobot import filters as filters_module
 from trolobot.config_models import Config
-from trolobot.db import Database, PendingRow, PlaceRow
+from trolobot.db import Database, MessageRow, PendingRow, PlaceRow
 from trolobot.filters import FilterContext, FilterVerdict
 from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
@@ -285,6 +285,24 @@ def _ok_response(text: str = "Бывает.") -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
+def _varied_responses(*texts: str) -> Handler:
+    """Handler, отдающий на каждый вызов свой текст (последний повторяется дальше).
+
+    Нужен там, где тест ждёт несколько ответов подряд: одинаковый текст второй раз
+    теперь режется выходным фильтром (``dedup:jaccard``), потому что стадия ``dedup``
+    входит в ``filters.enforce_stages`` и режет даже при ``shadow: true``
+    (CLAUDE.md, "меньше и разнообразнее", мера 4).
+    """
+    state = {"index": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        index = min(state["index"], len(texts) - 1)
+        state["index"] += 1
+        return _ok_response(texts[index])
+
+    return handler
+
+
 def _silent_response() -> httpx.Response:
     content = json.dumps({"speak": False, "text": ""})
     body = {
@@ -430,6 +448,7 @@ def _make_responder(
     judge: Judge | None = None,
     sticker_chooser: FakeStickerChooser | None = None,
     prompt_store: FakePromptStore | None = None,
+    followup: FakeFollowup | None = None,
 ) -> Responder:
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
     return Responder(
@@ -439,6 +458,7 @@ def _make_responder(
         llm=llm,
         judge=judge,
         sticker_chooser=sticker_chooser,  # type: ignore[arg-type]
+        followup=followup,  # type: ignore[arg-type]  # FakeFollowup повторяет только .check
         patterns_getter=lambda: patterns,
         prompt_store=prompt_store if prompt_store is not None else FakePromptStore(),
         rng=rng if rng is not None else random.Random(seed),  # type: ignore[arg-type]
@@ -447,6 +467,36 @@ def _make_responder(
         clock=clock.now,
         sleep=clock.sleep,
     )
+
+
+class FakeFollowup:
+    """Подделка ``FollowupChecker`` для checkin (CLAUDE.md, "меньше и разнообразнее",
+    мера 3): только ``check``, без LLM. Пишет аргументы вызовов — тестам нужно
+    убедиться, что проверяется именно выбранная строка, а не весь список."""
+
+    def __init__(self, addressed: bool) -> None:
+        self.addressed = addressed
+        self.calls: list[dict[str, object]] = []
+
+    async def check(
+        self,
+        *,
+        text: str,
+        display_name: str,
+        context_rows: Sequence[MessageRow],
+        recent_replies: Sequence[str],
+        now: int,
+    ) -> bool:
+        self.calls.append(
+            {
+                "text": text,
+                "display_name": display_name,
+                "context_rows": list(context_rows),
+                "recent_replies": list(recent_replies),
+                "now": now,
+            }
+        )
+        return self.addressed
 
 
 async def _noop_open_hot_window(_cfg: Config, _now: int) -> None:
@@ -677,7 +727,11 @@ async def test_second_mention_after_reply_delayed_until_chat_cooldown_elapses(
     отправляется — кулдаун больше не отбрасывает обращение, только откладывает."""
     cfg = _config()
     assert cfg.behaviour.mention_chat_cooldown_sec == 90
-    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ1."))
+    # Пауза между репликами (CLAUDE.md, "меньше и разнообразнее", мера 2) отложила бы
+    # этот pending ещё раз и проверяется отдельными тестами — здесь речь именно о
+    # кулдауне обращения, поэтому пауза выключена.
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, _varied_responses("Ответ1.", "Ответ2."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)
     responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
@@ -997,7 +1051,7 @@ async def test_restore_pending_late_flag_and_restart(db: Database) -> None:
 
 async def test_reply_mode_depends_on_messages_after_and_delay(db: Database) -> None:
     cfg = _config()
-    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Ок."))
+    llm, _calls = _make_llm(cfg, db, _varied_responses("Ок.", "Ага.", "Понял."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)
     responder = _make_responder(db, cfg, llm, bot, clock)
@@ -1837,7 +1891,7 @@ async def test_morning_job_loop_wakes_within_window_two_consecutive_days(
     db: Database,
 ) -> None:
     cfg = _config()
-    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Доброе утро."))
+    llm, calls = _make_llm(cfg, db, _varied_responses("Доброе утро.", "Всем привет."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)  # 2026-01-10 15:00 Warsaw — вне окна, после него
     responder = _make_responder(db, cfg, llm, bot, clock)
@@ -2453,7 +2507,7 @@ async def test_multiple_reasons_produce_one_filter_log_row_each(
 
 async def test_prompt_store_is_read_fresh_on_each_respond(db: Database) -> None:
     cfg = _config()
-    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ."))
+    llm, calls = _make_llm(cfg, db, _varied_responses("Ответ.", "Другой ответ."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)
     prompt_store = FakePromptStore(
@@ -3632,11 +3686,10 @@ async def test_ambient_reply_in_hot_window_increments_hot_counter_not_daily(db: 
 
 
 async def test_ambient_reply_outside_hot_window_uses_daily_budget_as_before(db: Database) -> None:
-    """Регрессия: без ранее открытого окна ambient-ответ по-прежнему тратит дневной
-    бюджет (не "горячий"), но общий хвост ``_generate_and_send`` теперь открывает
-    свежее горячее окно после ЛЮБОЙ успешной отправки (CLAUDE.md, "внимание как у
-    живого человека") — hot_ambient_count после этого "0" (только что открытое
-    окно), а не отсутствует, как было до этого решения владельца."""
+    """Регрессия: без ранее открытого окна ambient-ответ тратит дневной бюджет (не
+    "горячий") и НЕ открывает новое окно — после стопа 15.09 общий хвост
+    ``_generate_and_send`` делает это только при ``hot_window.open_on_any_reply``
+    (CLAUDE.md, "меньше и разнообразнее", мера 2)."""
     cfg = _config()
     llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
     bot = FakeBot()
@@ -3657,10 +3710,8 @@ async def test_ambient_reply_outside_hot_window_uses_daily_budget_as_before(db: 
         tz = cfg.persona.timezone
         assert await db.get_state(day_key("ambient_count", clock.now(), tz)) == "1"
         assert await db.get_state("last_ambient_at") is not None
-        assert await db.get_state("hot_ambient_count") == "0"
-        hot_until_raw = await db.get_state("hot_until")
-        assert hot_until_raw is not None
-        assert int(hot_until_raw) > clock.now()
+        assert await db.get_state("hot_ambient_count") is None
+        assert await db.get_state("hot_until") is None
 
         logs = await db.filter_log_summary(clock.now() - 10)
         assert any(reason == "send:ambient" for reason, _count in logs)
@@ -3670,11 +3721,12 @@ async def test_ambient_reply_outside_hot_window_uses_daily_budget_as_before(db: 
         await llm.aclose()
 
 
-async def test_morning_reply_opens_hot_window(db: Database) -> None:
-    """Общий хвост _generate_and_send открывает окно после ЛЮБОЙ успешной
-    отправки, включая утреннюю реплику (CLAUDE.md, "внимание как у живого
-    человека") — не только announce_life/say."""
+async def test_morning_reply_does_not_open_hot_window_by_default(db: Database) -> None:
+    """После стопа 15.09 обычный ответ (в том числе утренний) окно не открывает:
+    ``hot_window.open_on_any_reply`` по умолчанию false, окно осталось кнопкой
+    /life и /say (CLAUDE.md, "меньше и разнообразнее", мера 2)."""
     cfg = _config()
+    assert cfg.behaviour.hot_window.open_on_any_reply is False
     llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Доброе утро, был занят."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)
@@ -3682,6 +3734,34 @@ async def test_morning_reply_opens_hot_window(db: Database) -> None:
     try:
         await db.enqueue_night(
             tg_message_id=200,
+            user_id=5,
+            display_name="Дима",
+            text="фёдор ты тут?",
+            created_at=DAY_NOW - 3600,
+        )
+
+        await _drive(clock, responder._run_morning_once())
+
+        assert len(bot.sent) == 1
+        assert await db.get_state("hot_until") is None
+        assert await db.get_state("hot_ambient_count") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_morning_reply_opens_hot_window_when_open_on_any_reply(db: Database) -> None:
+    """Прежнее поведение возвращается флагом: с ``open_on_any_reply: true`` общий
+    хвост _generate_and_send снова открывает окно после любой успешной отправки."""
+    cfg = _config()
+    cfg.behaviour.hot_window.open_on_any_reply = True
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Доброе утро, был занят."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await db.enqueue_night(
+            tg_message_id=201,
             user_id=5,
             display_name="Дима",
             text="фёдор ты тут?",
@@ -3862,6 +3942,667 @@ async def test_chat_memory_slot_limited_by_in_prompt(db: Database) -> None:
         system_content = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
         assert "свежая неделя" in system_content
         assert "давняя неделя" not in system_content
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# ---------------------------------------------------------------------------
+# «Меньше и разнообразнее» (CLAUDE.md, после стопа 15.09): потолок присутствия,
+# пауза между репликами, тишина и адресность для «вернулся проверить».
+# ---------------------------------------------------------------------------
+
+
+async def _fill_presence(db_: Database, *, humans: int, bot_replies: int, now: int) -> None:
+    """Сутки, в которых люди написали ``humans`` сообщений, а бот ответил
+    ``bot_replies`` раз. Всё — в пределах локальных суток ``now``."""
+    for index in range(humans):
+        await _insert_message(
+            db_,
+            tg_message_id=6000 + index,
+            user_id=5,
+            display_name="Дима",
+            text="разговор",
+            created_at=now - 3600 + index,
+        )
+    for index in range(bot_replies):
+        await db_.insert_bot_reply(
+            tg_message_id=7000 + index,
+            reply_to_tg_message_id=None,
+            trigger="ambient",
+            trigger_tg_message_id=None,
+            text="реплика Фёдора",
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=0,
+            created_at=now - 3600 + index,
+        )
+
+
+async def test_presence_cap_blocks_ambient_before_model(db: Database) -> None:
+    """20 человеческих сообщений при max_share 0.15 и free_replies 2 -> allowance 5;
+    пятая реплика бота уже выбрала потолок, модель не зовётся вовсе."""
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0  # проверяется отдельно, здесь мешал бы
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _fill_presence(db, humans=20, bot_replies=5, now=DAY_NOW)
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=6000,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+            ),
+        )
+
+        assert calls == []
+        assert bot.sent == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:presence_cap") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_presence_under_cap_lets_ambient_through(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _fill_presence(db, humans=20, bot_replies=4, now=DAY_NOW)
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=6000,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+            ),
+        )
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_presence_cap_does_not_block_life_and_say(db: Database) -> None:
+    """/life и /say — кнопка владельца: потолок и пауза их не держат."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Продал, ага."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _fill_presence(db, humans=20, bot_replies=9, now=DAY_NOW)
+
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+        life_task = await _drive(clock, responder.announce_life(event))
+        assert life_task.result().sent is True
+
+        say_task = await _drive(clock, responder.say("Ну здарова."))
+        assert say_task.result().sent is True
+        assert len(bot.sent) == 2
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_recheck_presence_cuts_pending_name_address(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _fill_presence(db, humans=20, bot_replies=5, now=DAY_NOW)
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+            done_at=None,
+        )
+
+        await responder._fire_pending(row)
+
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:recheck_presence") == 1
+        assert bot.sent == []
+        assert calls == []
+        assert await db.load_pending() == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_recheck_presence_lets_reply_to_bot_through(db: Database) -> None:
+    """Реплай на сообщение бота проходит под потолком и в момент отправки."""
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Да ну."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _fill_presence(db, humans=20, bot_replies=5, now=DAY_NOW)
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="reply",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="reply",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+            done_at=None,
+        )
+
+        await _drive(clock, responder._fire_pending(row))
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_min_gap_delays_pending_instead_of_dropping_it(db: Database) -> None:
+    """Обращение не отбрасывается паузой — pending переносится на last + min_gap."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        last_reply_at = DAY_NOW - 100
+        await _insert_bot_reply(db, created_at=last_reply_at, tg_message_id=800)
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+            done_at=None,
+        )
+
+        await responder._fire_pending_inner(row)
+
+        rows = await db.load_pending()
+        assert len(rows) == 1  # не помечен done — ответ ещё впереди
+        assert rows[0].due_at == last_reply_at + cfg.behaviour.min_gap_sec + 5  # MinRandom -> 5
+        assert calls == []
+        assert bot.sent == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_min_gap_elapsed_lets_pending_fire(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ага."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_bot_reply(
+            db, created_at=DAY_NOW - cfg.behaviour.min_gap_sec - 1, tg_message_id=800
+        )
+        pending_id = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        row = PendingRow(
+            id=pending_id,
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+            done_at=None,
+        )
+
+        await _drive(clock, responder._fire_pending(row))
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_min_gap_cuts_ambient_with_silence(db: Database) -> None:
+    """Неадресный повод паузу не пережидает — молчание, модель не зовётся."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_bot_reply(db, created_at=DAY_NOW - 100, tg_message_id=800)
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=900,
+                user_id=None,
+                situation="",
+                delay_sec=0,
+            ),
+        )
+
+        assert calls == []
+        assert bot.sent == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:min_gap") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_min_gap_zero_disables_the_pause(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _insert_bot_reply(db, created_at=DAY_NOW - 1, tg_message_id=800)
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=900,
+                user_id=None,
+                situation="",
+                delay_sec=0,
+            ),
+        )
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def _prepare_checkin(db_: Database, *, last_reply_at: int, human_created_at: int) -> None:
+    """Состояние, при котором _maybe_checkin дошёл бы до вызова модели."""
+    await _insert_bot_reply(db_, created_at=last_reply_at)
+    await _insert_message(
+        db_,
+        tg_message_id=701,
+        user_id=5,
+        display_name="Дима",
+        text="как сам, дед?",
+        created_at=human_created_at,
+    )
+    await _insert_message(
+        db_,
+        tg_message_id=702,
+        user_id=6,
+        display_name="Аня",
+        text="федя, ты живой вообще?",
+        created_at=human_created_at + 10,
+    )
+    await db_.set_state("checkin_due", str(last_reply_at + 10))
+    await db_.set_state("checkin_due_hot_until", str(last_reply_at))
+
+
+async def test_maybe_checkin_waits_for_quiet_chat(db: Database) -> None:
+    """В чате только что писали — «вернулся проверить» откладывается без переноса
+    due: следующий poll попробует снова."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        last_reply_at = DAY_NOW - 20000
+        due = last_reply_at + 10
+        await _prepare_checkin(db, last_reply_at=last_reply_at, human_created_at=DAY_NOW - 60)
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert bot.sent == []
+        assert await db.get_state("checkin_due") == str(due)  # due не сдвинут
+        assert await db.get_state("checkin_last_at") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_quiet_min_zero_does_not_wait(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.checkin.quiet_min = 0
+    llm, calls = _make_llm(cfg, db, lambda _req: _checkin_response("Бывает.", 2))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        await _prepare_checkin(db, last_reply_at=DAY_NOW - 20000, human_created_at=DAY_NOW - 60)
+
+        await _drive(clock, responder._maybe_checkin())
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_without_reply_to_stays_silent(db: Database) -> None:
+    """Ответ «всем сразу», без номера сообщения, больше не отправляется."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _checkin_response("Всем привет.", None))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _prepare_checkin(db, last_reply_at=last_reply_at, human_created_at=last_reply_at + 10)
+
+        await _drive(clock, responder._maybe_checkin())
+
+        assert len(calls) == 1
+        assert bot.sent == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:checkin_no_target") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_followup_rejects_selected_message(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _checkin_response("Бывает.", 2))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    followup = FakeFollowup(addressed=False)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom(), followup=followup)
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _prepare_checkin(db, last_reply_at=last_reply_at, human_created_at=last_reply_at + 10)
+
+        await _drive(clock, responder._maybe_checkin())
+
+        assert len(calls) == 1
+        assert bot.sent == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:checkin_not_addressed") == 1
+
+        # Проверялась именно выбранная строка (номер 2 — Аня), остальные ушли в
+        # контекст проверки.
+        assert len(followup.calls) == 1
+        assert followup.calls[0]["text"] == "федя, ты живой вообще?"
+        assert followup.calls[0]["display_name"] == "Аня"
+        context_rows = followup.calls[0]["context_rows"]
+        assert isinstance(context_rows, list)
+        assert [row.tg_message_id for row in context_rows] == [701]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_followup_confirms_selected_message(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _checkin_response("Живой, чего нет.", 2))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    followup = FakeFollowup(addressed=True)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom(), followup=followup)
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _prepare_checkin(db, last_reply_at=last_reply_at, human_created_at=last_reply_at + 10)
+
+        await _drive(clock, responder._maybe_checkin())
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+        assert bot.sent[0][2] == 702
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:checkin") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 40. enforce_stages: dedup/style режут даже при shadow=true; слот {avoid} ---
+# --- собирается из тех же recent_replies, что уходят в фильтр -------------------
+# --- (CLAUDE.md, "меньше и разнообразнее", меры 4-5). --------------------------
+
+
+PROMPT_TEMPLATE_WITH_AVOID = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{avoid}\n{situation}"
+)
+
+
+async def test_enforce_stages_cut_dedup_even_in_shadow_mode(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    cfg.filters.shadow = True
+    assert cfg.filters.enforce_stages == ["dedup", "style"]
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(
+            ok=False,
+            reason="regex:length",
+            reasons=("regex:length", "dedup:motif"),
+        )
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=810, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        assert bot.sent == []
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT stage, reason, shadow FROM filter_log "
+            "WHERE trigger_tg_message_id = ? AND verdict = 'cut' ORDER BY id",
+            (810,),
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        # Обе причины записаны, но shadow=0: реплика реально срезана.
+        assert rows == [
+            {"stage": "regex", "reason": "regex:length", "shadow": 0},
+            {"stage": "dedup", "reason": "dedup:motif", "shadow": 0},
+        ]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_enforce_stages_cut_reason_is_the_enforced_one_in_shadow(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """В shadow режет только enforce-стадия — она и уходит причиной в SendOutcome."""
+    cfg = _config()
+    cfg.filters.shadow = True
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(
+            ok=False,
+            reason="regex:length",
+            reasons=("regex:length", "style:story_quota"),
+        )
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        task = await _drive(clock, responder.announce_life(event))
+        outcome = task.result()
+
+        assert outcome.sent is False
+        assert outcome.reason == "style:story_quota"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_non_enforced_stage_still_passes_in_shadow(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стадии вне enforce_stages в shadow по-прежнему только логируются."""
+    cfg = _config()
+    cfg.filters.shadow = True
+    cfg.filters.enforce_stages = ["dedup"]
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(ok=False, reason="style:exclaim", reasons=("style:exclaim",))
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=811, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        assert len(bot.sent) == 1
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT shadow FROM filter_log WHERE trigger_tg_message_id = ?", (811,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["shadow"] == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_avoid_slot_filled_from_recent_bot_replies(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_AVOID)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+
+    try:
+        await db.insert_bot_reply(
+            tg_message_id=980,
+            reply_to_tg_message_id=None,
+            trigger="ambient",
+            trigger_tg_message_id=None,
+            text="Жена сказала, что хватит. Помню, в девяностых так же было.",
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=0,
+            created_at=DAY_NOW - 600,
+        )
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=981, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "уже поминал: жену" in system
+        assert "девяностые" in system
+        assert "Байку сейчас не рассказывай" in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_avoid_slot_empty_without_recent_replies(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_AVOID)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=982, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "{avoid}" not in system
+        assert "уже поминал" not in system
     finally:
         await responder.shutdown()
         await llm.aclose()

@@ -13,6 +13,7 @@
 5a. маркеры команд (инъекция)                -> DROP ``gate:injection``
 6.  прямое обращение (reply > mention > name):
     ночь                                     -> QUEUE_NIGHT ``gate:night_queued``
+    потолок присутствия (кроме REPLY)        -> DROP ``gate:presence_cap``
     дневной лимит обращений                  -> DROP ``gate:mention_cap``
     иначе                                    -> PASS ``pass:<trigger>``
 
@@ -23,6 +24,14 @@
     ``earliest`` в постановке/схлопывании pending).
 7.  ночь (без обращения)                     -> DROP ``gate:night``
 8.  логистика                                -> DROP ``gate:logistics``
+8a. потолок присутствия                      -> DROP ``gate:presence_cap``
+
+    Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): за локальные сутки
+    бот не говорит больше, чем ``presence.max_share`` от числа сообщений людей плюс
+    ``presence.free_replies``. Реплай на самого бота (``Trigger.REPLY``) проходит
+    под потолком всегда — человек написал именно ему и ждёт ответа; всё остальное
+    (имя, ``@``, ambient) под потолком молчит. Реакции на ``gate:presence_cap`` не
+    ставятся: ``reactions.REACT_REASONS`` не меняется.
 
     Горячее окно после ``/life``/``/say`` (``state.hot_until``, CLAUDE.md,
     "горячее окно"): пока оно открыто, шаги 9-11 заменяются на:
@@ -69,6 +78,15 @@ def _direct_trigger(msg: GateMessage, patterns: PatternsLike) -> Trigger | None:
     return None
 
 
+def _over_presence_cap(state: GateState, cfg: Config) -> bool:
+    """Потолок присутствия за локальные сутки выбран (CLAUDE.md, "меньше и
+    разнообразнее"). Счётчики уже в ``GateState`` — их собрал ``gate_state``."""
+    return cfg.behaviour.presence.over_cap(
+        human_messages_today=state.human_messages_today,
+        bot_replies_today=state.bot_replies_today,
+    )
+
+
 def _is_live(state: GateState, cfg: Config) -> bool:
     """Живой разговор: минимум сообщений и разных авторов за окно live_talk."""
     live = cfg.behaviour.live_talk
@@ -95,6 +113,10 @@ def _direct_address_decision(
     behaviour = cfg.behaviour
     if in_window(now, cfg.persona.timezone, behaviour.quiet_window):
         return Decision(verdict=Verdict.QUEUE_NIGHT, trigger=trigger, reason="gate:night_queued")
+    # Потолок присутствия: реплай на сообщение бота проходит всегда (человек ответил
+    # именно ему), обращение по имени или через @ — нет.
+    if trigger is not Trigger.REPLY and _over_presence_cap(state, cfg):
+        return _drop("gate:presence_cap")
     if state.mention_count_today >= behaviour.mention_daily_cap:
         return _drop("gate:mention_cap")
     return Decision(verdict=Verdict.PASS, trigger=trigger, reason=f"pass:{trigger.value}")
@@ -156,6 +178,11 @@ def should_consider(
     # 8. логистический фильтр
     if patterns.logistics(msg.text) is not None:
         return _drop("gate:logistics")
+
+    # 8a. потолок присутствия — раньше и живого разговора, и горячего окна: если бот
+    # за сутки уже наговорил свою долю, ни один неадресный повод его не разговорит.
+    if _over_presence_cap(state, cfg):
+        return _drop("gate:presence_cap")
 
     # Горячее окно после /life и /say (решение владельца, CLAUDE.md): пока оно
     # открыто, живость чата (шаг 9) не проверяется, а дневной лимит/кулдаун

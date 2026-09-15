@@ -78,6 +78,16 @@ class FakeDb:
     life_events_store: dict[int, LifeEventRow] = field(default_factory=dict)
     _next_life_event_id: int = 1
     chat_memory_store: dict[int, ChatMemoryRow] = field(default_factory=dict)
+    # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): /status считает его по
+    # таблицам, здесь — просто два числа.
+    messages_today_value: int = 0
+    bot_replies_today_value: int = 0
+
+    async def count_messages_today(self, chat_id: int, day_start: int) -> int:
+        return self.messages_today_value
+
+    async def count_bot_replies_today(self, day_start: int) -> int:
+        return self.bot_replies_today_value
 
     async def get_state(self, key: str) -> str | None:
         return self.state.get(key)
@@ -1656,6 +1666,36 @@ async def test_status_shows_checkin_none_by_default(
     await handler(message)
 
     assert "checkin: нет" in sent[0]
+
+
+async def test_status_shows_presence_allowance_and_counts(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): 20 сообщений людей
+    при max_share 0.15 и free_replies 2 дают allowance 5."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.messages_today_value = 20
+    db.bot_replies_today_value = 3
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "presence: 3/5 (people 20)" in sent[0]
+
+
+async def test_status_shows_presence_free_replies_in_empty_chat(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "presence: 0/2 (people 0)" in sent[0]
 
 
 async def test_status_shows_checkin_due_local_time(

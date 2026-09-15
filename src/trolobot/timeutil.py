@@ -19,6 +19,17 @@ def local_date(ts: int, tz: str) -> date:
     return local_dt(ts, tz).date()
 
 
+def day_start(ts: int, tz: str) -> int:
+    """Unix-время локальной полуночи тех суток, в которые попал ts.
+
+    Нужен счётчикам «за сутки», которые считаются не по state-ключу с суффиксом даты
+    (``day_key``), а прямо по таблицам (messages/bot_replies): потолок присутствия,
+    CLAUDE.md, "меньше и разнообразнее".
+    """
+    zone = ZoneInfo(tz)
+    return int(datetime.combine(local_date(ts, tz), time(0, 0), tzinfo=zone).timestamp())
+
+
 def day_key(prefix: str, ts: int, tz: str) -> str:
     """Ключ state со суточным суффиксом: 'ambient_count:2026-09-10'."""
     return f"{prefix}:{local_date(ts, tz).isoformat()}"

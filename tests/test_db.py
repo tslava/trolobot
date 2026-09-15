@@ -2087,3 +2087,78 @@ async def test_first_message_at_returns_earliest_of_chat(tmp_path: Path) -> None
         assert await db.first_message_at(42) == 1000
     finally:
         await db.close()
+
+
+# --- счётчики за локальные сутки (CLAUDE.md, "меньше и разнообразнее", мера 1) ---
+
+
+async def test_count_messages_today_counts_only_humans_of_this_chat_since_day_start(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        day_start = 1_000_000
+        rows = (
+            (1, 42, False, day_start - 1),  # до полуночи — не считается
+            (2, 42, False, day_start),  # ровно полночь — считается
+            (3, 42, False, day_start + 500),
+            (4, 42, True, day_start + 600),  # реплика бота в messages — не человек
+            (5, 7, False, day_start + 700),  # другой чат
+        )
+        for tg_id, chat_id, is_bot, created_at in rows:
+            await db.insert_message(
+                tg_message_id=tg_id,
+                chat_id=chat_id,
+                user_id=1,
+                display_name="Дима",
+                text="текст",
+                reply_to_tg_message_id=None,
+                is_bot=is_bot,
+                created_at=created_at,
+            )
+
+        assert await db.count_messages_today(42, day_start) == 2
+        assert await db.count_messages_today(7, day_start) == 1
+    finally:
+        await db.close()
+
+
+async def test_count_bot_replies_today_counts_every_trigger_since_day_start(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        day_start = 1_000_000
+        for tg_id, trigger, created_at in (
+            (1, "ambient", day_start - 1),  # вчерашняя реплика
+            (2, "mention", day_start),
+            (3, "life", day_start + 10),  # /life тоже присутствие бота
+            (4, "say", day_start + 20),
+        ):
+            await db.insert_bot_reply(
+                tg_message_id=tg_id,
+                reply_to_tg_message_id=None,
+                trigger=trigger,
+                trigger_tg_message_id=None,
+                text="реплика",
+                prompt_version=1,
+                few_shot_version=1,
+                delay_sec=0,
+                created_at=created_at,
+            )
+
+        assert await db.count_bot_replies_today(day_start) == 3
+    finally:
+        await db.close()
+
+
+async def test_day_counters_are_zero_on_empty_db(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.count_messages_today(42, 0) == 0
+        assert await db.count_bot_replies_today(0) == 0
+    finally:
+        await db.close()

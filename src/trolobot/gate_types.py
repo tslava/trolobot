@@ -63,6 +63,13 @@ class GateState:
     # там не открывается (hot_until всегда None).
     hot_until: int | None = None
     hot_ambient_count: int = 0
+    # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): сколько человеческих
+    # сообщений и сколько реплик бота уже было за локальные сутки. Дефолты нулевые и в
+    # конце — по той же причине, что и у горячего окна: существующие позиционные
+    # вызовы (replay.py, тесты) не ломаются, а нулевой человеческий счётчик оставляет
+    # боту только free_replies.
+    human_messages_today: int = 0
+    bot_replies_today: int = 0
 
 
 @dataclass(frozen=True, slots=True)

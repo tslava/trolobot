@@ -39,6 +39,13 @@ class Patterns:
         self._model_talk = _compile_regex_list(filters.model_talk)
         self._assistant_markers = _compile_phrase_list(filters.assistant_markers)
         self._grumpy_markers = _compile_regex_list(filters.grumpy_markers)
+        # Реквизит и байки (CLAUDE.md, "меньше и разнообразнее", мера 5) —
+        # компилируются здесь же, чтобы и промпт (слот {avoid}), и выходной фильтр
+        # (dedup:motif / style:story_quota) брали один и тот же готовый набор.
+        self._motifs = {
+            label: _compile_regex_list(patterns) for label, patterns in filters.motifs.items()
+        }
+        self._story_markers = _compile_regex_list(filters.story_markers)
         self._name_triggers = [
             re.compile(rf"\b{re.escape(trigger)}\b", re.IGNORECASE) for trigger in name_triggers
         ]
@@ -81,3 +88,13 @@ class Patterns:
 
     def grumpy(self, text: str) -> str | None:
         return _first_match(self._grumpy_markers, text)
+
+    @property
+    def motifs(self) -> dict[str, list[re.Pattern[str]]]:
+        """Метка мотива -> скомпилированные регулярки (для motifs.py)."""
+        return self._motifs
+
+    @property
+    def story_markers(self) -> list[re.Pattern[str]]:
+        """Скомпилированные маркеры байки (для motifs.story_count)."""
+        return self._story_markers

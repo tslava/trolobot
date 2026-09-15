@@ -722,6 +722,31 @@ class Database:
             return None
         return int(row["max_created_at"])
 
+    async def count_messages_today(self, chat_id: int, day_start: int) -> int:
+        """Сколько сообщений людей в чате с локальной полуночи (потолок присутствия,
+        CLAUDE.md, "меньше и разнообразнее"). ``day_start`` считает вызывающий —
+        ``timeutil.day_start(now, persona.timezone)``."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM messages "
+            "WHERE chat_id = ? AND is_bot = 0 AND created_at >= ?",
+            (chat_id, day_start),
+        )
+        row = await cursor.fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
+    async def count_bot_replies_today(self, day_start: int) -> int:
+        """Сколько реплик бота ушло в чат с локальной полуночи — знаменатель того же
+        потолка присутствия. Считаются все реплики, включая /life и /say: они —
+        присутствие бота в чате, хотя сами потолком и не ограничены."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM bot_replies WHERE created_at >= ?",
+            (day_start,),
+        )
+        row = await cursor.fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
     async def last_bot_reply_at(self) -> int | None:
         """created_at последней реплики бота (bot_replies) — момент, от которого
         responder._maybe_checkin (CLAUDE.md, "внимание как у живого человека:

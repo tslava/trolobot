@@ -56,6 +56,50 @@ def test_load_real_config_filters_pattern_lists() -> None:
     assert "urząd" in cfg.filters.polish_words
 
 
+def test_load_real_config_motifs_and_story_defaults_match() -> None:
+    # config.yaml дублирует дефолты FiltersConfig (CLAUDE.md, "меньше и разнообразнее",
+    # меры 4-5) — проверка ловит расхождение, если поправили один файл без другого.
+    cfg = load_config(CONFIG_PATH)
+    default_filters = FiltersConfig()
+
+    assert cfg.filters.enforce_stages == default_filters.enforce_stages == ["dedup", "style"]
+    assert cfg.filters.motifs == default_filters.motifs
+    assert cfg.filters.story_markers == default_filters.story_markers
+    assert cfg.filters.motif_recent_window == default_filters.motif_recent_window
+    assert cfg.filters.motif_avoid_window == default_filters.motif_avoid_window
+    assert cfg.filters.story_window == default_filters.story_window
+    assert cfg.filters.story_max == default_filters.story_max
+
+    assert "жена" in cfg.filters.motifs
+    assert r"\bгараж" in cfg.filters.motifs["гараж"]
+    assert r"\bкак-то раз\b" in cfg.filters.story_markers
+
+
+def test_invalid_regex_in_motifs_raises_with_pattern_and_label() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        FiltersConfig(motifs={"жена": [_INVALID_REGEX]})
+
+    assert _INVALID_REGEX in str(exc_info.value)
+    assert "жена" in str(exc_info.value)
+
+
+def test_motifs_override_via_set_parses_yaml_mapping() -> None:
+    """/set filters.motifs — такой же YAML, как у списков регулярок."""
+    cfg = load_config(CONFIG_PATH, {"filters.motifs": "{рыбалка: ['\\bрыбалк']}"})
+
+    assert cfg.filters.motifs == {"рыбалка": [r"\bрыбалк"]}
+
+
+def test_describe_key_dict_of_lists() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    info = describe_key(cfg, cfg, {}, "filters.motifs")
+
+    assert info is not None
+    assert info.type_name == "dict[str, list[str]]"
+    assert "жена" in info.value
+
+
 def test_load_real_config_places_queries_match_defaults() -> None:
     # config.yaml дублирует дефолтные queries places_fill.py (CLAUDE.md, "Интерфейсы
     # этапа 5") — эта проверка ловит расхождение, если один из файлов поправили без другого.
