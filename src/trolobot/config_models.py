@@ -844,6 +844,41 @@ _POLISH_WORDS_DEFAULT = [
     "żywiec",
 ]
 
+# Реквизит персонажа (CLAUDE.md, "меньше и разнообразнее", мера 5): метка мотива ->
+# регулярки. 14.09 в 22 репликах жена встретилась 7 раз, теплица 5, гараж 5,
+# «в девяносто пятом» 5 — мотивы нужны и фильтру (dedup:motif), и промпту (слот
+# {avoid}), поэтому список один и живёт в конфиге.
+_MOTIFS_DEFAULT: dict[str, list[str]] = {
+    "жена": [r"\bжен[аеуы]\b", r"\bжено[йю]\b"],
+    "теплица": [r"\bтеплиц"],
+    "гараж": [r"\bгараж"],
+    "девяностые": [r"\bдевяност", r"\b9\d-?[мхе]\b"],
+    "двухтысячные": [r"\bдвухтысячн"],
+    "сын": [r"\bсын"],
+    "грибы": [r"\bгриб"],
+    "участок": [r"\bучасток", r"\bучастк"],
+    "машина": [r"\bмашин"],
+    "зато": [r"\bзато\b"],
+}
+
+# Маркеры байки (CLAUDE.md, мера 5) — по ним считается квота историй в окне
+# story_window: байка не в каждом ответе, а одна на несколько реплик.
+_STORY_MARKERS_DEFAULT = [
+    r"\bдевяност",
+    r"\bдвухтысячн",
+    r"\bв прошлом году",
+    r"\bлет назад",
+    r"\bпомню\b",
+    r"\bкогда-то\b",
+    r"\bодин раз\b",
+    r"\bкак-то раз\b",
+]
+
+# Стадии выходного фильтра, которые режут даже при filters.shadow: true
+# (CLAUDE.md, мера 4): повторы и сорванный стиль — ровно то, из-за чего чат
+# остановил бота, а shadow их пропускал.
+_ENFORCE_STAGES_DEFAULT = ["dedup", "style"]
+
 _REGEX_LIST_FIELDS = (
     "topic_stop",
     "injection_markers",
@@ -852,6 +887,7 @@ _REGEX_LIST_FIELDS = (
     "places_request",
     "model_talk",
     "grumpy_markers",
+    "story_markers",
 )
 
 # Разрешённый набор эмодзи (решение владельца, CHARACTER.md раздел 3/4) — небольшой,
@@ -926,6 +962,60 @@ class FiltersConfig(BaseModel):
         default_factory=lambda: list(_GRUMPY_MARKERS_DEFAULT),
         description="Сухие/раздражённые формулировки не в характере персонажа (выходной фильтр)",
     )
+    # Мера 4 контракта «меньше и разнообразнее»: shadow остаётся щадящим для новых
+    # слоёв, но дедуп и стиль режут всегда — иначе повторы уходят в чат.
+    enforce_stages: list[str] = Field(
+        default_factory=lambda: list(_ENFORCE_STAGES_DEFAULT),
+        description="Стадии выходного фильтра, которые режут ответ даже при shadow: true",
+    )
+    # Мера 5: реквизит (жена/теплица/гараж/девяностые) — метка -> регулярки.
+    motifs: dict[str, list[str]] = Field(
+        default_factory=lambda: {label: list(items) for label, items in _MOTIFS_DEFAULT.items()},
+        description="Метка мотива -> регулярки реквизита: жена, теплица, гараж, девяностые",
+    )
+    motif_recent_window: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="Окно последних реплик: мотив из него режет кандидата (dedup:motif)",
+    )
+    motif_avoid_window: int = Field(
+        default=10,
+        ge=0,
+        le=50,
+        description="Окно последних реплик, чьи мотивы уходят в промпт слотом {avoid}",
+    )
+    story_markers: list[str] = Field(
+        default_factory=lambda: list(_STORY_MARKERS_DEFAULT),
+        description="Маркеры байки: «девяностые», «помню», «как-то раз» (квота историй)",
+    )
+    story_window: int = Field(
+        default=5, ge=1, le=20, description="Окно последних реплик, в котором считается квота баек"
+    )
+    story_max: int = Field(
+        default=1,
+        ge=0,
+        le=20,
+        description="Сколько баек можно на окно story_window, дальше срез style:story_quota",
+    )
+
+    @field_validator("motifs")
+    @classmethod
+    def _validate_motifs(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Регулярки мотивов компилируются с IGNORECASE, как и все остальные списки.
+
+        Проверка здесь, а не в ``_validate_regex_list``: там валидатор получает
+        плоский ``list[str]``, а мотивы — словарь «метка -> список регулярок».
+        """
+        for label, patterns in value.items():
+            for pattern in patterns:
+                try:
+                    re.compile(pattern, re.IGNORECASE)
+                except re.error as exc:
+                    raise ValueError(
+                        f"invalid regex pattern {pattern!r} for motif {label!r}: {exc}"
+                    ) from exc
+        return value
 
     @field_validator(*_REGEX_LIST_FIELDS)
     @classmethod

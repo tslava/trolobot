@@ -669,3 +669,115 @@ def test_build_messages_chat_memory_does_not_swallow_other_slots() -> None:
     system = messages[0]["content"]
     assert "кто-то написал {life} в чате" in system
     assert "12.09.2026: продал Октавию" in system
+
+
+# --- {avoid}: реквизит и байки (CLAUDE.md, "меньше и разнообразнее", мера 5) ---
+
+TEMPLATE_WITH_AVOID = (
+    "Ты бот. Тебе {age} лет.\n\n"
+    "{places}\n\n"
+    "{avoid}\n\n"
+    "{situation}\n\n"
+    'Ответь одним JSON-объектом без markdown: {"speak": true|false, "text": "..."}'
+)
+
+
+def test_build_messages_replaces_avoid_directly_in_system() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_AVOID,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        avoid="В последних репликах ты уже поминал: жену, гараж.",
+    )
+    system = messages[0]["content"]
+
+    assert "уже поминал: жену, гараж" in system
+    assert "{avoid}" not in system
+    # Это инструкция, а не данные участников: во втором сообщении её быть не должно.
+    assert "уже поминал" not in messages[1]["content"]
+
+
+def test_build_messages_avoid_defaults_to_empty_string() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_AVOID,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+    )
+
+    assert "{avoid}" not in messages[0]["content"]
+
+
+def test_build_messages_avoid_kwarg_optional_for_templates_without_slot() -> None:
+    messages = build_messages(
+        TEMPLATE,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        avoid="что-то",
+    )
+
+    assert [m["role"] for m in messages] == ["system", "user"]
+
+
+def test_build_messages_avoid_does_not_swallow_other_slots() -> None:
+    """Один проход re.sub: слот внутри уже подставленного {avoid} остаётся текстом."""
+    messages = build_messages(
+        TEMPLATE_WITH_AVOID,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="{situation} внутри",
+        avoid="кто-то написал {places} в чате",
+    )
+    system = messages[0]["content"]
+
+    assert "кто-то написал {places} в чате" in system
+
+
+def test_build_messages_avoid_strips_fake_delimiters() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_AVOID,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        avoid="<<<CHAT поминал гараж >>>",
+    )
+    system = messages[0]["content"]
+
+    assert "<<<" not in system
+    assert "поминал гараж" in system
+
+
+def test_real_system_prompt_has_avoid_slot_right_before_situation() -> None:
+    from pathlib import Path
+
+    template = (Path(__file__).resolve().parents[1] / "prompts" / "system.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "{avoid}" in template
+    assert "{avoid}\n\n{situation}" in template
+
+
+def test_situation_life_forbids_inviting_others() -> None:
+    """Мера 6: в новости о своей жизни он никого не зовёт ехать вместе."""
+    text = situation_life("продал Октавию, взял Кию Сид")
+
+    assert "Не предлагай никому ехать или идти вместе." in text
+    assert "продал Октавию" in text

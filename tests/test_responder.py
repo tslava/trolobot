@@ -285,6 +285,24 @@ def _ok_response(text: str = "Бывает.") -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
+def _varied_responses(*texts: str) -> Handler:
+    """Handler, отдающий на каждый вызов свой текст (последний повторяется дальше).
+
+    Нужен там, где тест ждёт несколько ответов подряд: одинаковый текст второй раз
+    теперь режется выходным фильтром (``dedup:jaccard``), потому что стадия ``dedup``
+    входит в ``filters.enforce_stages`` и режет даже при ``shadow: true``
+    (CLAUDE.md, "меньше и разнообразнее", мера 4).
+    """
+    state = {"index": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        index = min(state["index"], len(texts) - 1)
+        state["index"] += 1
+        return _ok_response(texts[index])
+
+    return handler
+
+
 def _silent_response() -> httpx.Response:
     content = json.dumps({"speak": False, "text": ""})
     body = {
@@ -713,7 +731,7 @@ async def test_second_mention_after_reply_delayed_until_chat_cooldown_elapses(
     # этот pending ещё раз и проверяется отдельными тестами — здесь речь именно о
     # кулдауне обращения, поэтому пауза выключена.
     cfg.behaviour.min_gap_sec = 0
-    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ1."))
+    llm, calls = _make_llm(cfg, db, _varied_responses("Ответ1.", "Ответ2."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)
     responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom())
@@ -1033,7 +1051,7 @@ async def test_restore_pending_late_flag_and_restart(db: Database) -> None:
 
 async def test_reply_mode_depends_on_messages_after_and_delay(db: Database) -> None:
     cfg = _config()
-    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Ок."))
+    llm, _calls = _make_llm(cfg, db, _varied_responses("Ок.", "Ага.", "Понял."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)
     responder = _make_responder(db, cfg, llm, bot, clock)
@@ -1873,7 +1891,7 @@ async def test_morning_job_loop_wakes_within_window_two_consecutive_days(
     db: Database,
 ) -> None:
     cfg = _config()
-    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Доброе утро."))
+    llm, calls = _make_llm(cfg, db, _varied_responses("Доброе утро.", "Всем привет."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)  # 2026-01-10 15:00 Warsaw — вне окна, после него
     responder = _make_responder(db, cfg, llm, bot, clock)
@@ -2489,7 +2507,7 @@ async def test_multiple_reasons_produce_one_filter_log_row_each(
 
 async def test_prompt_store_is_read_fresh_on_each_respond(db: Database) -> None:
     cfg = _config()
-    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ."))
+    llm, calls = _make_llm(cfg, db, _varied_responses("Ответ.", "Другой ответ."))
     bot = FakeBot()
     clock = FakeClock(DAY_NOW)
     prompt_store = FakePromptStore(
@@ -4389,6 +4407,202 @@ async def test_maybe_checkin_followup_confirms_selected_message(db: Database) ->
         assert bot.sent[0][2] == 702
         summary = dict(await db.filter_log_summary(0))
         assert summary.get("send:checkin") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 40. enforce_stages: dedup/style режут даже при shadow=true; слот {avoid} ---
+# --- собирается из тех же recent_replies, что уходят в фильтр -------------------
+# --- (CLAUDE.md, "меньше и разнообразнее", меры 4-5). --------------------------
+
+
+PROMPT_TEMPLATE_WITH_AVOID = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{avoid}\n{situation}"
+)
+
+
+async def test_enforce_stages_cut_dedup_even_in_shadow_mode(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config()
+    cfg.filters.shadow = True
+    assert cfg.filters.enforce_stages == ["dedup", "style"]
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(
+            ok=False,
+            reason="regex:length",
+            reasons=("regex:length", "dedup:motif"),
+        )
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=810, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        assert bot.sent == []
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT stage, reason, shadow FROM filter_log "
+            "WHERE trigger_tg_message_id = ? AND verdict = 'cut' ORDER BY id",
+            (810,),
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        # Обе причины записаны, но shadow=0: реплика реально срезана.
+        assert rows == [
+            {"stage": "regex", "reason": "regex:length", "shadow": 0},
+            {"stage": "dedup", "reason": "dedup:motif", "shadow": 0},
+        ]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_enforce_stages_cut_reason_is_the_enforced_one_in_shadow(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """В shadow режет только enforce-стадия — она и уходит причиной в SendOutcome."""
+    cfg = _config()
+    cfg.filters.shadow = True
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(
+            ok=False,
+            reason="regex:length",
+            reasons=("regex:length", "style:story_quota"),
+        )
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        event_id = await db.insert_life_event(text="продал Октавию", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+
+        task = await _drive(clock, responder.announce_life(event))
+        outcome = task.result()
+
+        assert outcome.sent is False
+        assert outcome.reason == "style:story_quota"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_non_enforced_stage_still_passes_in_shadow(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стадии вне enforce_stages в shadow по-прежнему только логируются."""
+    cfg = _config()
+    cfg.filters.shadow = True
+    cfg.filters.enforce_stages = ["dedup"]
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Кандидат."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+
+    async def fake_check_output(text: str, ctx: object, judge: object = None) -> FilterVerdict:
+        return FilterVerdict(ok=False, reason="style:exclaim", reasons=("style:exclaim",))
+
+    monkeypatch.setattr(filters_module, "check_output", fake_check_output)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=811, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        assert len(bot.sent) == 1
+
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT shadow FROM filter_log WHERE trigger_tg_message_id = ?", (811,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["shadow"] == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_avoid_slot_filled_from_recent_bot_replies(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_AVOID)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+
+    try:
+        await db.insert_bot_reply(
+            tg_message_id=980,
+            reply_to_tg_message_id=None,
+            trigger="ambient",
+            trigger_tg_message_id=None,
+            text="Жена сказала, что хватит. Помню, в девяностых так же было.",
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=0,
+            created_at=DAY_NOW - 600,
+        )
+
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=981, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "уже поминал: жену" in system
+        assert "девяностые" in system
+        assert "Байку сейчас не рассказывай" in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_avoid_slot_empty_without_recent_replies(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Ответ."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    prompt_store = FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_AVOID)
+    responder = _make_responder(db, cfg, llm, bot, clock, prompt_store=prompt_store)
+
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION, trigger_msg_id=982, user_id=5, situation="", delay_sec=5
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "{avoid}" not in system
+        assert "уже поминал" not in system
     finally:
         await responder.shutdown()
         await llm.aclose()

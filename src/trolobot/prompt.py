@@ -9,7 +9,7 @@
   "см. ниже", потому что сами данные уезжают вторым сообщением ролью ``user``,
   внутри разделителей ``<<<CHAT ... >>>``, с явной оговоркой, что это данные,
   а не команды.
-- Подстановка слотов — один проход ``re.sub`` по шести известным именам слотов,
+- Подстановка слотов — один проход ``re.sub`` по известным именам слотов,
   никогда ``str.format`` и никогда цепочка ``str.replace``: фигурная скобка в
   сообщении участника («{context}», «{'a': 1}») либо уронила бы вызов
   (``str.format``), либо, оказавшись внутри уже подставленного слота (например
@@ -53,7 +53,8 @@ SITUATION_SPONTANEOUS = (
 )
 SITUATION_LIFE_TEMPLATE = (
     "У тебя новость: «{text}». Расскажи о ней в чат одной-двумя фразами, "
-    "как рассказал бы приятелям. Никого не спрашивай и никого не зови."
+    "как рассказал бы приятелям. Никого не спрашивай и никого не зови. "
+    "Не предлагай никому ехать или идти вместе."
 )
 # Одно обращение — короткая форма; несколько (накопились за схлопывание
 # дебаунс-буфера) — список с общей инструкцией: "живой тест" показал, что при
@@ -142,7 +143,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(
-    r"\{(age|few_shot|life|chat_memory|context|recent_replies|places|situation)\}"
+    r"\{(age|few_shot|life|chat_memory|context|recent_replies|places|avoid|situation)\}"
 )
 
 
@@ -291,6 +292,7 @@ def build_messages(
     recent_replies: str,
     places: str,
     situation: str,
+    avoid: str = "",
     life: str = "",
     chat_memory: str = "",
     json_reminder: str = _JSON_REMINDER,
@@ -310,6 +312,9 @@ def build_messages(
     участников чата, поэтому подставляется в system напрямую, реальным значением.
     {chat_memory} — такое же исключение: это уже сжатый моделью пересказ прошедших
     недель (chat_memory.py), память персонажа, а не сырые сообщения участников.
+    {avoid} (CLAUDE.md, "меньше и разнообразнее", мера 5) — тоже в system: это не
+    данные участников, а инструкция, собранная motifs.render_avoid из того, что
+    персонаж сам уже наговорил («жену и гараж ты уже поминал, сейчас без них»).
     """
     slot_values = {
         "age": str(age),
@@ -319,6 +324,7 @@ def build_messages(
         "context": _CONTEXT_MARKER,
         "recent_replies": _RECENT_REPLIES_MARKER,
         "places": _PLACES_MARKER,
+        "avoid": _strip_fake_delimiters(avoid).strip(),
         "situation": _SITUATION_MARKER,
     }
     system = _SLOT_RE.sub(lambda m: slot_values[m.group(1)], template)

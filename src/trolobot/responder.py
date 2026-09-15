@@ -61,6 +61,7 @@ from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
+from trolobot.motifs import render_avoid, story_count, used_motifs
 from trolobot.patterns import Patterns
 from trolobot.places import render_places_menu
 from trolobot.postprocess import soften
@@ -996,6 +997,21 @@ class Responder:
         recent_replies_list = await self.db.recent_bot_replies(cfg.behaviour.recent_replies_memory)
         context = render_context(context_rows)
         recent_replies = "\n".join(recent_replies_list)
+        # 50 последних реплик читаются один раз на всю генерацию и переиспользуются
+        # трижды: слот {avoid} (CLAUDE.md, "меньше и разнообразнее", мера 5), soften
+        # (окно style:emoji_freq) и FilterContext — второй раз в БД не ходим.
+        filter_recent_replies = await self.db.recent_bot_replies(_FILTER_RECENT_REPLIES_LIMIT)
+        patterns = self.patterns_getter()
+        # {avoid} собирается ДО вызова модели из того же списка реплик, по которому
+        # потом отработают dedup:motif и style:story_quota: предупредить дешевле,
+        # чем срезать готовый ответ и промолчать.
+        avoid_block = render_avoid(
+            used_motifs(filter_recent_replies, cfg.filters.motif_avoid_window, patterns.motifs),
+            no_story=(
+                story_count(filter_recent_replies, cfg.filters.story_window, patterns.story_markers)
+                >= cfg.filters.story_max
+            ),
+        )
         # Читаем промпт/few-shot из prompt_store заново на каждом _respond, а не
         # кэшируем в конструкторе: /rollback и /ex add должны подхватываться
         # следующим же ответом, без рестарта Responder.
@@ -1030,7 +1046,7 @@ class Responder:
         # Прямое обращение -> весь кэш заведений в промпт, всегда, независимо от
         # текста; regex ниже влияет только на записываемый trigger (статистика).
         places_block = render_places_menu(await self.db.places_all()) if is_address else ""
-        places_requested = is_address and self.patterns_getter().places_request(trigger_text)
+        places_requested = is_address and patterns.places_request(trigger_text)
         record_trigger = _PLACES_TRIGGER if places_requested else trigger_value
 
         # Слот {life} заполняется всегда, для любого триггера (CLAUDE.md, "события
@@ -1059,6 +1075,7 @@ class Responder:
             recent_replies=recent_replies,
             places=places_block,
             situation=situation,
+            avoid=avoid_block,
             life=life_block,
             chat_memory=chat_memory_block,
             **build_messages_kwargs,
@@ -1148,11 +1165,6 @@ class Responder:
                 await self._finish_pending(pending_id, now)
                 return SendOutcome(sent=False, text=reply.text, reason="send:checkin_not_addressed")
 
-        # filter_recent_replies (50 реплик) переиспользуется и для soften (окно
-        # style:emoji_freq), и для FilterContext ниже — второй раз в БД не ходим
-        # (CLAUDE.md, "Интерфейсы: пост-обработка").
-        filter_recent_replies = await self.db.recent_bot_replies(_FILTER_RECENT_REPLIES_LIMIT)
-
         # Мягкая правка ДО выходного фильтра: тире и слишком частые/лишние эмодзи —
         # косметика, не нарушение характера, поэтому правится руками, а не срезается
         # (CLAUDE.md, "Интерфейсы: пост-обработка").
@@ -1202,18 +1214,25 @@ class Responder:
             participant_names=participant_names,
             bot_names=bot_names,
             muted_names=muted_names,
-            patterns=self.patterns_getter(),
+            patterns=patterns,
             system_prompt=system_prompt,
             trigger_text=trigger_text,
             now=now,
         )
         verdict = await filters.check_output(text, filter_ctx, self.judge)
         if not verdict.ok:
-            shadow = cfg.filters.shadow
-            # На каждую сработавшую причину — своя строка filter_log (для shadow-статистики
-            # по каждому слою отдельно); reasons может быть пустым только у чужого
-            # FilterVerdict, собранного вручную (тесты) — тогда используем verdict.reason.
+            # reasons может быть пустым только у чужого FilterVerdict, собранного
+            # вручную (тесты) — тогда используем verdict.reason.
             reasons = verdict.reasons or (verdict.reason,)
+            # Мера 4 контракта «меньше и разнообразнее»: shadow остаётся щадящим
+            # режимом для новых слоёв, но стадии из filters.enforce_stages
+            # (по умолчанию dedup и style) режут всегда — именно повторы и сорванный
+            # стиль остановили чат 15.09, а shadow их пропускал.
+            enforce_stages = set(cfg.filters.enforce_stages)
+            enforced = [reason for reason in reasons if reason.split(":", 1)[0] in enforce_stages]
+            cut = (not cfg.filters.shadow) or bool(enforced)
+            # На каждую сработавшую причину — своя строка filter_log (для shadow-статистики
+            # по каждому слою отдельно); shadow=1 значит «записали, но отправили».
             for reason in reasons:
                 stage = reason.split(":", 1)[0] if reason else "filter"
                 await self.db.insert_filter_log(
@@ -1222,13 +1241,16 @@ class Responder:
                     verdict="cut",
                     stage=stage,
                     reason=reason,
-                    shadow=shadow,
+                    shadow=not cut,
                     created_at=now,
                 )
-            if not shadow:
+            if cut:
                 logger.info("cut: %s", ", ".join(reasons))
                 await self._finish_pending(pending_id, now)
-                return SendOutcome(sent=False, text=text, reason=reasons[0])
+                # В shadow режет только enforce-стадия — она и уходит причиной;
+                # без shadow причина обычная, первая из списка.
+                cut_reason = enforced[0] if cfg.filters.shadow else reasons[0]
+                return SendOutcome(sent=False, text=text, reason=cut_reason)
 
         reply_to_message_id: int | None = None
         if is_address and trigger_msg_id is not None:
