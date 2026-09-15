@@ -265,3 +265,31 @@ def test_empty_pattern_lists_always_none_or_false() -> None:
     assert patterns.places_request("куда сходить") is False
     assert patterns.model_talk("ИИ") is None
     assert patterns.assistant_marker("конечно!") is None
+
+
+# --- motifs / story_markers (CLAUDE.md, "меньше и разнообразнее", мера 5) -----
+
+
+def test_motifs_compiled_by_label_with_ignorecase() -> None:
+    motifs = PATTERNS.motifs
+
+    assert set(motifs) == set(_CFG.filters.motifs)
+    assert [p.pattern for p in motifs["жена"]] == _CFG.filters.motifs["жена"]
+    assert any(p.search("ЖЕНА сказала") for p in motifs["жена"])
+
+
+def test_story_markers_compiled_with_ignorecase() -> None:
+    markers = PATTERNS.story_markers
+
+    assert [p.pattern for p in markers] == _CFG.filters.story_markers
+    assert any(p.search("ПОМНЮ, было дело") for p in markers)
+
+
+def test_empty_motifs_and_story_markers_are_empty() -> None:
+    cfg = Config()
+    cfg.filters.motifs = {}
+    cfg.filters.story_markers = []
+    patterns = Patterns(cfg.filters, [], "")
+
+    assert patterns.motifs == {}
+    assert patterns.story_markers == []

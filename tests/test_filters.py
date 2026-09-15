@@ -551,3 +551,97 @@ async def test_all_few_shot_speak_true_examples_pass_check_output() -> None:
             failures.append(f"{item.name!r}: {item.text!r} -> {verdict.reasons}")
 
     assert not failures, "few_shot.yaml примеры срезаны выходным фильтром:\n" + "\n".join(failures)
+
+
+# --------------------------------------------------------------------------- #
+# Реквизит и байки: dedup:motif / style:story_quota (CLAUDE.md, "меньше
+# и разнообразнее", мера 5). Страховка к слоту {avoid}: если модель всё равно
+# притащила мотив из свежих реплик или байку сверх квоты — режем.
+# --------------------------------------------------------------------------- #
+
+
+async def test_dedup_motif_cuts_repeated_prop() -> None:
+    ctx = _ctx(recent_replies=["Жена сказала, что хватит.", "Тихо прошли."])
+
+    verdict = await check_output("Опять жена ругается.", ctx)
+
+    assert verdict.ok is False
+    assert "dedup:motif" in verdict.reasons
+
+
+async def test_dedup_motif_allows_other_prop() -> None:
+    ctx = _ctx(recent_replies=["Жена сказала, что хватит."])
+
+    verdict = await check_output("Помидоры пошли, куда их столько.", ctx)
+
+    assert verdict.ok is True
+
+
+async def test_dedup_motif_ignores_replies_outside_window() -> None:
+    """motif_recent_window=3: мотив из четвёртой с конца реплики уже не режет."""
+    cfg = Config()
+    assert cfg.filters.motif_recent_window == 3
+    ctx = _ctx(
+        cfg=cfg,
+        recent_replies=["Гараж закрыт.", "Тихо прошли.", "Ключи нашлись.", "Свитер достал."],
+    )
+
+    verdict = await check_output("В гараже опять холодно.", ctx)
+
+    assert verdict.ok is True
+
+
+async def test_dedup_motif_disabled_by_zero_window() -> None:
+    cfg = Config()
+    cfg.filters.motif_recent_window = 0
+    ctx = _ctx(cfg=cfg, recent_replies=["Гараж закрыт."])
+
+    verdict = await check_output("В гараже опять холодно.", ctx)
+
+    assert verdict.ok is True
+
+
+async def test_style_story_quota_cuts_second_story_in_window() -> None:
+    ctx = _ctx(recent_replies=["Помню, тогда так же было."])
+
+    verdict = await check_output("Как-то раз мы это уже проходили.", ctx)
+
+    assert verdict.ok is False
+    assert "style:story_quota" in verdict.reasons
+
+
+async def test_style_story_quota_allows_short_answer_without_marker() -> None:
+    ctx = _ctx(recent_replies=["Помню, тогда так же было."])
+
+    verdict = await check_output("Регулярно. Просто перестал расстраиваться.", ctx)
+
+    assert verdict.ok is True
+
+
+async def test_style_story_quota_allows_first_story_in_window() -> None:
+    ctx = _ctx(recent_replies=["Тихо прошли.", "Ключи нашлись."])
+
+    verdict = await check_output("Как-то раз мы это уже проходили.", ctx)
+
+    assert verdict.ok is True
+
+
+async def test_style_story_quota_zero_max_cuts_any_story() -> None:
+    cfg = Config()
+    cfg.filters.story_max = 0
+    ctx = _ctx(cfg=cfg, recent_replies=[])
+
+    verdict = await check_output("Как-то раз мы это уже проходили.", ctx)
+
+    assert verdict.ok is False
+    assert "style:story_quota" in verdict.reasons
+
+
+async def test_motifs_and_stories_ignore_sticker_records() -> None:
+    """Записи стикеров в recent_replies не считаются ни мотивом, ни байкой."""
+    ctx = _ctx(recent_replies=["[стикер #2] Жена сказала", "[стикер #3] помню такое"])
+
+    verdict = await check_output("В гараже жена помню как-то раз ругалась.", ctx)
+
+    assert "dedup:motif" not in verdict.reasons
+    assert "style:story_quota" not in verdict.reasons
