@@ -210,6 +210,10 @@ class HotWindowConfig(BaseModel):
     ambient_cap: int = Field(
         default=8, ge=0, le=50, description="Потолок ambient-реплик за одно горячее окно"
     )
+    open_on_any_reply: bool = Field(
+        default=False,
+        description="Открывать горячее окно после любой реплики, не только /life и /say",
+    )
 
 
 class FollowupConfig(BaseModel):
@@ -275,6 +279,12 @@ class CheckinConfig(BaseModel):
     poll_sec: int = Field(
         default=300, ge=30, le=3600, description="Период фонового цикла checkin_job, сек"
     )
+    quiet_min: int = Field(
+        default=10,
+        ge=0,
+        le=180,
+        description="Минут тишины в чате перед проверкой «вернулся»; писали позже — отложить",
+    )
 
     @field_validator("after_min")
     @classmethod
@@ -283,6 +293,39 @@ class CheckinConfig(BaseModel):
         if not (0 <= lo <= hi):
             raise ValueError(f"invalid after_min {value!r}: expected 0 <= min <= max")
         return value
+
+
+class PresenceConfig(BaseModel):
+    """Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): за локальные сутки
+    бот не говорит больше, чем ``max_share`` от числа сообщений людей плюс
+    ``free_replies`` в запас. Под потолком проходят только реплаи на самого бота,
+    ``/life`` и ``/say`` — остальное (обращения по имени, ambient, «просто так»,
+    утренняя реплика, «вернулся проверить») молчит до конца суток.
+    """
+
+    enabled: bool = Field(default=True, description="Включает суточный потолок присутствия бота")
+    max_share: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Доля реплик бота от сообщений людей за локальные сутки",
+    )
+    free_replies: int = Field(
+        default=2,
+        ge=0,
+        le=20,
+        description="Реплик в сутки сверх доли: на утро пустого чата",
+    )
+
+    def allowance(self, human_messages_today: int) -> int:
+        """Сколько реплик бот может себе позволить сегодня при таком числе сообщений людей."""
+        return int(human_messages_today * self.max_share) + self.free_replies
+
+    def over_cap(self, *, human_messages_today: int, bot_replies_today: int) -> bool:
+        """Потолок уже выбран (выключенный потолок — никогда)."""
+        if not self.enabled:
+            return False
+        return bot_replies_today >= self.allowance(human_messages_today)
 
 
 class ChatMemoryConfig(BaseModel):
@@ -432,6 +475,10 @@ class BehaviourConfig(BaseModel):
         default_factory=CheckinConfig,
         description="Периодическая проверка «вернулся» после закрытия горячего окна",
     )
+    presence: PresenceConfig = Field(
+        default_factory=PresenceConfig,
+        description="Суточный потолок присутствия: доля реплик бота от сообщений людей",
+    )
     chat_memory: ChatMemoryConfig = Field(
         default_factory=ChatMemoryConfig,
         description="Долгая память чата: пересказы прошедших разговоров по неделям",
@@ -497,6 +544,12 @@ class BehaviourConfig(BaseModel):
     )
     message_retention_days: int = Field(
         default=30, ge=1, le=3650, description="Сколько дней хранятся сообщения перед удалением"
+    )
+    min_gap_sec: int = Field(
+        default=300,
+        ge=0,
+        le=3600,
+        description="Минимум секунд между любыми двумя сообщениями бота в чате",
     )
 
     @field_validator("quiet_window", "morning_reply_window")

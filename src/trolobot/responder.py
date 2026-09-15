@@ -56,6 +56,7 @@ from trolobot.config_models import Config, HotWindowConfig
 from trolobot.db import Database, LifeEventRow, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
 from trolobot.filters import FilterContext
+from trolobot.followup import FollowupChecker
 from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
@@ -78,7 +79,15 @@ from trolobot.prompt import (
     situation_life,
 )
 from trolobot.stickers import Sticker, StickerChooser, recent_sticker_ids, sticker_allowed
-from trolobot.timeutil import day_key, in_window, local_date, parse_hhmm, seconds_until, week_key
+from trolobot.timeutil import (
+    day_key,
+    day_start,
+    in_window,
+    local_date,
+    parse_hhmm,
+    seconds_until,
+    week_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +188,22 @@ _CHECKIN_DUE_KEY = "checkin_due"
 _CHECKIN_DUE_REF_KEY = "checkin_due_hot_until"
 _CHECKIN_LAST_AT_KEY = "checkin_last_at"
 
+# Сколько последних реплик персонажа отдаётся дешёвой проверке "это мне?" при разборе
+# выбранного checkin-сообщения (CLAUDE.md, "меньше и разнообразнее", мера 3).
+_CHECKIN_FOLLOWUP_RECENT_REPLIES = 3
+
+# Триггеры, которые бот выбирает сам, без обращения к нему: потолок присутствия и пауза
+# между репликами (CLAUDE.md, "меньше и разнообразнее", меры 1 и 2) режут именно их, и
+# режут молчанием — переносить тут нечего, повода ждать нет. Обращения ограничивает
+# _recheck (потолок) и перенос pending (пауза), /life и /say — кнопка владельца — не
+# ограничены ничем.
+_UNSOLICITED_TRIGGER_VALUES = (
+    Trigger.AMBIENT.value,
+    "spontaneous",
+    "morning",
+    _CHECKIN_TRIGGER,
+)
+
 
 def _unique_participant_names(context_rows: list[MessageRow]) -> list[str]:
     """Уникальные display_name не-ботов из context_rows, в порядке первого появления."""
@@ -263,6 +288,7 @@ class Responder:
         llm: LLMClient,
         judge: Judge | None = None,
         sticker_chooser: StickerChooser | None = None,
+        followup: FollowupChecker | None = None,
         patterns_getter: Callable[[], Patterns],
         prompt_store: _PromptStoreLike,
         rng: random.Random,
@@ -277,6 +303,10 @@ class Responder:
         self.llm = llm
         self.judge = judge
         self.sticker_chooser = sticker_chooser
+        # Дешёвая проверка "это мне?" — здесь она нужна не гейту (там её зовёт bot.py),
+        # а checkin'у: строку, которую выбрала основная модель, перепроверяет вторая
+        # (CLAUDE.md, "меньше и разнообразнее", мера 3). None -> проверки нет.
+        self.followup = followup
         self.patterns_getter = patterns_getter
         self.prompt_store = prompt_store
         self.rng = rng
@@ -555,6 +585,16 @@ class Responder:
             )
             return
 
+        # Пауза между репликами (CLAUDE.md, "меньше и разнообразнее", мера 2):
+        # обращение не отбрасывается, а переносится — ответ уйдёт, просто не встык к
+        # предыдущей реплике бота.
+        delayed_due = await self._min_gap_due(cfg, now)
+        if delayed_due is not None:
+            await self.db.update_pending_due(row.id, delayed_due)
+            logger.info("min gap: pending delayed until %s", delayed_due)
+            self._schedule_pending_timer(row, delayed_due)
+            return
+
         recheck_reason = await self._recheck(row, now, cfg)
         if recheck_reason is not None:
             self._pending_info.pop(row.id, None)
@@ -636,6 +676,35 @@ class Responder:
 
         return items[-_ADDRESSED_ITEMS_LIMIT:]
 
+    async def _presence_over_cap(self, cfg: Config, now: int) -> bool:
+        """Суточный потолок присутствия выбран (CLAUDE.md, "меньше и разнообразнее",
+        мера 1). Считает по тем же таблицам, что и ``gate_state`` — счётчики могли
+        измениться, пока ответ ждал своей задержки или лока."""
+        presence = cfg.behaviour.presence
+        if not presence.enabled:
+            return False
+        midnight = day_start(now, cfg.persona.timezone)
+        return presence.over_cap(
+            human_messages_today=await self.db.count_messages_today(self.chat_id, midnight),
+            bot_replies_today=await self.db.count_bot_replies_today(midnight),
+        )
+
+    async def _min_gap_due(self, cfg: Config, now: int) -> int | None:
+        """Момент, раньше которого следующее сообщение бота уйти не может — или None,
+        если пауза уже выдержана (CLAUDE.md, "меньше и разнообразнее", мера 2).
+
+        Пауза считается от последней реплики бота в ``bot_replies``, то есть от любого
+        сообщения — текста, стикера, ``/life``, ``/say``. Небольшой случайный разброс
+        сверху (5-30с) — по образцу ``_apply_cooldown_floor``: чтобы несколько
+        отложенных ответов не били в одну и ту же секунду."""
+        min_gap = cfg.behaviour.min_gap_sec
+        if min_gap <= 0:
+            return None
+        last_reply_at = await self.db.last_bot_reply_at()
+        if last_reply_at is None or now - last_reply_at >= min_gap:
+            return None
+        return last_reply_at + min_gap + self.rng.randint(5, 30)
+
     async def _recheck(self, row: PendingRow, now: int, cfg: Config) -> str | None:
         """Только детерминированные шаги гейта (п.1-5, п.7 и лимиты обращений).
 
@@ -666,6 +735,14 @@ class Responder:
             return "send:recheck_muted"
         if state.topic_cooldown_until is not None and state.topic_cooldown_until > now:
             return "send:recheck_topic"
+        # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1): реплай на
+        # сообщение бота проходит под потолком всегда, как и в гейте; остальные поводы
+        # (имя, @, followup) к моменту отправки могли исчерпать суточную долю.
+        if row.trigger != Trigger.REPLY.value and cfg.behaviour.presence.over_cap(
+            human_messages_today=state.human_messages_today,
+            bot_replies_today=state.bot_replies_today,
+        ):
+            return "send:recheck_presence"
         if state.mention_count_today >= cfg.behaviour.mention_daily_cap:
             return "send:recheck_mention_cap"
         return None
@@ -869,6 +946,30 @@ class Responder:
                 await self._finish_pending(pending_id, now)
                 return SendOutcome(sent=False, text="", reason=recheck_reason)
 
+        if trigger_value in _UNSOLICITED_TRIGGER_VALUES:
+            # Потолок присутствия и пауза между репликами (CLAUDE.md, "меньше и
+            # разнообразнее", меры 1 и 2) — до вызова модели: неадресный повод не
+            # стоит ни денег, ни места в чате. Обращения сюда не попадают: их
+            # ограничивает _recheck (потолок) и перенос pending (пауза), /life и
+            # /say — кнопка владельца — не ограничены вовсе.
+            unsolicited_reason: str | None = None
+            if await self._presence_over_cap(cfg, now):
+                unsolicited_reason = "send:presence_cap"
+            elif await self._min_gap_due(cfg, now) is not None:
+                unsolicited_reason = "send:min_gap"
+            if unsolicited_reason is not None:
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=trigger_msg_id,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="send",
+                    reason=unsolicited_reason,
+                    shadow=False,
+                    created_at=now,
+                )
+                await self._finish_pending(pending_id, now)
+                return SendOutcome(sent=False, text="", reason=unsolicited_reason)
+
         if not cfg.llm.main_model:
             # LLM включён (есть openrouter_api_key), но модель ещё не задана —
             # это не ошибка вызова, а нормальное состояние до первого /set
@@ -1003,12 +1104,49 @@ class Responder:
         checkin_reply_to_message_id: int | None = None
         if trigger_value == _CHECKIN_TRIGGER and checkin_rows is not None:
             reply_to_index = reply.reply_to
-            if reply_to_index is not None and 1 <= reply_to_index <= len(checkin_rows):
-                selected_row = checkin_rows[reply_to_index - 1]
-                checkin_reply_to_message_id = selected_row.tg_message_id
-                trigger_text = selected_row.text or ""
-            else:
-                trigger_text = ""
+            if reply_to_index is None or not 1 <= reply_to_index <= len(checkin_rows):
+                # Ответ «всем сразу», без адресата, больше не отправляется (CLAUDE.md,
+                # "меньше и разнообразнее", мера 3): модель обязана назвать номер
+                # сообщения, на которое отвечает, иначе это не ответ, а вклинивание.
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=trigger_msg_id,
+                    candidate_text=reply.text,
+                    verdict="cut",
+                    stage="send",
+                    reason="send:checkin_no_target",
+                    shadow=False,
+                    created_at=now,
+                )
+                await self._finish_pending(pending_id, now)
+                return SendOutcome(sent=False, text=reply.text, reason="send:checkin_no_target")
+
+            selected_index = reply_to_index - 1
+            selected_row = checkin_rows[selected_index]
+            checkin_reply_to_message_id = selected_row.tg_message_id
+            trigger_text = selected_row.text or ""
+            if self.followup is not None and not await self.followup.check(
+                text=trigger_text,
+                display_name=selected_row.display_name or "",
+                context_rows=[
+                    row for index, row in enumerate(checkin_rows) if index != selected_index
+                ],
+                recent_replies=recent_replies_list[-_CHECKIN_FOLLOWUP_RECENT_REPLIES:],
+                now=now,
+            ):
+                # Вторая, дешёвая модель не увидела здесь обращения к Фёдору — молчим:
+                # основная модель склонна считать адресованным себе любой разговор,
+                # который она сама когда-то задела.
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=trigger_msg_id,
+                    candidate_text=reply.text,
+                    verdict="cut",
+                    stage="send",
+                    reason="send:checkin_not_addressed",
+                    shadow=False,
+                    created_at=now,
+                )
+                await self._finish_pending(pending_id, now)
+                return SendOutcome(sent=False, text=reply.text, reason="send:checkin_not_addressed")
 
         # filter_recent_replies (50 реплик) переиспользуется и для soften (окно
         # style:emoji_freq), и для FilterContext ниже — второй раз в БД не ходим
@@ -1185,13 +1323,13 @@ class Responder:
             created_at=now,
         )
         await self._finish_pending(pending_id, now)
-        # Горячее окно (CLAUDE.md, "горячее окно"/"внимание как у живого человека")
-        # открывается из ОБЩЕГО хвоста успешной отправки — любой триггер (текст или
-        # стикер), не только /life и /say: после каждой своей реплики разговор,
-        # скорее всего, продолжится вокруг неё, и следующие 30 минут бот должен
-        # быть внимательнее. announce_life отдельный вызов больше не делает —
-        # он проходит через этот же метод.
-        await self._maybe_open_hot_window(cfg, now)
+        # Горячее окно из ОБЩЕГО хвоста — только если владелец включил
+        # hot_window.open_on_any_reply (CLAUDE.md, "меньше и разнообразнее", мера 2).
+        # По умолчанию окно открывают лишь /life и /say: «после каждой своей реплики
+        # быть внимательнее» на практике означало, что бот сам себе продлевал
+        # присутствие в чате бесконечно.
+        if cfg.behaviour.hot_window.open_on_any_reply:
+            await self._maybe_open_hot_window(cfg, now)
         return SendOutcome(
             sent=True, text=sent_text, reason=send_reason, tg_message_id=sent_message_id
         )
@@ -1289,9 +1427,13 @@ class Responder:
                 await self.db.mark_life_event_announced(
                     event.id, tg_message_id=outcome.tg_message_id, now=now
                 )
-            # Горячее окно уже открыл общий хвост _generate_and_send (см. там) —
-            # отдельного вызова здесь больше нет (CLAUDE.md, "внимание как у живого
-            # человека").
+            # Окно после /life открывается всегда, независимо от
+            # hot_window.open_on_any_reply: это кнопка владельца, вокруг вброшенной
+            # новости разговор и правда идёт (CLAUDE.md, "меньше и разнообразнее",
+            # мера 2). Повторный вызов при open_on_any_reply=true безвреден —
+            # значения те же.
+            if outcome.sent:
+                await self._maybe_open_hot_window(cfg, now)
             return outcome
 
     async def say(self, text: str) -> SendOutcome:
@@ -1645,6 +1787,15 @@ class Responder:
 
         if now < due:
             return
+
+        # Тишина (CLAUDE.md, "меньше и разнообразнее", мера 3): «вернулся проверить» —
+        # про разговор, который уже остыл. Если в чате писали только что, бот ждёт:
+        # due не переносится, следующий poll попробует снова.
+        quiet_sec = checkin_cfg.quiet_min * 60
+        if quiet_sec > 0:
+            last_human_at = await self.db.last_message_at(self.chat_id)
+            if last_human_at is not None and now - last_human_at < quiet_sec:
+                return
 
         checkin_last_raw = await self.db.get_state(_CHECKIN_LAST_AT_KEY)
         try:

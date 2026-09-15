@@ -35,7 +35,7 @@ from trolobot.db import ChatMemoryRow, LifeEventRow
 from trolobot.few_shot import FewShot
 from trolobot.sanitize import normalize_text, sanitize_display_name
 from trolobot.settings import Settings
-from trolobot.timeutil import day_key, local_dt
+from trolobot.timeutil import day_key, day_start, local_dt
 
 if TYPE_CHECKING:
     # Только для аннотаций: "from __future__ import annotations" делает их строками,
@@ -162,6 +162,9 @@ class _DbLike(Protocol):
     ) -> _MessageRowLike | None: ...
     async def bot_reply_by_tg_id(self, tg_message_id: int) -> _BotReplyRowLike | None: ...
     async def filter_log_summary(self, since: int) -> list[tuple[str, int]]: ...
+    # -- потолок присутствия (CLAUDE.md, "меньше и разнообразнее") -----------
+    async def count_messages_today(self, chat_id: int, day_start: int) -> int: ...
+    async def count_bot_replies_today(self, day_start: int) -> int: ...
     async def load_pending(self) -> Sequence[object]: ...
     async def night_unanswered(self) -> Sequence[object]: ...
     async def prompt_versions(self) -> Sequence[_VersionRowLike]: ...
@@ -427,6 +430,16 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     followup_calls = int(await deps.db.get_state(day_key("followup_calls", now, tz)) or "0")
     vision_count = int(await deps.db.get_state(day_key("vision_count", now, tz)) or "0")
 
+    # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1) — считается по
+    # таблицам, как в гейте, а не по state-счётчику.
+    presence_cfg = cfg.behaviour.presence
+    midnight = day_start(now, tz)
+    human_today = await deps.db.count_messages_today(deps.settings.allowed_chat_id, midnight)
+    bot_today = await deps.db.count_bot_replies_today(midnight)
+    presence_line = (
+        f"presence: {bot_today}/{presence_cfg.allowance(human_today)} (people {human_today})"
+    )
+
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
 
@@ -487,6 +500,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"followup calls: {followup_calls}/{cfg.behaviour.followup.daily_cap}",
         f"vision: {vision_count}/{cfg.behaviour.vision.daily_cap}",
         checkin_line,
+        presence_line,
     ]
     await _reply(message, "\n".join(lines))
 

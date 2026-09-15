@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from trolobot.config_models import Config
 from trolobot.db import Database
@@ -51,6 +52,8 @@ async def test_load_gate_state_empty_db_gives_defaults(tmp_path: Path) -> None:
         assert state.recent == ()
         assert state.hot_until is None
         assert state.hot_ambient_count == 0
+        assert state.human_messages_today == 0
+        assert state.bot_replies_today == 0
     finally:
         await db.close()
 
@@ -206,5 +209,47 @@ async def test_load_gate_state_mention_count_key_uses_warsaw_local_day(tmp_path:
         state = await load_gate_state(db, CONFIG, _msg(created_at=now), now)
 
         assert state.mention_count_today == 9
+    finally:
+        await db.close()
+
+
+async def test_load_gate_state_counts_presence_by_local_day(tmp_path: Path) -> None:
+    """Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): счётчики считаются
+    по таблицам с локальной полуночи persona.timezone, вчерашнее не учитывается."""
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        tz = ZoneInfo(CONFIG.persona.timezone)
+        now = int(datetime(2026, 9, 10, 15, 0, tzinfo=tz).timestamp())
+        midnight = int(datetime(2026, 9, 10, 0, 0, tzinfo=tz).timestamp())
+
+        for tg_id, created_at in ((1, midnight - 60), (2, midnight), (3, now - 10)):
+            await db.insert_message(
+                tg_message_id=tg_id,
+                chat_id=1,
+                user_id=10,
+                display_name="Дима",
+                text="текст",
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=created_at,
+            )
+        for tg_id, created_at in ((100, midnight - 30), (101, now - 5)):
+            await db.insert_bot_reply(
+                tg_message_id=tg_id,
+                reply_to_tg_message_id=None,
+                trigger="ambient",
+                trigger_tg_message_id=None,
+                text="реплика",
+                prompt_version=1,
+                few_shot_version=1,
+                delay_sec=0,
+                created_at=created_at,
+            )
+
+        state = await load_gate_state(db, CONFIG, _msg(created_at=now), now=now)
+
+        assert state.human_messages_today == 2
+        assert state.bot_replies_today == 1
     finally:
         await db.close()
