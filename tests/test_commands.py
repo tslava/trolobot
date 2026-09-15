@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
@@ -18,7 +19,7 @@ from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
 from trolobot.commands import build_commands_router
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import LifeEventRow
+from trolobot.db import ChatMemoryRow, LifeEventRow
 from trolobot.few_shot import FewShot
 from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
@@ -76,6 +77,7 @@ class FakeDb:
     )
     life_events_store: dict[int, LifeEventRow] = field(default_factory=dict)
     _next_life_event_id: int = 1
+    chat_memory_store: dict[int, ChatMemoryRow] = field(default_factory=dict)
 
     async def get_state(self, key: str) -> str | None:
         return self.state.get(key)
@@ -141,6 +143,24 @@ class FakeDb:
 
     async def delete_life_event(self, event_id: int) -> bool:
         return self.life_events_store.pop(event_id, None) is not None
+
+    async def chat_memories(self, limit: int) -> list[ChatMemoryRow]:
+        rows = sorted(self.chat_memory_store.values(), key=lambda r: (r.period_end, r.id))
+        return rows[-limit:] if limit > 0 else []
+
+    async def chat_memory(self, memory_id: int) -> ChatMemoryRow | None:
+        return self.chat_memory_store.get(memory_id)
+
+    async def chat_memory_count(self) -> int:
+        return len(self.chat_memory_store)
+
+    async def delete_chat_memory(self, memory_id: int) -> bool:
+        return self.chat_memory_store.pop(memory_id, None) is not None
+
+    async def last_chat_memory_end(self) -> int | None:
+        if not self.chat_memory_store:
+            return None
+        return max(row.period_end for row in self.chat_memory_store.values())
 
 
 @dataclass
@@ -242,6 +262,18 @@ class FakeResponder:
 
 
 @dataclass
+class FakeMemorizer:
+    """Структурно подходит под commands._ChatMemorizerLike."""
+
+    run_due_result: list[ChatMemoryRow] = field(default_factory=list)
+    run_due_calls: list[int] = field(default_factory=list)
+
+    async def run_due(self, *, now: int) -> list[ChatMemoryRow]:
+        self.run_due_calls.append(now)
+        return self.run_due_result
+
+
+@dataclass
 class FakeDeps:
     """Структурно подходит под commands._CommandsDeps."""
 
@@ -253,6 +285,7 @@ class FakeDeps:
     bot_user_id: int
     bot_username: str
     sticker_catalog_enabled: int = 0
+    memorizer: FakeMemorizer | None = None
 
 
 # --- вспомогательные конструкторы -------------------------------------------------
@@ -327,6 +360,7 @@ def _deps(
     config: Config,
     db: FakeDb | None = None,
     responder: FakeResponder | None = None,
+    memorizer: FakeMemorizer | None = None,
 ) -> tuple[FakeDeps, FakeDb, FakeConfigStore, FakePromptStore]:
     fake_db = db if db is not None else FakeDb()
     config_store = FakeConfigStore(cfg=config)
@@ -339,6 +373,7 @@ def _deps(
         responder=responder,
         bot_user_id=BOT_USER_ID,
         bot_username=BOT_USERNAME,
+        memorizer=memorizer,
     )
     return deps, fake_db, config_store, prompt_store
 
@@ -1580,6 +1615,36 @@ async def test_status_shows_followup_calls_today_count(
     assert f"followup calls: 7/{cap}" in sent[0]
 
 
+async def test_status_shows_vision_zero_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.vision.daily_cap
+    assert f"vision: 0/{cap}" in sent[0]
+
+
+async def test_status_shows_vision_today_count(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    db.state[day_key("vision_count", now, config.persona.timezone)] = "4"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.vision.daily_cap
+    assert f"vision: 4/{cap}" in sent[0]
+
+
 async def test_status_shows_checkin_none_by_default(
     monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
 ) -> None:
@@ -1768,3 +1833,210 @@ async def test_mute_via_text_mention_entity_by_member_does_nothing(
     await handler(message)
 
     assert db.add_mute_calls == []
+
+
+# --- /memory (CLAUDE.md, "долгая память чата") --------------------------------
+
+
+def _memory_row(memory_id: int, text: str) -> ChatMemoryRow:
+    """Период 08.09–14.09.2026 по Europe/Warsaw (persona.timezone по умолчанию)."""
+    start = int(datetime(2026, 9, 8, tzinfo=ZoneInfo("Europe/Warsaw")).timestamp())
+    end = int(datetime(2026, 9, 15, tzinfo=ZoneInfo("Europe/Warsaw")).timestamp())
+    return ChatMemoryRow(
+        id=memory_id,
+        period_start=start + (memory_id - 1) * 7 * 86400,
+        period_end=end + (memory_id - 1) * 7 * 86400,
+        text=text,
+        created_at=end,
+    )
+
+
+async def test_memory_list_empty(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory")
+    await handler(message)
+
+    assert sent == ["Памяти пока нет."]
+
+
+async def test_memory_list_shows_period_and_text_oldest_first(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.chat_memory_store[1] = _memory_row(1, "Илья хвастался велосипедом")
+    db.chat_memory_store[2] = _memory_row(2, "Собирались за грибами")
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory list")
+    await handler(message)
+
+    assert len(sent) == 1
+    text = sent[0]
+    assert text.startswith("#1 08.09–14.09.2026\nИлья хвастался велосипедом")
+    assert "#2 15.09–21.09.2026\nСобирались за грибами" in text
+
+
+async def test_memory_rm_deletes_and_audits(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.chat_memory_store[1] = _memory_row(1, "Илья хвастался велосипедом")
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory rm 1")
+    await handler(message)
+
+    assert sent == ["Пересказ #1 удалён."]
+    assert db.chat_memory_store == {}
+    assert db.audit_stop_calls == [("memory:rm", ADMIN_ID, int(NOW.timestamp()))]
+    assert db.audit_values["memory:rm"] == "Илья хвастался велосипедом"
+
+
+async def test_memory_rm_unknown_id(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory rm 7")
+    await handler(message)
+
+    assert sent == ["Нет пересказа #7."]
+
+
+async def test_memory_rm_without_number_replies_usage(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory rm")
+    await handler(message)
+
+    assert sent == ["Использование: /memory [list | rm N | run]"]
+
+
+async def test_memory_run_reports_created_rows(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    memorizer = FakeMemorizer(run_due_result=[_memory_row(1, "Илья хвастался велосипедом")])
+    deps, db, _, _ = _deps(settings=settings, config=config, memorizer=memorizer)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory run")
+    await handler(message)
+
+    assert memorizer.run_due_calls == [int(NOW.timestamp())]
+    assert len(sent) == 1
+    assert sent[0].startswith("Добавлено пересказов: 1")
+    assert "#1 08.09–14.09.2026\nИлья хвастался велосипедом" in sent[0]
+    assert db.audit_stop_calls == [("memory:run", ADMIN_ID, int(NOW.timestamp()))]
+
+
+async def test_memory_run_nothing_to_summarize(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    memorizer = FakeMemorizer()
+    deps, _, _, _ = _deps(settings=settings, config=config, memorizer=memorizer)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory run")
+    await handler(message)
+
+    assert sent == ["Нечего пересказывать."]
+
+
+async def test_memory_run_without_memorizer(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory run")
+    await handler(message)
+
+    assert sent == ["LLM-часть выключена, пересказы недоступны."]
+    assert db.audit_stop_calls == []
+
+
+async def test_memory_unknown_subcommand_replies_usage(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/memory всё забудь"
+    )
+    await handler(message)
+
+    assert sent == ["Использование: /memory [list | rm N | run]"]
+
+
+async def test_memory_command_in_chat_does_nothing(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """Команда владельца — только в личке; в чате памятью не светим."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.chat_memory_store[1] = _memory_row(1, "Илья хвастался велосипедом")
+    handler = _handler(deps)
+
+    message = _message(chat=_chat(), from_user=_user(ADMIN_ID), text="/memory list")
+    await handler(message)
+
+    assert sent == []
+
+
+async def test_help_mentions_memory_command(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/help")
+    await handler(message)
+
+    assert "/memory" in sent[0]
+
+
+async def test_status_shows_no_chat_memory_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "chat memory: нет" in sent[0]
+
+
+async def test_status_shows_chat_memory_total_and_last_period_end(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.chat_memory_store[1] = _memory_row(1, "Илья хвастался велосипедом")
+    db.chat_memory_store[2] = _memory_row(2, "Собирались за грибами")
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "chat memory: 2, последний до 22.09.2026" in sent[0]

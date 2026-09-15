@@ -7,6 +7,7 @@ Message/Chat/User собираются напрямую (обычные конс
 
 from __future__ import annotations
 
+import io
 import logging
 import random
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import GetFile
 from aiogram.types import Chat, Message, PhotoSize, User
 
 from trolobot.bot import Deps, build_router
@@ -24,6 +27,7 @@ from trolobot.patterns import Patterns
 from trolobot.sanitize import stable_n
 from trolobot.settings import Settings
 from trolobot.stores import ConfigStore, PromptStore
+from trolobot.timeutil import day_key
 
 OWN_CHAT_ID = -1001234567890
 FOREIGN_CHAT_ID = -100999
@@ -94,6 +98,7 @@ def _deps(
     bot: object | None = None,
     responder: object | None = None,
     followup: object | None = None,
+    vision: object | None = None,
 ) -> Deps:
     reserved = {cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers}
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, bot_username)
@@ -118,6 +123,7 @@ def _deps(
         bot=bot,  # type: ignore[arg-type]
         responder=responder,  # type: ignore[arg-type]
         followup=followup,  # type: ignore[arg-type]
+        vision=vision,  # type: ignore[arg-type]
     )
 
 
@@ -979,3 +985,317 @@ async def test_followup_disabled_by_config_skips_checker(
     assert checker.calls == []
     summary = dict(await db.filter_log_summary(0))
     assert summary.get("gate:dice") == 1
+
+
+# --- Зрение на фото (vision.py) ---
+
+
+class _FakeVisionBot:
+    """Подделка BotLike: set_message_reaction (реакции) + download (зрение).
+
+    ``download_error`` — исключение, которое поднимает download (проверка того,
+    что ошибка скачивания не ломает хендлер).
+    """
+
+    def __init__(
+        self, image: bytes = b"jpeg-bytes", download_error: Exception | None = None
+    ) -> None:
+        self.image = image
+        self.download_error = download_error
+        self.downloaded: list[str] = []
+        self.calls: list[tuple[int, int, object]] = []
+
+    async def set_message_reaction(
+        self, chat_id: int, message_id: int, reaction: object = None
+    ) -> bool:
+        self.calls.append((chat_id, message_id, reaction))
+        return True
+
+    async def download(self, file: str, destination: object = None) -> io.BytesIO | None:
+        self.downloaded.append(file)
+        if self.download_error is not None:
+            raise self.download_error
+        return io.BytesIO(self.image)
+
+
+class _FakeVisionDescriber:
+    """Подделка VisionDescriber: пишет аргументы вызова, отдаёт заданное описание."""
+
+    def __init__(self, description: str | None = "кружка пива на столе") -> None:
+        self.description = description
+        self.calls: list[dict[str, object]] = []
+
+    async def describe(self, image: bytes, *, mime: str, caption: str, now: int) -> str | None:
+        self.calls.append({"image": image, "mime": mime, "caption": caption, "now": now})
+        return self.description
+
+
+def _photo(width: int = 800) -> list[PhotoSize]:
+    return [
+        PhotoSize(file_id="small", file_unique_id="u-small", width=90, height=60),
+        PhotoSize(file_id="big", file_unique_id="u-big", width=width, height=width),
+    ]
+
+
+def _config_vision(**updates: object) -> Config:
+    cfg = Config()
+    vision = cfg.behaviour.vision.model_copy(update=updates)
+    behaviour = cfg.behaviour.model_copy(update={"vision": vision})
+    return cfg.model_copy(update={"behaviour": behaviour})
+
+
+def _vision_count_key() -> str:
+    return day_key("vision_count", int(DAY.timestamp()), "Europe/Warsaw")
+
+
+async def test_photo_addressed_by_name_is_described_and_stored(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Подпись с триггером имени — повод описать фото; описание ложится в messages
+    и гейт видит в нём обращение (pass:name), а не «[фото]»."""
+    cfg = _config_vision(ambient_probability=0.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    bot = _FakeVisionBot()
+    describer = _FakeVisionDescriber("кружка пива на столе")
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, bot=bot, vision=describer, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        photo=_photo(),
+        caption="Федя, глянь",
+        date=DAY,
+    )
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото: кружка пива на столе] Федя, глянь"
+    assert bot.downloaded == ["big"]
+    assert describer.calls[0]["mime"] == "image/jpeg"
+    assert describer.calls[0]["caption"] == "Федя, глянь"
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("vision:described") == 1
+    assert summary.get("pass:name") == 1
+    assert len(responder.calls) == 1
+    assert responder.calls[0][1] is Trigger.NAME
+
+    assert await db.get_state(_vision_count_key()) == "1"
+
+
+async def test_photo_without_reason_and_zero_dice_is_skipped(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_vision(ambient_probability=0.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    bot = _FakeVisionBot()
+    describer = _FakeVisionDescriber()
+    deps = _deps(db, cfg, settings=settings, bot=bot, vision=describer)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(from_user=_user(user_id=5, first_name="Дима"), photo=_photo(), date=DAY)
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото]"
+    assert describer.calls == []
+    assert bot.downloaded == []
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("vision:skipped") == 1
+    assert await db.get_state(_vision_count_key()) is None
+
+
+async def test_photo_skipped_keeps_caption(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Отказ описывать не съедает подпись автора — она остаётся рядом с «[фото]»."""
+    cfg = _config_vision(ambient_probability=0.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    deps = _deps(db, cfg, settings=settings, bot=_FakeVisionBot(), vision=_FakeVisionDescriber())
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        photo=_photo(),
+        caption="закат",
+        date=DAY,
+    )
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото] закат"
+
+
+async def test_photo_in_hot_window_is_described_without_address(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_vision(ambient_probability=0.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    describer = _FakeVisionDescriber("двое на берегу")
+    deps = _deps(db, cfg, settings=settings, bot=_FakeVisionBot(), vision=describer)
+    handler = build_router(deps).message.handlers[0].callback
+    await _set_hot_until(db, future=True)
+
+    message = _message(from_user=_user(user_id=5, first_name="Дима"), photo=_photo(), date=DAY)
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото: двое на берегу]"
+    assert len(describer.calls) == 1
+
+
+async def test_photo_download_error_falls_back_to_placeholder(
+    db: Database, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Скачивание упало — хендлер жив, сообщение записано как «[фото]», модель не звали."""
+    cfg = _config_vision(ambient_probability=1.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    error = TelegramBadRequest(method=GetFile(file_id="big"), message="file is too big")
+    bot = _FakeVisionBot(download_error=error)
+    describer = _FakeVisionDescriber()
+    deps = _deps(db, cfg, settings=settings, bot=bot, vision=describer)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        photo=_photo(),
+        caption="вот",
+        date=DAY,
+    )
+    with caplog.at_level(logging.WARNING, logger="trolobot.bot"):
+        await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото] вот"
+    assert describer.calls == []
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("vision:failed") == 1
+    assert any("не удалось скачать фото" in record.getMessage() for record in caplog.records)
+
+
+async def test_photo_describe_returns_none_logs_failed(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_vision(ambient_probability=1.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    describer = _FakeVisionDescriber(None)
+    deps = _deps(db, cfg, settings=settings, bot=_FakeVisionBot(), vision=describer)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(from_user=_user(user_id=5, first_name="Дима"), photo=_photo(), date=DAY)
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото]"
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("vision:failed") == 1
+    assert await db.get_state(_vision_count_key()) is None
+
+
+async def test_photo_daily_cap_stops_describing(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_vision(daily_cap=2, ambient_probability=1.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    await db.set_state(day_key("vision_count", int(DAY.timestamp()), "Europe/Warsaw"), "2")
+    describer = _FakeVisionDescriber()
+    deps = _deps(db, cfg, settings=settings, bot=_FakeVisionBot(), vision=describer)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(from_user=_user(user_id=5, first_name="Дима"), photo=_photo(), date=DAY)
+    await handler(message)
+
+    assert describer.calls == []
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото]"
+
+
+async def test_photo_vision_disabled_behaves_as_before(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """enabled: false — старое поведение целиком: подпись без «[фото]», ни одной
+    записи стадии vision."""
+    cfg = _config_vision(enabled=False)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    describer = _FakeVisionDescriber()
+    deps = _deps(db, cfg, settings=settings, bot=_FakeVisionBot(), vision=describer)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"),
+        photo=_photo(),
+        caption="закат",
+        date=DAY,
+    )
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "закат"
+    assert describer.calls == []
+    summary = dict(await db.filter_log_summary(0))
+    assert not [key for key in summary if key.startswith("vision:")]
+
+
+async def test_photo_without_describer_behaves_as_before(
+    db: Database, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vision=None (ключа LLM нет) — ровно как до фичи: «[фото]» и никаких записей."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    deps = _deps(db, config, settings=settings, bot=_FakeVisionBot())
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(from_user=_user(user_id=5, first_name="Дима"), photo=_photo(), date=DAY)
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото]"
+    summary = dict(await db.filter_log_summary(0))
+    assert not [key for key in summary if key.startswith("vision:")]
+
+
+async def test_photo_reply_to_bot_is_a_reason_to_describe(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_vision(ambient_probability=0.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    describer = _FakeVisionDescriber("стол в пабе")
+    deps = _deps(
+        db, cfg, settings=settings, bot=_FakeVisionBot(), vision=describer, bot_user_id=999
+    )
+    handler = build_router(deps).message.handlers[0].callback
+
+    bot_message = _message(
+        message_id=9,
+        from_user=User(id=999, is_bot=True, first_name="Отец Фёдор"),
+        text="Бывает.",
+        date=DAY,
+    )
+    message = _message(
+        message_id=10,
+        from_user=_user(user_id=5, first_name="Дима"),
+        photo=_photo(),
+        reply_to_message=bot_message,
+        date=DAY,
+    )
+    await handler(message)
+
+    rows = await db.recent_messages(OWN_CHAT_ID, 10)
+    assert rows[0].text == "[фото: стол в пабе]"
+    assert len(describer.calls) == 1
+
+
+async def test_photo_picks_size_within_max_width(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_vision(ambient_probability=1.0, max_width=500)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    bot = _FakeVisionBot()
+    deps = _deps(db, cfg, settings=settings, bot=bot, vision=_FakeVisionDescriber())
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        from_user=_user(user_id=5, first_name="Дима"), photo=_photo(width=1280), date=DAY
+    )
+    await handler(message)
+
+    # 1280 шире потолка — берётся превью 90 px.
+    assert bot.downloaded == ["small"]

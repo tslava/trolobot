@@ -28,9 +28,10 @@ from typing import TYPE_CHECKING, Protocol
 from aiogram import F, Router
 from aiogram.types import Message, User
 
+from trolobot.chat_memory import format_period
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import LifeEventRow
+from trolobot.db import ChatMemoryRow, LifeEventRow
 from trolobot.few_shot import FewShot
 from trolobot.sanitize import normalize_text, sanitize_display_name
 from trolobot.settings import Settings
@@ -77,11 +78,19 @@ _HELP_TEXT = (
     "/life <текст> — новость о себе: запомнить и сразу рассказать в чате\n"
     "/life list | rm N | post N — события: список, удалить, повторить\n"
     "/say <текст> — сказать в чат дословно\n"
+    "/memory [list|rm N|run] — долгая память чата: пересказы по неделям\n"
     "/help — эта справка"
 )
 
 # Общий текст использования — и для голого /life, и для /life rm|post без валидного N.
 _LIFE_USAGE = "Использование: /life <текст> | list | rm N | post N"
+
+# /memory без подкоманды = /memory list; остальное — подсказка при кривом вводе.
+_MEMORY_USAGE = "Использование: /memory [list | rm N | run]"
+# Сколько пересказов показывать в /memory list (ответ всё равно режется до 3500 символов).
+_MEMORY_LIST_LIMIT = 20
+# Сколько символов свежесозданных пересказов показать в ответе на /memory run.
+_MEMORY_RUN_PREVIEW_LEN = 1500
 
 
 class _MessageRowLike(Protocol):
@@ -161,6 +170,12 @@ class _DbLike(Protocol):
     async def life_events(self) -> Sequence[LifeEventRow]: ...
     async def life_event(self, event_id: int) -> LifeEventRow | None: ...
     async def delete_life_event(self, event_id: int) -> bool: ...
+    # -- долгая память чата (/memory, CLAUDE.md "долгая память чата") --------
+    async def chat_memories(self, limit: int) -> Sequence[ChatMemoryRow]: ...
+    async def chat_memory(self, memory_id: int) -> ChatMemoryRow | None: ...
+    async def chat_memory_count(self) -> int: ...
+    async def delete_chat_memory(self, memory_id: int) -> bool: ...
+    async def last_chat_memory_end(self) -> int | None: ...
 
 
 class _ResponderLike(Protocol):
@@ -172,6 +187,16 @@ class _ResponderLike(Protocol):
 
     async def announce_life(self, event: LifeEventRow) -> SendOutcome: ...
     async def say(self, text: str) -> SendOutcome: ...
+
+
+class _ChatMemorizerLike(Protocol):
+    """Подмножество chat_memory.ChatMemorizer, нужное /memory run.
+
+    Только ``run_due`` — список и удаление идут прямо через БД. None означает,
+    что LLM-часть выключена (нет ключа): тогда /memory run отвечает об этом и
+    ничего не запускает."""
+
+    async def run_due(self, *, now: int) -> Sequence[ChatMemoryRow]: ...
 
 
 class _ConfigStoreLike(Protocol):
@@ -231,6 +256,8 @@ class _CommandsDeps(Protocol):
     def bot_username(self) -> str: ...
     @property
     def sticker_catalog_enabled(self) -> int: ...
+    @property
+    def memorizer(self) -> _ChatMemorizerLike | None: ...
 
 
 def _truncate(text: str) -> str:
@@ -398,12 +425,21 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     reactions = int(await deps.db.get_state(day_key("reaction_count", now, tz)) or "0")
     stickers = int(await deps.db.get_state(day_key("sticker_count", now, tz)) or "0")
     followup_calls = int(await deps.db.get_state(day_key("followup_calls", now, tz)) or "0")
+    vision_count = int(await deps.db.get_state(day_key("vision_count", now, tz)) or "0")
 
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
 
     life_events = await deps.db.life_events()
     life_unsent = sum(1 for event in life_events if event.announced_at is None)
+
+    memory_total = await deps.db.chat_memory_count()
+    memory_end = await deps.db.last_chat_memory_end()
+    memory_line = (
+        f"chat memory: {memory_total}, последний до {local_dt(memory_end, tz).strftime('%d.%m.%Y')}"
+        if memory_end is not None
+        else "chat memory: нет"
+    )
 
     hot_until_raw = await deps.db.get_state("hot_until")
     try:
@@ -446,8 +482,10 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"Pending: {pending}",
         f"Night queue: {night_queue}",
         f"life events: {len(life_events)} ({life_unsent})",
+        memory_line,
         hot_line,
         f"followup calls: {followup_calls}/{cfg.behaviour.followup.daily_cap}",
+        f"vision: {vision_count}/{cfg.behaviour.vision.daily_cap}",
         checkin_line,
     ]
     await _reply(message, "\n".join(lines))
@@ -734,6 +772,83 @@ async def _cmd_life_post(
     await _reply(message, _life_outcome_text(outcome))
 
 
+async def _cmd_memory(
+    message: Message,
+    deps: _CommandsDeps,
+    now: int,
+    admin_user_id: int,
+    args: list[str],
+) -> None:
+    """/memory [list|rm N|run] — долгая память чата (CLAUDE.md, "долгая память чата").
+
+    Голое /memory — это /memory list: смотреть, что бот о вас помнит, владелец
+    будет чаще, чем что-то менять.
+    """
+    sub = args[0].lower() if args else "list"
+    if sub == "list":
+        await _cmd_memory_list(message, deps)
+        return
+    if sub == "rm":
+        await _cmd_memory_rm(message, deps, now, admin_user_id, args)
+        return
+    if sub == "run":
+        await _cmd_memory_run(message, deps, now, admin_user_id)
+        return
+    await _reply(message, _MEMORY_USAGE)
+
+
+async def _cmd_memory_list(message: Message, deps: _CommandsDeps) -> None:
+    tz = deps.config_store.get().persona.timezone
+    rows = await deps.db.chat_memories(_MEMORY_LIST_LIMIT)
+    if not rows:
+        await _reply(message, "Памяти пока нет.")
+        return
+    blocks = [
+        f"#{row.id} {format_period(row.period_start, row.period_end, tz)}\n{row.text}"
+        for row in rows
+    ]
+    await _reply(message, "\n\n".join(blocks))
+
+
+async def _cmd_memory_rm(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    memory_id = _parse_int(args[1]) if len(args) > 1 else None
+    if memory_id is None:
+        await _reply(message, _MEMORY_USAGE)
+        return
+    row = await deps.db.chat_memory(memory_id)
+    if row is None:
+        await _reply(message, f"Нет пересказа #{memory_id}.")
+        return
+    await deps.db.delete_chat_memory(memory_id)
+    await deps.db.audit_stop("memory:rm", admin_user_id, now, row.text)
+    logger.info("memory rm: #%s, символов %d", memory_id, len(row.text))
+    await _reply(message, f"Пересказ #{memory_id} удалён.")
+
+
+async def _cmd_memory_run(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int
+) -> None:
+    """Принудительный прогон, вне run_window — чтобы не ждать до ночи."""
+    if deps.memorizer is None:
+        await _reply(message, "LLM-часть выключена, пересказы недоступны.")
+        return
+    await deps.db.audit_stop("memory:run", admin_user_id, now)
+    tz = deps.config_store.get().persona.timezone
+    created = await deps.memorizer.run_due(now=now)
+    logger.info("memory run: добавлено %d", len(created))
+    if not created:
+        await _reply(message, "Нечего пересказывать.")
+        return
+    blocks = [
+        f"#{row.id} {format_period(row.period_start, row.period_end, tz)}\n{row.text}"
+        for row in created
+    ]
+    preview = "\n\n".join(blocks)[:_MEMORY_RUN_PREVIEW_LEN]
+    await _reply(message, f"Добавлено пересказов: {len(created)}\n\n{preview}")
+
+
 async def _cmd_say(
     message: Message,
     deps: _CommandsDeps,
@@ -846,6 +961,8 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_life(message, deps, now, admin_user_id, args, text, tokens)
                 elif cmd == "say":
                     await _cmd_say(message, deps, now, admin_user_id, text, tokens)
+                elif cmd == "memory":
+                    await _cmd_memory(message, deps, now, admin_user_id, args)
                 elif cmd == "help":
                     await _reply(message, _HELP_TEXT)
                 else:

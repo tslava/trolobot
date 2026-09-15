@@ -15,6 +15,7 @@ import httpx
 from aiogram import Bot, Dispatcher
 
 from trolobot.bot import Deps, build_router
+from trolobot.chat_memory import ChatMemorizer
 from trolobot.commands import build_commands_router
 from trolobot.db import Database
 from trolobot.followup import FollowupChecker
@@ -25,6 +26,7 @@ from trolobot.retention import retention_loop
 from trolobot.settings import Settings
 from trolobot.stickers import StickerChooser, load_catalog
 from trolobot.stores import ConfigStore, PromptStore
+from trolobot.vision import VisionDescriber
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ async def main() -> None:
     morning_task: asyncio.Task[None] | None = None
     spontaneous_task: asyncio.Task[None] | None = None
     checkin_task: asyncio.Task[None] | None = None
+    memory_task: asyncio.Task[None] | None = None
     llm: LLMClient | None = None
     responder: Responder | None = None
     try:
@@ -123,6 +126,12 @@ async def main() -> None:
             followup_prompt = settings.followup_prompt_path.read_text(encoding="utf-8")
             deps.followup = FollowupChecker(llm, config_store.get, followup_prompt)
 
+            # Зрение на фото (CLAUDE.md, "зрение на фото") — как и followup,
+            # создаётся вместе с остальными LLM-зависимыми компонентами; enabled и
+            # модель проверяются на каждом снимке, а не один раз при старте.
+            vision_prompt = settings.vision_prompt_path.read_text(encoding="utf-8")
+            deps.vision = VisionDescriber(llm, config_store.get, vision_prompt)
+
             # Каталог стикеров — офлайн-файл (CLAUDE.md, "Интерфейсы: стикеры"),
             # правится stickers_fill.py и владельцем руками. Пустой/отсутствующий
             # файл -> пустой каталог, чузер не создаётся, всё остальное работает
@@ -133,6 +142,20 @@ async def main() -> None:
             if deps.sticker_catalog_enabled:
                 sticker_prompt = settings.sticker_prompt_path.read_text(encoding="utf-8")
                 sticker_chooser = StickerChooser(llm, config_store.get, catalog, sticker_prompt)
+
+            # Долгая память чата (CLAUDE.md, "долгая память чата"): фоновый таск
+            # раз в час смотрит, попало ли локальное время в run_window, и
+            # пересказывает завершённые периоды. enabled проверяется на каждом
+            # заходе, а не один раз при старте — /set включает без рестарта.
+            memory_prompt = settings.memory_prompt_path.read_text(encoding="utf-8")
+            memorizer = ChatMemorizer(
+                llm,
+                db,
+                config_store.get,
+                memory_prompt,
+                chat_id=settings.allowed_chat_id,
+            )
+            deps.memorizer = memorizer
 
             responder = Responder(
                 bot=bot,
@@ -155,6 +178,8 @@ async def main() -> None:
             morning_task = asyncio.create_task(responder.morning_job())
             spontaneous_task = asyncio.create_task(responder.spontaneous_job())
             checkin_task = asyncio.create_task(responder.checkin_job())
+        if deps.memorizer is not None:
+            memory_task = asyncio.create_task(deps.memorizer.job())
 
         logger.info(
             "started as @%s, allowed_chat_id=%s, discovery=%s",
@@ -165,7 +190,7 @@ async def main() -> None:
 
         await dispatcher.start_polling(bot, allowed_updates=["message", "edited_message"])
     finally:
-        for task in (checkin_task, spontaneous_task, morning_task, retention_task):
+        for task in (memory_task, checkin_task, spontaneous_task, morning_task, retention_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

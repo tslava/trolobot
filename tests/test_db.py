@@ -25,6 +25,7 @@ EXPECTED_TABLES = {
     "prompt_versions",
     "few_shot_versions",
     "life_events",
+    "chat_memory",
 }
 
 
@@ -37,7 +38,7 @@ async def test_connect_creates_all_tables_and_bumps_user_version(tmp_path: Path)
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 2
+        assert row[0] == 3
 
         cursor = await conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
@@ -74,7 +75,7 @@ async def test_reconnect_is_idempotent(tmp_path: Path) -> None:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 2
+        assert row[0] == 3
         messages = await db2.recent_messages(42, 10)
         assert len(messages) == 1
         assert messages[0].text == "привет"
@@ -1686,8 +1687,8 @@ async def test_mark_places_not_seen_already_not_operational_not_recounted(tmp_pa
 
 
 def _schema_sql_v1() -> str:
-    """schema.sql, но как будто ещё нет life_events (реальная БД на сервере,
-    user_version == 1) — для теста миграции 1 -> 2."""
+    """schema.sql, но как будто ещё нет ни life_events, ни chat_memory (реальная
+    БД на сервере, user_version == 1) — для теста миграции 1 -> 3."""
     schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
     life_events_block = (
         '-- События жизни персонажа (/life, CLAUDE.md "события жизни") — память, не\n'
@@ -1702,12 +1703,42 @@ def _schema_sql_v1() -> str:
     )
     assert life_events_block in schema_sql
     old_schema_sql = schema_sql.replace(life_events_block, "")
-    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 2;", "PRAGMA user_version = 1;")
+    old_schema_sql = _strip_chat_memory(old_schema_sql)
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 1;")
     assert "life_events" not in old_schema_sql
     return old_schema_sql
 
 
-async def test_migrate_v1_to_v2_adds_life_events_and_keeps_existing_data(
+def _schema_sql_v2() -> str:
+    """schema.sql, но как будто ещё нет chat_memory (user_version == 2) — для
+    теста миграции 2 -> 3 (CLAUDE.md, "долгая память чата")."""
+    schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
+    old_schema_sql = _strip_chat_memory(schema_sql)
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 2;")
+    assert "chat_memory" not in old_schema_sql
+    return old_schema_sql
+
+
+def _strip_chat_memory(schema_sql: str) -> str:
+    chat_memory_block = (
+        '-- Долгая память чата (CLAUDE.md, "долгая память чата") — пересказ прошедших\n'
+        "-- разговоров по периодам. Живёт дольше самих сообщений: retention.py чистит её\n"
+        "-- по своему сроку (behaviour.chat_memory.keep_days), а не по message_retention_days.\n"
+        "CREATE TABLE chat_memory (\n"
+        "    id INTEGER PRIMARY KEY,\n"
+        "    period_start INTEGER NOT NULL,   -- unix, включительно\n"
+        "    period_end INTEGER NOT NULL,     -- unix, исключительно\n"
+        "    text TEXT NOT NULL,              -- пересказ, несколько строк\n"
+        "    created_at INTEGER NOT NULL\n"
+        ");\n\n"
+    )
+    index_line = "CREATE INDEX idx_chat_memory_period_end ON chat_memory (period_end);\n"
+    assert chat_memory_block in schema_sql
+    assert index_line in schema_sql
+    return schema_sql.replace(chat_memory_block, "").replace(index_line, "")
+
+
+async def test_migrate_v1_to_v3_adds_new_tables_and_keeps_existing_data(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "bot.db"
@@ -1732,20 +1763,65 @@ async def test_migrate_v1_to_v2_adds_life_events_and_keeps_existing_data(
         cursor = await raw_conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 2
+        assert row[0] == 3
 
         cursor = await raw_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'life_events'"
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('life_events', 'chat_memory')"
         )
-        assert await cursor.fetchone() is not None
+        assert {r["name"] for r in await cursor.fetchall()} == {"life_events", "chat_memory"}
 
         messages = await db.recent_messages(42, 10)
         assert len(messages) == 1
         assert messages[0].text == "привет со старой схемы"
 
-        # Свежая таблица рабочая, не просто существует.
+        # Свежие таблицы рабочие, не просто существуют.
         event_id = await db.insert_life_event(text="продал Октавию", created_at=2000)
         assert await db.life_event(event_id) is not None
+        memory_id = await db.insert_chat_memory(
+            period_start=1000, period_end=2000, text="говорили о гараже", created_at=2000
+        )
+        assert await db.chat_memory(memory_id) is not None
+    finally:
+        await db.close()
+
+
+async def test_migrate_v2_to_v3_adds_chat_memory_and_keeps_existing_data(
+    tmp_path: Path,
+) -> None:
+    """Реальная БД на сервере стоит на user_version == 2 (life_events уже есть):
+    миграция 3 должна добавить chat_memory и не тронуть данные."""
+    path = tmp_path / "bot.db"
+    conn = await aiosqlite.connect(path)
+    try:
+        await conn.executescript(_schema_sql_v2())
+        await conn.execute(
+            "INSERT INTO messages (tg_message_id, chat_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, is_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 42, 1, "A", "привет со схемы v2", None, 0, 1000),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    db = Database(path)
+    await db.connect()
+    try:
+        raw_conn = db._conn
+        assert raw_conn is not None
+
+        cursor = await raw_conn.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 3
+
+        messages = await db.recent_messages(42, 10)
+        assert [m.text for m in messages] == ["привет со схемы v2"]
+
+        memory_id = await db.insert_chat_memory(
+            period_start=1000, period_end=2000, text="говорили о гараже", created_at=2000
+        )
+        assert await db.chat_memory(memory_id) is not None
     finally:
         await db.close()
 
@@ -1815,5 +1891,199 @@ async def test_mark_life_event_announced_sets_fields(tmp_path: Path) -> None:
         assert event is not None
         assert event.announced_at == 2000
         assert event.announced_tg_message_id == 555
+    finally:
+        await db.close()
+
+
+# --- долгая память чата (CLAUDE.md, "долгая память чата") --------------------
+
+
+async def test_chat_memory_crud(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        first = await db.insert_chat_memory(
+            period_start=1000, period_end=2000, text="говорили о гараже", created_at=2000
+        )
+        second = await db.insert_chat_memory(
+            period_start=2000, period_end=3000, text="ездили за грибами", created_at=3000
+        )
+
+        rows = await db.chat_memories(10)
+        assert [row.id for row in rows] == [first, second]  # хронологически
+        assert rows[0].text == "говорили о гараже"
+        assert await db.chat_memory_count() == 2
+        assert await db.last_chat_memory_end() == 3000
+
+        one = await db.chat_memory(second)
+        assert one is not None
+        assert one.period_start == 2000
+
+        assert await db.delete_chat_memory(second) is True
+        assert await db.delete_chat_memory(second) is False
+        assert await db.chat_memory(second) is None
+        assert await db.last_chat_memory_end() == 2000
+    finally:
+        await db.close()
+
+
+async def test_chat_memories_returns_last_limit_chronologically(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        for index in range(5):
+            await db.insert_chat_memory(
+                period_start=index * 100,
+                period_end=(index + 1) * 100,
+                text=f"неделя {index}",
+                created_at=(index + 1) * 100,
+            )
+
+        rows = await db.chat_memories(2)
+        assert [row.text for row in rows] == ["неделя 3", "неделя 4"]
+        # in_prompt = 0 -> память в промпт не подмешивается, лишнего запроса нет
+        assert await db.chat_memories(0) == []
+    finally:
+        await db.close()
+
+
+async def test_last_chat_memory_end_is_none_when_empty(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.last_chat_memory_end() is None
+        assert await db.chat_memory_count() == 0
+        assert await db.chat_memories(5) == []
+    finally:
+        await db.close()
+
+
+async def test_purge_chat_memory_older_than_uses_period_end(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        old = await db.insert_chat_memory(
+            period_start=0, period_end=1000, text="давнее", created_at=1000
+        )
+        fresh = await db.insert_chat_memory(
+            period_start=1000, period_end=2000, text="свежее", created_at=2000
+        )
+
+        assert await db.purge_chat_memory_older_than(1500) == 1
+        assert await db.chat_memory(old) is None
+        assert await db.chat_memory(fresh) is not None
+    finally:
+        await db.close()
+
+
+async def test_messages_between_is_half_open_and_skips_bots(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        for index, created_at in enumerate((900, 1000, 1500, 2000, 2100)):
+            await db.insert_message(
+                tg_message_id=index + 1,
+                chat_id=42,
+                user_id=1,
+                display_name="Дима",
+                text=str(created_at),
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=created_at,
+            )
+        await db.insert_message(
+            tg_message_id=99,
+            chat_id=42,
+            user_id=999,
+            display_name="Фёдор",
+            text="реплика бота",
+            reply_to_tg_message_id=None,
+            is_bot=True,
+            created_at=1200,
+        )
+        await db.insert_message(
+            tg_message_id=100,
+            chat_id=7,
+            user_id=1,
+            display_name="Чужой",
+            text="другой чат",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=1200,
+        )
+
+        rows = await db.messages_between(42, 1000, 2000)
+        assert [row.text for row in rows] == ["1000", "1500"]  # start включён, end нет
+    finally:
+        await db.close()
+
+
+async def test_messages_between_excludes_muted_user_ids(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        for user_id, name in ((1, "Дима"), (2, "Молчун")):
+            await db.insert_message(
+                tg_message_id=user_id,
+                chat_id=42,
+                user_id=user_id,
+                display_name=name,
+                text=name,
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=1000 + user_id,
+            )
+
+        rows = await db.messages_between(42, 0, 5000, exclude_user_ids=frozenset({2}))
+        assert [row.display_name for row in rows] == ["Дима"]
+
+        rows = await db.messages_between(42, 0, 5000)
+        assert [row.display_name for row in rows] == ["Дима", "Молчун"]
+    finally:
+        await db.close()
+
+
+async def test_bot_replies_between_is_half_open_and_chronological(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        for created_at in (900, 1000, 1500, 2000):
+            await db.insert_bot_reply(
+                tg_message_id=created_at,
+                reply_to_tg_message_id=None,
+                trigger="ambient",
+                trigger_tg_message_id=None,
+                text=str(created_at),
+                prompt_version=1,
+                few_shot_version=1,
+                delay_sec=0,
+                created_at=created_at,
+            )
+
+        rows = await db.bot_replies_between(1000, 2000)
+        assert [row.text for row in rows] == ["1000", "1500"]
+    finally:
+        await db.close()
+
+
+async def test_first_message_at_returns_earliest_of_chat(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        assert await db.first_message_at(42) is None
+
+        for chat_id, created_at in ((42, 2000), (42, 1000), (7, 500)):
+            await db.insert_message(
+                tg_message_id=created_at,
+                chat_id=chat_id,
+                user_id=1,
+                display_name="Дима",
+                text="x",
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=created_at,
+            )
+
+        assert await db.first_message_at(42) == 1000
     finally:
         await db.close()

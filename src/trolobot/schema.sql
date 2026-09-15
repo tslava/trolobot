@@ -125,11 +125,23 @@ CREATE TABLE life_events (
     announced_tg_message_id INTEGER
 );
 
+-- Долгая память чата (CLAUDE.md, "долгая память чата") — пересказ прошедших
+-- разговоров по периодам. Живёт дольше самих сообщений: retention.py чистит её
+-- по своему сроку (behaviour.chat_memory.keep_days), а не по message_retention_days.
+CREATE TABLE chat_memory (
+    id INTEGER PRIMARY KEY,
+    period_start INTEGER NOT NULL,   -- unix, включительно
+    period_end INTEGER NOT NULL,     -- unix, исключительно
+    text TEXT NOT NULL,              -- пересказ, несколько строк
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX idx_messages_chat_created ON messages (chat_id, created_at);
 CREATE INDEX idx_messages_tg_message_id ON messages (tg_message_id);
 CREATE INDEX idx_bot_replies_created ON bot_replies (created_at);
 CREATE INDEX idx_filter_log_created ON filter_log (created_at);
 CREATE INDEX idx_night_queue_answered ON night_queue (answered_at);
 CREATE INDEX idx_pending_replies_done_due ON pending_replies (done_at, due_at);
+CREATE INDEX idx_chat_memory_period_end ON chat_memory (period_end);
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
