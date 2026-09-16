@@ -1513,6 +1513,31 @@ async def test_status_shows_circuit_closed_when_key_expired(
     assert "Предохранитель LLM: закрыт, ошибок подряд: 5" in text
 
 
+async def test_status_shows_stop_only_while_active(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """stop_until в прошлом — гейт стоп уже не применяет (сравнивает с now), а ключ
+    никто не удаляет; /status не должен показывать истёкший стоп (живой случай
+    16.09.2026: «у бота до сих пор стоп, хотя время прошло»). Действующий — показывает."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+    now = int(NOW.timestamp())
+
+    db.state["stop_until"] = str(now - 10)
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status"))
+    assert "Стоп до: нет" in sent[0]
+
+    db.state["stop_until"] = str(now + 3600)
+    await handler(
+        _message(
+            chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status", message_id=2
+        )
+    )
+    assert "Стоп до: нет" not in sent[1]
+    assert "Стоп до: " in sent[1]
+
+
 async def test_status_shows_life_events_total_and_unsent(
     monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
 ) -> None:

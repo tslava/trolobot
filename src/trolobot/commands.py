@@ -409,9 +409,12 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
 
     panic = await deps.db.get_state("panic") == "1"
     stop_until_raw = await deps.db.get_state("stop_until")
-    stop_until = (
-        local_dt(int(stop_until_raw), tz).strftime("%H:%M %d.%m") if stop_until_raw else "нет"
-    )
+    # Ключ stop_until после истечения никто не удаляет (гейт просто сравнивает его с now),
+    # поэтому показываем дату только пока стоп действует — иначе /status врал бы про стоп,
+    # которого уже нет (живой случай 16.09.2026).
+    stop_until = "нет"
+    if stop_until_raw is not None and int(stop_until_raw) > now:
+        stop_until = local_dt(int(stop_until_raw), tz).strftime("%H:%M %d.%m")
 
     circuit_until_raw = await deps.db.get_state("llm_circuit_until")
     circuit_state = "закрыт"
