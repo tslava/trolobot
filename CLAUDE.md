@@ -1026,7 +1026,7 @@ shadow=false -> sent=False с причиной; LLMError -> reason; say: тек�
 # config_models.py — BehaviourConfig.hot_window: HotWindowConfig (с description у каждого поля)
 class HotWindowConfig(BaseModel):
     enabled: bool = True
-    minutes: int = Field(default=30, ge=0, le=720)  # длительность окна после /life и /say
+    minutes: int = Field(default=10, ge=0, le=720)  # длительность окна после /life и /say (было 30, решение владельца 16.09)
     mention_max_delay_sec: int = Field(
         default=120, ge=0, le=3600
     )  # потолок задержки ответа на обращение в окне

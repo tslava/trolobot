@@ -222,7 +222,7 @@ class HotWindowConfig(BaseModel):
 
     enabled: bool = Field(default=True, description="Включает горячее окно после /life и /say")
     minutes: int = Field(
-        default=30, ge=0, le=720, description="Длительность горячего окна после /life и /say"
+        default=10, ge=0, le=720, description="Длительность горячего окна после /life и /say"
     )
     mention_max_delay_sec: int = Field(
         default=120,
