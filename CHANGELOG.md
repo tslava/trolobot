@@ -10,7 +10,13 @@
 
 ### Для чата
 
+- Фёдор больше не лайкает мгновенно: сначала вычитывает сообщение, а через минуту-другую ставит реакцию — и только если она к месту. Добавилось 😂 для по-настоящему смешного.
+
 ### Для владельца
+
+- Реакции с задержкой и смыслом: `behaviour.reactions.delay_sec` (20–120 с), `semantic: true` (выбор эмодзи дешёвой моделью вместо кубика), `model` (пусто → `llm.judge_model`), `max_tokens`, `semantic_daily_cap` (40, счётчик `reaction_calls`), `context_messages` (6); дефолт `emoji` — `["👍", "💩", "😂"]`.
+- `probability` работает только при `semantic: false` (прежнее поведение); промпт `prompts/reaction.txt`, путь — `REACTION_PROMPT_PATH`.
+- `filter_log` пополнился `react:recheck` (условия разошлись за время паузы) и `react:declined` (модель сказала «не нужно»); `/status` показывает `semantic calls <N>/<cap>`.
 
 
 ## [0.5.0] — 2026-09-16

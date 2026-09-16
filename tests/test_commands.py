@@ -1651,6 +1651,41 @@ async def test_status_shows_followup_calls_today_count(
     assert f"followup calls: 7/{cap}" in sent[0]
 
 
+async def test_status_shows_reaction_semantic_calls(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """Реакции считаются двумя числами: сколько поставлено и сколько вызовов модели
+    на них потрачено (свой потолок semantic_daily_cap)."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    tz = config.persona.timezone
+    db.state[day_key("reaction_count", now, tz)] = "2"
+    db.state[day_key("reaction_calls", now, tz)] = "5"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    reactions_cfg = config.behaviour.reactions
+    assert f"reactions=2/{reactions_cfg.daily_cap}" in sent[0]
+    assert f"semantic calls 5/{reactions_cfg.semantic_daily_cap}" in sent[0]
+
+
+async def test_status_shows_zero_reaction_semantic_calls_by_default(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    cap = config.behaviour.reactions.semantic_daily_cap
+    assert f"semantic calls 0/{cap}" in sent[0]
+
+
 async def test_status_shows_vision_zero_by_default(
     monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
 ) -> None:

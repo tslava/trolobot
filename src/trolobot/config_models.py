@@ -115,8 +115,12 @@ class ReplyDelayBucket(BaseModel):
 class ReactionsConfig(BaseModel):
     """Реакции-эмодзи на чужие сообщения, срезанные гейтом по gate:dice/gate:ambient_cooldown.
 
-    Дёшево: не вызывает модель, не создаёт сообщение, только setMessageReaction —
-    эффект присутствия без текстового ответа (CLAUDE.md, "Интерфейсы: реакции").
+    Вместо текстового ответа — только setMessageReaction: нового сообщения нет,
+    эффект присутствия есть (CLAUDE.md, "Интерфейсы: реакции"). С 16.09.2026
+    реакция ставится не мгновенно и не по кубику (CLAUDE.md, "Интерфейсы: реакции
+    с задержкой и смыслом"): сначала пауза ``delay_sec`` — человек сперва читает, —
+    потом при ``semantic`` дешёвая модель решает, уместна ли реакция и какая.
+    ``probability`` остаётся только для ``semantic: false`` (прежнее поведение).
     ``emoji`` валидируется на уровне ``Config`` (см. ``Config._check_reactions_emoji_allowed``):
     каждый элемент обязан входить в ``filters.allowed_emoji``, иначе ``/set
     behaviour.reactions.emoji`` падает с понятной ошибкой.
@@ -133,8 +137,25 @@ class ReactionsConfig(BaseModel):
         default=8, ge=0, le=100, description="Потолок реакций в сутки, отдельно от ambient/mention"
     )
     emoji: list[str] = Field(
-        default_factory=lambda: ["👍", "💩"],
+        default_factory=lambda: ["👍", "💩", "😂"],
         description="Из чего выбирается реакция; каждый элемент — из filters.allowed_emoji",
+    )
+    delay_sec: tuple[int, int] = Field(
+        default=(20, 120),
+        description="Пауза перед реакцией: прочитал и хмыкнул, а не мгновенно, [мин, макс]",
+    )
+    semantic: bool = Field(
+        default=True, description="Реакцию выбирает дешёвая модель; false — прежний кубик"
+    )
+    model: str = Field(default="", description="Модель выбора реакции; пусто -> llm.judge_model")
+    max_tokens: int = Field(
+        default=40, ge=10, le=200, description="Потолок ответа модели выбора реакции, токенов"
+    )
+    semantic_daily_cap: int = Field(
+        default=40, ge=0, le=1000, description="Потолок вызовов модели на реакции в сутки"
+    )
+    context_messages: int = Field(
+        default=6, ge=1, le=30, description="Сколько последних сообщений чата показать модели"
     )
 
     @field_validator("emoji")
@@ -142,6 +163,14 @@ class ReactionsConfig(BaseModel):
     def _validate_non_empty(cls, value: list[str]) -> list[str]:
         if not value:
             raise ValueError("reactions.emoji must not be empty")
+        return value
+
+    @field_validator("delay_sec")
+    @classmethod
+    def _validate_delay_sec(cls, value: tuple[int, int]) -> tuple[int, int]:
+        lo, hi = value
+        if not (0 <= lo <= hi <= 3600):
+            raise ValueError(f"invalid delay_sec {value!r}: expected 0 <= min <= max <= 3600")
         return value
 
 
