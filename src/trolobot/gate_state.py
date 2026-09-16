@@ -7,7 +7,7 @@ import logging
 from trolobot.config_models import Config
 from trolobot.db import Database
 from trolobot.gate_types import GateMessage, GateState
-from trolobot.timeutil import day_key
+from trolobot.timeutil import day_key, day_start
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,14 @@ async def load_gate_state(db: Database, cfg: Config, msg: GateMessage, now: int)
     hot_ambient_count_raw = await db.get_state("hot_ambient_count")
     hot_ambient_count = _parse_int_state_default_zero("hot_ambient_count", hot_ambient_count_raw)
 
+    # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее") считается не по
+    # state-счётчику, а прямо по таблицам: сообщения людей и реплики бота с локальной
+    # полуночи. Так потолок переживает любые ручные правки state и сразу учитывает
+    # /life, /say и всё, что записалось мимо счётчиков ambient/mention.
+    midnight = day_start(now, tz)
+    human_messages_today = await db.count_messages_today(msg.chat_id, midnight)
+    bot_replies_today = await db.count_bot_replies_today(midnight)
+
     return GateState(
         panic=panic,
         stop_until=stop_until,
@@ -82,4 +90,6 @@ async def load_gate_state(db: Database, cfg: Config, msg: GateMessage, now: int)
         recent=tuple(recent),
         hot_until=hot_until,
         hot_ambient_count=hot_ambient_count,
+        human_messages_today=human_messages_today,
+        bot_replies_today=bot_replies_today,
     )

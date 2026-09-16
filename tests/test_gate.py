@@ -127,6 +127,8 @@ def make_state(
     recent: tuple[RecentActivity, ...] = (),
     hot_until: int | None = None,
     hot_ambient_count: int = 0,
+    human_messages_today: int = 0,
+    bot_replies_today: int = 0,
 ) -> GateState:
     return GateState(
         panic=panic,
@@ -141,6 +143,8 @@ def make_state(
         recent=recent,
         hot_until=hot_until,
         hot_ambient_count=hot_ambient_count,
+        human_messages_today=human_messages_today,
+        bot_replies_today=bot_replies_today,
     )
 
 
@@ -761,3 +765,117 @@ def test_make_msg_and_state_defaults_produce_ambient_pass_or_dice() -> None:
     )
     assert decision.verdict == Verdict.PASS
     assert decision.reason == "pass:ambient"
+
+
+# ---------------------------------------------------------------------------
+# Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1): за локальные
+# сутки бот говорит не больше своей доли от написанного людьми. Реплай на бота
+# проходит под потолком всегда, всё остальное — нет.
+# ---------------------------------------------------------------------------
+
+# 20 человеческих сообщений при max_share 0.15 и free_replies 2 -> allowance 5.
+OVER_CAP = {"human_messages_today": 20, "bot_replies_today": 5}
+UNDER_CAP = {"human_messages_today": 20, "bot_replies_today": 4}
+
+
+def test_presence_cap_drops_name_address() -> None:
+    state = make_state(**OVER_CAP)
+    decision = should_consider(
+        make_msg(text="фёдор, ты как"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.DROP
+    assert decision.reason == "gate:presence_cap"
+
+
+def test_presence_cap_drops_mention() -> None:
+    state = make_state(**OVER_CAP)
+    decision = should_consider(
+        make_msg(text="@trolobot ты тут"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.DROP
+    assert decision.reason == "gate:presence_cap"
+
+
+def test_presence_cap_lets_reply_to_bot_through() -> None:
+    """Человек ответил боту реплаем — это проходит под потолком всегда."""
+    state = make_state(**OVER_CAP)
+    decision = should_consider(
+        make_msg(text="да ну", reply_to_bot=True),
+        state,
+        make_cfg(),
+        FakePatterns(),
+        DAY,
+        FixedRandom(0.0),
+    )
+    assert decision.verdict is Verdict.PASS
+    assert decision.trigger is Trigger.REPLY
+    assert decision.reason == "pass:reply"
+
+
+def test_presence_cap_drops_ambient() -> None:
+    state = make_state(recent=LIVE_RECENT, **OVER_CAP)
+    decision = should_consider(
+        make_msg(text="ну и погода"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.DROP
+    assert decision.reason == "gate:presence_cap"
+
+
+def test_presence_cap_drops_ambient_in_hot_window() -> None:
+    """Потолок проверяется РАНЬШЕ горячего окна — окно его не обходит."""
+    state = make_state(recent=LIVE_RECENT, hot_until=DAY + 1000, **OVER_CAP)
+    decision = should_consider(
+        make_msg(text="ну и погода"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.DROP
+    assert decision.reason == "gate:presence_cap"
+
+
+def test_presence_under_cap_passes_name_address() -> None:
+    state = make_state(**UNDER_CAP)
+    decision = should_consider(
+        make_msg(text="фёдор, ты как"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.PASS
+    assert decision.reason == "pass:name"
+
+
+def test_presence_cap_disabled_lets_everything_through() -> None:
+    cfg = make_cfg()
+    cfg.behaviour.presence.enabled = False
+    state = make_state(**OVER_CAP)
+    decision = should_consider(
+        make_msg(text="фёдор, ты как"), state, cfg, FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.PASS
+
+
+def test_presence_cap_free_replies_allow_first_replies_in_empty_chat() -> None:
+    """Пустые сутки: доля 0, но free_replies даёт боту две реплики."""
+    state = make_state(human_messages_today=1, bot_replies_today=1)
+    decision = should_consider(
+        make_msg(text="фёдор, ты как"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.PASS
+
+    state = make_state(human_messages_today=1, bot_replies_today=2)
+    decision = should_consider(
+        make_msg(text="фёдор, ты как"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
+    )
+    assert decision.verdict is Verdict.DROP
+    assert decision.reason == "gate:presence_cap"
+
+
+def test_presence_cap_does_not_block_night_queue() -> None:
+    """Ночь важнее: обращение уходит в очередь на утро, а не отбрасывается потолком
+    (к утру наступят новые сутки и счётчики обнулятся)."""
+    state = make_state(**OVER_CAP)
+    decision = should_consider(
+        make_msg(text="фёдор, ты как", created_at=NIGHT),
+        state,
+        make_cfg(),
+        FakePatterns(),
+        NIGHT,
+        FixedRandom(0.0),
+    )
+    assert decision.verdict is Verdict.QUEUE_NIGHT

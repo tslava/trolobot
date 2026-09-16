@@ -48,7 +48,9 @@ def _convert_override_value(annotation: Any, raw_value: str, key: str) -> Any:
     """Строка -> питоновское значение. Списки/bool идут через yaml.safe_load,
     остальное остаётся строкой и приводится типом самим pydantic."""
     origin = get_origin(annotation)
-    needs_yaml = annotation is bool or origin in (list, tuple)
+    # dict — ради filters.motifs («метка -> список регулярок», CLAUDE.md, мера 5):
+    # /set filters.motifs принимает такой же YAML, как списки регулярок.
+    needs_yaml = annotation is bool or origin in (list, tuple, dict)
     if not needs_yaml:
         return raw_value
     try:
@@ -115,6 +117,12 @@ def _format_value(value: object) -> str:
         return yaml.safe_dump(
             plain, default_flow_style=True, allow_unicode=True, width=10_000
         ).strip()
+    if isinstance(value, dict):
+        # filters.motifs: тот же YAML-формат, что и списки, чтобы /get отдавал
+        # ровно то, что принимает /set.
+        return yaml.safe_dump(
+            value, default_flow_style=True, allow_unicode=True, width=10_000
+        ).strip()
     return str(value)
 
 
@@ -148,6 +156,9 @@ def _type_name(annotation: Any) -> str:
     if origin is tuple:
         inner = ", ".join(_type_name(arg) for arg in args)
         return f"tuple[{inner}]"
+    if origin is dict:
+        inner = ", ".join(_type_name(arg) for arg in args) if args else "Any, Any"
+        return f"dict[{inner}]"
     return str(origin)
 
 

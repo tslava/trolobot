@@ -29,6 +29,7 @@ from typing import Protocol, cast
 from trolobot.config_models import Config
 from trolobot.db import MessageRow
 from trolobot.gate_types import PatternsLike
+from trolobot.motifs import motifs_in, story_count, used_motifs
 from trolobot.patterns import Patterns
 
 _MAX_LEN = 300
@@ -480,6 +481,44 @@ def _check_self_echo(text: str, ctx: FilterContext) -> bool:
     return False
 
 
+def _check_motif(text: str, ctx: FilterContext, patterns: Patterns) -> bool:
+    """dedup:motif — кандидат тянет тот же реквизит, что уже был в последних репликах.
+
+    Страховка к слоту ``{avoid}`` промпта (CLAUDE.md, "меньше и разнообразнее",
+    мера 5): модель предупредили заранее, что жену/теплицу/гараж сейчас поминать
+    не надо, и если она всё равно их притащила — реплика режется. Окно
+    ``filters.motif_recent_window`` намеренно уже, чем окно ``{avoid}``
+    (``motif_avoid_window``): просить разнообразия можно широко, а резать —
+    только за совсем свежий повтор.
+    """
+    window = ctx.cfg.filters.motif_recent_window
+    if window <= 0:
+        return False
+    candidate = motifs_in(text, patterns.motifs)
+    if not candidate:
+        return False
+    recent = used_motifs(ctx.recent_replies, window, patterns.motifs)
+    return bool(set(candidate) & set(recent))
+
+
+def _check_story_quota(text: str, ctx: FilterContext, patterns: Patterns) -> bool:
+    """style:story_quota — байка, когда квота баек в окне уже выбрана.
+
+    «Байка не в каждом ответе, одна на несколько ответов» (CHARACTER.md раздел 3):
+    если в последних ``filters.story_window`` репликах историй уже
+    ``filters.story_max`` и больше, следующая история режется, а короткий ответ
+    по делу проходит.
+    """
+    filters_cfg = ctx.cfg.filters
+    markers = patterns.story_markers
+    if not markers:
+        return False
+    if not any(marker.search(text) for marker in markers):
+        return False
+    told = story_count(ctx.recent_replies, filters_cfg.story_window, markers)
+    return told >= filters_cfg.story_max
+
+
 def _check_emoji_count(text: str, allowed: frozenset[str], max_per_reply: int) -> bool:
     """style:emoji_count — разрешённых эмодзи в реплике больше emoji_max_per_reply."""
     count = sum(1 for ch, _ in _emoji_tokens(text) if ch in allowed)
@@ -505,11 +544,15 @@ def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
         reasons.append("dedup:polish_freq")
     if _check_self_echo(text, ctx):
         reasons.append("dedup:self_echo")
+    if _check_motif(text, ctx, patterns):
+        reasons.append("dedup:motif")
 
     if patterns.assistant_marker(text) is not None:
         reasons.append("style:assistant")
     if patterns.grumpy(text) is not None:
         reasons.append("style:grumpy")
+    if _check_story_quota(text, ctx, patterns):
+        reasons.append("style:story_quota")
     if _check_question_x2(text, ctx.recent_replies):
         reasons.append("style:question_x2")
     if text.count("!") > 1:

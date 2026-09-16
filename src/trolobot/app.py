@@ -124,7 +124,8 @@ async def main() -> None:
             # компонентами, как только есть ключ; enabled/model проверяются на
             # каждом вызове, а не один раз при старте.
             followup_prompt = settings.followup_prompt_path.read_text(encoding="utf-8")
-            deps.followup = FollowupChecker(llm, config_store.get, followup_prompt)
+            followup_checker = FollowupChecker(llm, config_store.get, followup_prompt)
+            deps.followup = followup_checker
 
             # Зрение на фото (CLAUDE.md, "зрение на фото") — как и followup,
             # создаётся вместе с остальными LLM-зависимыми компонентами; enabled и
@@ -169,6 +170,10 @@ async def main() -> None:
                 rng=rng,
                 chat_id=settings.allowed_chat_id,
                 bot_user_id=me.id,
+                # Та же дешёвая проверка "это мне?", что и в горячем окне: Responder
+                # перепроверяет ею строку, которую выбрал checkin (CLAUDE.md, "меньше
+                # и разнообразнее", мера 3).
+                followup=followup_checker,
             )
             deps.responder = responder
 

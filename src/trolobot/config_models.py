@@ -210,6 +210,10 @@ class HotWindowConfig(BaseModel):
     ambient_cap: int = Field(
         default=8, ge=0, le=50, description="Потолок ambient-реплик за одно горячее окно"
     )
+    open_on_any_reply: bool = Field(
+        default=False,
+        description="Открывать горячее окно после любой реплики, не только /life и /say",
+    )
 
 
 class FollowupConfig(BaseModel):
@@ -275,6 +279,12 @@ class CheckinConfig(BaseModel):
     poll_sec: int = Field(
         default=300, ge=30, le=3600, description="Период фонового цикла checkin_job, сек"
     )
+    quiet_min: int = Field(
+        default=10,
+        ge=0,
+        le=180,
+        description="Минут тишины в чате перед проверкой «вернулся»; писали позже — отложить",
+    )
 
     @field_validator("after_min")
     @classmethod
@@ -283,6 +293,39 @@ class CheckinConfig(BaseModel):
         if not (0 <= lo <= hi):
             raise ValueError(f"invalid after_min {value!r}: expected 0 <= min <= max")
         return value
+
+
+class PresenceConfig(BaseModel):
+    """Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): за локальные сутки
+    бот не говорит больше, чем ``max_share`` от числа сообщений людей плюс
+    ``free_replies`` в запас. Под потолком проходят только реплаи на самого бота,
+    ``/life`` и ``/say`` — остальное (обращения по имени, ambient, «просто так»,
+    утренняя реплика, «вернулся проверить») молчит до конца суток.
+    """
+
+    enabled: bool = Field(default=True, description="Включает суточный потолок присутствия бота")
+    max_share: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Доля реплик бота от сообщений людей за локальные сутки",
+    )
+    free_replies: int = Field(
+        default=2,
+        ge=0,
+        le=20,
+        description="Реплик в сутки сверх доли: на утро пустого чата",
+    )
+
+    def allowance(self, human_messages_today: int) -> int:
+        """Сколько реплик бот может себе позволить сегодня при таком числе сообщений людей."""
+        return int(human_messages_today * self.max_share) + self.free_replies
+
+    def over_cap(self, *, human_messages_today: int, bot_replies_today: int) -> bool:
+        """Потолок уже выбран (выключенный потолок — никогда)."""
+        if not self.enabled:
+            return False
+        return bot_replies_today >= self.allowance(human_messages_today)
 
 
 class ChatMemoryConfig(BaseModel):
@@ -432,6 +475,10 @@ class BehaviourConfig(BaseModel):
         default_factory=CheckinConfig,
         description="Периодическая проверка «вернулся» после закрытия горячего окна",
     )
+    presence: PresenceConfig = Field(
+        default_factory=PresenceConfig,
+        description="Суточный потолок присутствия: доля реплик бота от сообщений людей",
+    )
     chat_memory: ChatMemoryConfig = Field(
         default_factory=ChatMemoryConfig,
         description="Долгая память чата: пересказы прошедших разговоров по неделям",
@@ -497,6 +544,12 @@ class BehaviourConfig(BaseModel):
     )
     message_retention_days: int = Field(
         default=30, ge=1, le=3650, description="Сколько дней хранятся сообщения перед удалением"
+    )
+    min_gap_sec: int = Field(
+        default=300,
+        ge=0,
+        le=3600,
+        description="Минимум секунд между любыми двумя сообщениями бота в чате",
     )
 
     @field_validator("quiet_window", "morning_reply_window")
@@ -791,6 +844,41 @@ _POLISH_WORDS_DEFAULT = [
     "żywiec",
 ]
 
+# Реквизит персонажа (CLAUDE.md, "меньше и разнообразнее", мера 5): метка мотива ->
+# регулярки. 14.09 в 22 репликах жена встретилась 7 раз, теплица 5, гараж 5,
+# «в девяносто пятом» 5 — мотивы нужны и фильтру (dedup:motif), и промпту (слот
+# {avoid}), поэтому список один и живёт в конфиге.
+_MOTIFS_DEFAULT: dict[str, list[str]] = {
+    "жена": [r"\bжен[аеуы]\b", r"\bжено[йю]\b"],
+    "теплица": [r"\bтеплиц"],
+    "гараж": [r"\bгараж"],
+    "девяностые": [r"\bдевяност", r"\b9\d-?[мхе]\b"],
+    "двухтысячные": [r"\bдвухтысячн"],
+    "сын": [r"\bсын"],
+    "грибы": [r"\bгриб"],
+    "участок": [r"\bучасток", r"\bучастк"],
+    "машина": [r"\bмашин"],
+    "зато": [r"\bзато\b"],
+}
+
+# Маркеры байки (CLAUDE.md, мера 5) — по ним считается квота историй в окне
+# story_window: байка не в каждом ответе, а одна на несколько реплик.
+_STORY_MARKERS_DEFAULT = [
+    r"\bдевяност",
+    r"\bдвухтысячн",
+    r"\bв прошлом году",
+    r"\bлет назад",
+    r"\bпомню\b",
+    r"\bкогда-то\b",
+    r"\bодин раз\b",
+    r"\bкак-то раз\b",
+]
+
+# Стадии выходного фильтра, которые режут даже при filters.shadow: true
+# (CLAUDE.md, мера 4): повторы и сорванный стиль — ровно то, из-за чего чат
+# остановил бота, а shadow их пропускал.
+_ENFORCE_STAGES_DEFAULT = ["dedup", "style"]
+
 _REGEX_LIST_FIELDS = (
     "topic_stop",
     "injection_markers",
@@ -799,6 +887,7 @@ _REGEX_LIST_FIELDS = (
     "places_request",
     "model_talk",
     "grumpy_markers",
+    "story_markers",
 )
 
 # Разрешённый набор эмодзи (решение владельца, CHARACTER.md раздел 3/4) — небольшой,
@@ -873,6 +962,60 @@ class FiltersConfig(BaseModel):
         default_factory=lambda: list(_GRUMPY_MARKERS_DEFAULT),
         description="Сухие/раздражённые формулировки не в характере персонажа (выходной фильтр)",
     )
+    # Мера 4 контракта «меньше и разнообразнее»: shadow остаётся щадящим для новых
+    # слоёв, но дедуп и стиль режут всегда — иначе повторы уходят в чат.
+    enforce_stages: list[str] = Field(
+        default_factory=lambda: list(_ENFORCE_STAGES_DEFAULT),
+        description="Стадии выходного фильтра, которые режут ответ даже при shadow: true",
+    )
+    # Мера 5: реквизит (жена/теплица/гараж/девяностые) — метка -> регулярки.
+    motifs: dict[str, list[str]] = Field(
+        default_factory=lambda: {label: list(items) for label, items in _MOTIFS_DEFAULT.items()},
+        description="Метка мотива -> регулярки реквизита: жена, теплица, гараж, девяностые",
+    )
+    motif_recent_window: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="Окно последних реплик: мотив из него режет кандидата (dedup:motif)",
+    )
+    motif_avoid_window: int = Field(
+        default=10,
+        ge=0,
+        le=50,
+        description="Окно последних реплик, чьи мотивы уходят в промпт слотом {avoid}",
+    )
+    story_markers: list[str] = Field(
+        default_factory=lambda: list(_STORY_MARKERS_DEFAULT),
+        description="Маркеры байки: «девяностые», «помню», «как-то раз» (квота историй)",
+    )
+    story_window: int = Field(
+        default=5, ge=1, le=20, description="Окно последних реплик, в котором считается квота баек"
+    )
+    story_max: int = Field(
+        default=1,
+        ge=0,
+        le=20,
+        description="Сколько баек можно на окно story_window, дальше срез style:story_quota",
+    )
+
+    @field_validator("motifs")
+    @classmethod
+    def _validate_motifs(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Регулярки мотивов компилируются с IGNORECASE, как и все остальные списки.
+
+        Проверка здесь, а не в ``_validate_regex_list``: там валидатор получает
+        плоский ``list[str]``, а мотивы — словарь «метка -> список регулярок».
+        """
+        for label, patterns in value.items():
+            for pattern in patterns:
+                try:
+                    re.compile(pattern, re.IGNORECASE)
+                except re.error as exc:
+                    raise ValueError(
+                        f"invalid regex pattern {pattern!r} for motif {label!r}: {exc}"
+                    ) from exc
+        return value
 
     @field_validator(*_REGEX_LIST_FIELDS)
     @classmethod

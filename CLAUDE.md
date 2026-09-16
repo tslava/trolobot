@@ -1387,6 +1387,112 @@ data-URL, counter_key vision_calls и calls_cap, пост-обработка/о�
 «[фото: …] подпись», гейт видит триггер имени из подписи; should_describe False → «[фото]» и vision:skipped; ошибка
 скачивания → «[фото]» и хендлер жив; vision=None → как раньше), `tests/test_commands.py` (/status).
 
+## Интерфейсы: меньше и разнообразнее (после стопа 15.09.2026)
+
+Решение владельца после того, как чат остановил бота на сутки («его слишком много и он слишком
+однообразный»): 14.09 бот дал 19 реплик на 49 человеческих (39%), 6 из них непрошеные; в 22
+репликах жена 7 раз, теплица 5, гараж 5, «в девяносто пятом» 5, почти каждая — байка + «зато» +
+смайлик; фильтр видел повторы (`dedup:self_echo`, `style:emoji_freq`), но `filters.shadow: true`
+всё пропускал. Шесть мер ниже. Все пороги — конфиг, меняются `/set`.
+
+```python
+# 1. Потолок присутствия — behaviour.presence: PresenceConfig (description у каждого поля)
+class PresenceConfig(BaseModel):
+    enabled: bool = True
+    max_share: float = Field(default=0.15, ge=0.0, le=1.0)   # доля реплик бота от сообщений людей за локальные сутки
+    free_replies: int = Field(default=2, ge=0, le=20)        # столько реплик в сутки разрешено сверх доли (утро пустого чата)
+# allowance(now) = floor(human_messages_today * max_share) + free_replies; bot_replies_today >= allowance → потолок.
+# Под потолком проходят ТОЛЬКО Trigger.REPLY (реплай на сообщение бота), /life и /say; morning тоже блокируется.
+# GateState дополняется human_messages_today: int = 0, bot_replies_today: int = 0 (gate_state читает через новые
+# db.count_messages_today(chat_id, day_start) / db.count_bot_replies_today(day_start); day_start — локальная полночь
+# persona.timezone через timeutil). gate.py: шаг сразу после gate:muted (до topic): триггер уже определён на этом
+# шаге? НЕТ — обращение определяется на шаге 6. Поэтому: проверка присутствия делается в двух местах:
+#   - gate.py в ветке обращения (шаг 6): trigger != REPLY и over_cap → DROP "gate:presence_cap";
+#   - gate.py в ветке ambient (перед not_live/hot): over_cap → DROP "gate:presence_cap".
+#   Реплаи на бота проходят всегда (гейт не меняется для них). Реакции на gate:presence_cap не ставятся
+#   (REACT_REASONS не меняется).
+# responder: перепроверка в момент отправки — _recheck (pending, кроме REPLY): "send:recheck_presence";
+# _generate_and_send для ambient/spontaneous/morning/checkin ДО вызова модели: "send:presence_cap".
+# Метод db.bot_replies_today / messages_today считают по created_at >= day_start; life/say в bot_replies тоже считаются
+# (они — реплики бота), но сами потолком не блокируются.
+# /status: строка "presence: <bot_today>/<allowance> (people <human_today>)".
+
+# 2. Пауза между репликами и горячее окно только по кнопке
+# BehaviourConfig.min_gap_sec: int = Field(default=300, ge=0, le=3600)  # минимум между любыми двумя сообщениями бота
+# HotWindowConfig.open_on_any_reply: bool = False  # True — прежнее поведение (окно после любой реплики)
+# responder: last = db.last_bot_reply_at(); now - last < min_gap_sec →
+#   pending (обращение, _fire_pending до recheck): update_pending_due(last + min_gap_sec + randint(5, 30)) и новый таймер,
+#   лог INFO "min gap: pending delayed"; НЕ дропать (обращение не отбрасывается);
+#   ambient/spontaneous/checkin/morning (в _generate_and_send до модели): filter_log "send:min_gap", молчание;
+#   life/say — без ограничения (кнопка владельца).
+# _maybe_open_hot_window из общего хвоста зовётся только если cfg.behaviour.hot_window.open_on_any_reply;
+# из announce_life/say — всегда (вернуть вызов в announce_life).
+
+# 3. «Вернулся проверить» только в тишине и только на явное
+# CheckinConfig.quiet_min: int = Field(default=10, ge=0, le=180)  # если в чате писали позже — отложить
+# _maybe_checkin: после проверки due — last_human = db.last_message_at(chat_id); now - last_human < quiet_min*60 →
+#   return без переноса due (следующий poll попробует снова). Если followup-checker передан в Responder
+#   (новый необязательный kwarg followup: FollowupChecker | None = None) — после parse_reply с reply_to выбранная строка
+#   прогоняется через followup.check(text=row.text, display_name=row.display_name, context_rows=<checkin_rows без неё>,
+#   recent_replies=<последние 3>, now) — False → filter_log "send:checkin_not_addressed", молчание. reply_to=None при
+#   speak=true → тоже молчание "send:checkin_no_target" (общий ответ «всем» без адресата больше не отправляется).
+# SITUATION_CHECKIN_FOOTER ужесточается: «Ответь, только если написано явно тебе: обратились по имени, задали тебе
+# вопрос или ответили на твою реплику. Если сомневаешься — промолчи (speak: false). В чужие планы не встраивайся.»
+
+# 4. Shadow выключается для дедупа и стиля
+# FiltersConfig.enforce_stages: list[str] = ["dedup", "style"]  # стадии, которые режут даже при shadow: true
+# responder (блок if not verdict.ok): cut = (not shadow) or any(reason.split(":")[0] in enforce_stages for reason in
+# reasons); filter_log shadow=<not cut> для каждой причины; cut → молчание с reason = первая причина из enforce-стадий
+# (или reasons[0] при shadow=false). config.yaml: enforce_stages: [dedup, style].
+
+# 5. Реквизит и байки — filters.motifs + слот {avoid}
+# FiltersConfig.motifs: dict[str, list[str]] — метка → регулярки (IGNORECASE, границы слов), дефолт:
+#   жена: ["\bжен[аеуы]\b", "\bжено[йю]\b"]; теплица: ["\bтеплиц"]; гараж: ["\bгараж"];
+#   девяностые: ["\bдевяност", "\b9\d-?[мхе]\b"]; двухтысячные: ["\bдвухтысячн"]; сын: ["\bсын"];
+#   грибы: ["\bгриб"]; участок: ["\bучасток", "\bучастк"]; машина: ["\bмашин"]; зато: ["\bзато\b"]
+# FiltersConfig.motif_recent_window: int = Field(default=3, ge=0, le=20)  # мотив из последних N реплик → dedup:motif
+# FiltersConfig.motif_avoid_window: int = Field(default=10, ge=0, le=50)  # мотивы из последних N реплик → слот {avoid}
+# FiltersConfig.story_markers: list[str] — дефолт ["\bдевяност", "\bдвухтысячн", "\bв прошлом году", "\bлет назад",
+#   "\bпомню\b", "\bкогда-то\b", "\bодин раз\b", "\bкак-то раз\b"]
+# FiltersConfig.story_window: int = Field(default=5, ge=1, le=20); story_max: int = Field(default=1, ge=0, le=20)
+#   # если в последних story_window репликах баек (по маркерам) >= story_max → слот {avoid} требует ответ без байки,
+#   # а фильтр режет кандидата с маркером байки: "style:story_quota"
+# motifs.py — чистые функции:
+def motifs_in(text: str, motifs: Mapping[str, Sequence[Pattern[str]]]) -> list[str]     # метки по порядку конфига
+def used_motifs(recent_replies: Sequence[str], window: int, motifs) -> list[str]       # по хвосту recent_replies
+def story_count(recent_replies: Sequence[str], window: int, markers: Sequence[Pattern[str]]) -> int
+def render_avoid(used: Sequence[str], *, no_story: bool) -> str
+# "" если нечего. Иначе: «В последних репликах ты уже поминал: жену, теплицу, гараж. Сейчас без них: другая деталь
+# или вовсе без байки.» + при no_story: «Байку сейчас не рассказывай: короткий ответ по делу, одна фраза.»
+# Метки склоняются по словарю в модуле (жена→жену, теплица→теплицу, …; нет в словаре → как есть).
+# Patterns компилирует motifs и story_markers (Patterns.motifs, Patterns.story_markers).
+# prompt.py: слот {avoid} в _SLOT_RE, build_messages(avoid: str = ""); system.txt — {avoid} отдельным абзацем СРАЗУ
+# ПЕРЕД {situation}. responder: avoid = render_avoid(used_motifs(filter_recent_replies…, motif_avoid_window),
+# no_story=story_count(..., story_window) >= story_max) — из тех же recent_replies, что и для фильтра.
+# filters.layer_rules: "dedup:motif" — motifs_in(candidate) ∩ used_motifs(last motif_recent_window) непусто;
+# "style:story_quota" — кандидат содержит маркер байки и story_count(last story_window) >= story_max.
+# Записи стикеров «[стикер #N] …» в recent_replies пропускаются при подсчёте мотивов и баек.
+
+# 6. Не напрашиваться — текст, не код
+# prompts/system.txt, блок «КАК ТЫ ПИШЕШЬ»: строку «Вместо совета рассказываешь короткую историю из жизни» заменить на
+# «Байка не в каждом ответе, чаще короткая реплика по делу. Если рассказываешь историю, то одну на несколько ответов,
+# и каждый раз про другое: не тяни в каждый ответ жену, теплицу, гараж и девяностые.»; строку «Почти в каждой реплике
+# есть чему улыбнуться» → «Часто есть чему улыбнуться». Блок правил-запретов: добавить «- В чужие планы, поездки и
+# компании не встраиваешься и не напрашиваешься, даже если тема твоя. Своё делаешь один.»
+# SITUATION_LIFE_TEMPLATE: + «Не предлагай никому ехать или идти вместе.» CHARACTER.md раздел 3 и 8 — те же правки.
+# few_shot.yaml: из 17 примеров 6 с этим реквизитом — заменить 3 из них примерами коротких ответов по делу без байки
+# (тексты примеров — на усмотрение агента, в характере, без тире, без эмодзи).
+```
+
+Тесты: `tests/test_gate.py` (presence_cap в обеих ветках, REPLY проходит), `tests/test_gate_state.py`,
+`tests/test_db.py` (счётчики за сутки), `tests/test_responder.py` (recheck_presence, presence_cap до модели, min_gap
+переносит pending и режет ambient, life/say не ограничены, окно не открывается после обычного ответа при
+open_on_any_reply=false, checkin ждёт тишины, checkin_not_addressed, checkin_no_target, enforce_stages режет dedup при
+shadow=true, слот {avoid} в system), `tests/test_motifs.py`, `tests/test_filters.py` (dedup:motif, style:story_quota),
+`tests/test_prompt.py` (слот, тексты), `tests/test_commands.py` (/status presence). `tests/test_few_shot.py` — если
+проверяет число примеров, поправить. README: раздел «Как он решает, когда говорить» — потолок присутствия, пауза,
+тишина для checkin; «Голос» — реквизит и байки.
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»
