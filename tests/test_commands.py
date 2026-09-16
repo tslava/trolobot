@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -2105,3 +2106,156 @@ async def test_status_shows_chat_memory_total_and_last_period_end(
     await handler(message)
 
     assert "chat memory: 2, последний до 22.09.2026" in sent[0]
+
+
+# --- /changelog -------------------------------------------------------------
+
+
+_CHANGELOG_SAMPLE = """# Changelog
+
+## [Unreleased]
+
+### Для чата
+
+### Для владельца
+
+## [0.5.0] — 2026-09-16
+
+### Для чата
+
+- Фёдор стал говорить заметно реже.
+
+### Для владельца
+
+- Потолок присутствия `behaviour.presence` (#12).
+
+## [0.4.0] — 2026-09-15
+
+### Для чата
+
+- Фёдор видит фото.
+
+### Для владельца
+
+- `/life`, `/say` (#10).
+
+[Unreleased]: https://example.com/compare/v0.5.0...HEAD
+[0.5.0]: https://example.com/releases/tag/v0.5.0
+[0.4.0]: https://example.com/compare/v0.4.0...v0.5.0
+"""
+
+
+def _write_changelog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str = _CHANGELOG_SAMPLE
+) -> None:
+    path = tmp_path / "CHANGELOG.md"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("CHANGELOG_PATH", str(path))
+
+
+async def test_changelog_bare_returns_latest_for_chat(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], tmp_path: Path
+) -> None:
+    _write_changelog(monkeypatch, tmp_path)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/changelog")
+    await handler(message)
+
+    assert sent == ["v0.5.0 (2026-09-16)\n- Фёдор стал говорить заметно реже."]
+
+
+async def test_changelog_owner_returns_latest_for_owner(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], tmp_path: Path
+) -> None:
+    _write_changelog(monkeypatch, tmp_path)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/changelog owner"
+    )
+    await handler(message)
+
+    assert sent == ["v0.5.0 (2026-09-16)\n- Потолок присутствия `behaviour.presence` (#12)."]
+
+
+@pytest.mark.parametrize("version_arg", ["0.4.0", "v0.4.0"])
+async def test_changelog_specific_version_accepts_v_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    sent: list[str],
+    tmp_path: Path,
+    version_arg: str,
+) -> None:
+    _write_changelog(monkeypatch, tmp_path)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text=f"/changelog {version_arg}"
+    )
+    await handler(message)
+
+    assert sent == ["v0.4.0 (2026-09-15)\n- Фёдор видит фото."]
+
+
+async def test_changelog_unknown_version_replies_not_found(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], tmp_path: Path
+) -> None:
+    _write_changelog(monkeypatch, tmp_path)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/changelog 9.9.9"
+    )
+    await handler(message)
+
+    assert sent == ["Версии 9.9.9 нет."]
+
+
+async def test_changelog_missing_file_replies_not_found(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CHANGELOG_PATH", str(tmp_path / "does-not-exist.md"))
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/changelog")
+    await handler(message)
+
+    assert sent == ["CHANGELOG.md не найден или пуст."]
+
+
+async def test_changelog_ignored_in_chat(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], tmp_path: Path
+) -> None:
+    _write_changelog(monkeypatch, tmp_path)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_chat(), from_user=_user(ADMIN_ID), text="/changelog")
+    await handler(message)
+
+    assert sent == []
+
+
+async def test_status_starts_with_version(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert sent[0].startswith("trolobot v")

@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Protocol
 from aiogram import F, Router
 from aiogram.types import Message, User
 
+from trolobot import __version__
+from trolobot.changelog import Release, parse_changelog
 from trolobot.chat_memory import format_period
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
@@ -79,6 +81,7 @@ _HELP_TEXT = (
     "/life list | rm N | post N — события: список, удалить, повторить\n"
     "/say <текст> — сказать в чат дословно\n"
     "/memory [list|rm N|run] — долгая память чата: пересказы по неделям\n"
+    "/changelog [owner|<версия>] — что нового: блок для чата или для владельца\n"
     "/help — эта справка"
 )
 
@@ -483,6 +486,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     )
 
     lines = [
+        f"trolobot v{__version__}",
         f"Паника: {'да' if panic else 'нет'}",
         f"Стоп до: {stop_until}",
         f"Предохранитель LLM: {circuit_state}, ошибок подряд: {llm_error_streak}",
@@ -893,6 +897,39 @@ async def _cmd_say(
         await _reply(message, "Бот молчит (panic/stop) — /resume.")
 
 
+async def _cmd_changelog(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
+    """/changelog [owner|<версия>] — релиз-ноты из CHANGELOG.md (CLAUDE.md, "версии и changelog").
+
+    Файл маленький — читается заново при каждом вызове, а не кэшируется, чтобы не
+    заводить ещё один stores-подобный объект ради одной команды.
+    """
+    try:
+        text = deps.settings.changelog_path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+
+    releases = parse_changelog(text) if text else []
+    if not releases:
+        await _reply(message, "CHANGELOG.md не найден или пуст.")
+        return
+
+    owner_view = bool(args) and args[0].lower() == "owner"
+    found: Release | None
+    if owner_view or not args:
+        found = releases[0]
+    else:
+        raw = args[0].lower()
+        wanted = raw[1:] if raw.startswith("v") else raw
+        found = next((r for r in releases if r.version == wanted), None)
+        if found is None:
+            await _reply(message, f"Версии {args[0]} нет.")
+            return
+    release = found
+
+    body = release.for_owner if owner_view else release.for_chat
+    await _reply(message, f"v{release.version} ({release.date})\n{body}")
+
+
 def build_commands_router(deps: _CommandsDeps) -> Router:
     """Собирает Router с одним хендлером-диспетчером команд.
 
@@ -980,6 +1017,8 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_say(message, deps, now, admin_user_id, text, tokens)
                 elif cmd == "memory":
                     await _cmd_memory(message, deps, now, admin_user_id, args)
+                elif cmd == "changelog":
+                    await _cmd_changelog(message, deps, args)
                 elif cmd == "help":
                     await _reply(message, _HELP_TEXT)
                 else:

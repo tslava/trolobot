@@ -12,6 +12,7 @@
 
 ### Для владельца
 
+
 ## [0.5.0] — 2026-09-16
 
 ### Для чата
@@ -29,6 +30,7 @@
 - `filters.enforce_stages: [dedup, style]` — эти стадии режут даже при `shadow: true` (#12).
 - Реквизит и байки: `filters.motifs`, слот `{avoid}` в промпте, `dedup:motif`, `style:story_quota`; промпт v10, few-shot v6 (#12).
 - `/status`: истёкший стоп показывается как «нет» (#13).
+- `/changelog [owner|<версия>]` в личке, версия в `/status`, `CHANGELOG.md` и SemVer-теги (#14).
 
 ## [0.4.0] — 2026-09-15
 
