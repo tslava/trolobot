@@ -28,6 +28,7 @@ def test_settings_from_env_minimal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.few_shot_path == Path("few_shot.yaml")
     assert settings.prompt_path == Path("prompts/system.txt")
     assert settings.vision_prompt_path == Path("prompts/vision.txt")
+    assert settings.changelog_path == Path("CHANGELOG.md")
     assert settings.log_level == "INFO"
 
 
@@ -38,6 +39,7 @@ def test_settings_from_env_full(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-1")
     monkeypatch.setenv("GOOGLE_PLACES_KEY", "gp-1")
     monkeypatch.setenv("DB_PATH", "/tmp/custom.db")
+    monkeypatch.setenv("CHANGELOG_PATH", "/tmp/CHANGELOG.md")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
     settings = Settings()
@@ -48,6 +50,7 @@ def test_settings_from_env_full(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.openrouter_api_key.get_secret_value() == "sk-or-1"
     assert settings.google_places_key is not None
     assert settings.google_places_key.get_secret_value() == "gp-1"
+    assert settings.changelog_path == Path("/tmp/CHANGELOG.md")
     assert settings.db_path == Path("/tmp/custom.db")
     assert settings.log_level == "DEBUG"
 

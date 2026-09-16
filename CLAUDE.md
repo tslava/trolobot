@@ -1493,6 +1493,36 @@ shadow=true, слот {avoid} в system), `tests/test_motifs.py`, `tests/test_fi
 проверяет число примеров, поправить. README: раздел «Как он решает, когда говорить» — потолок присутствия, пауза,
 тишина для checkin; «Голос» — реквизит и байки.
 
+## Интерфейсы: версии и changelog
+
+Решение владельца: ребята в чате просят release notes. Версия — SemVer с мажором 0 (минор за фичу, патч за
+правку поведения и багфиксы), единственный источник — `pyproject.toml`; `trolobot.__version__` читается через
+`importlib.metadata.version("trolobot")` (fallback "0.0.0" при отсутствии метаданных). Тег `vX.Y.Z` ставится
+на squash-коммит релиза в main. `CHANGELOG.md` — Keep a Changelog, у каждой версии два блока: `### Для чата`
+(3–5 строк по-русски без технических слов — их владелец публикует сам) и `### Для владельца` (конфиг, команды,
+промпт, ссылки на PR). Бот релиз-ноты в чат НЕ постит — это ломает персонажа.
+
+```python
+# changelog.py — чистые функции
+@dataclass(frozen=True) class Release: version: str; date: str; for_chat: str; for_owner: str   # тексты блоков без заголовков, strip
+def parse_changelog(text: str) -> list[Release]     # версии по порядку файла (новые первыми), Unreleased пропускается
+def latest_release(text: str) -> Release | None
+# settings.py: changelog_path: Path = Path("CHANGELOG.md"); Dockerfile копирует CHANGELOG.md рядом с config.yaml.
+# commands.py, личка владельца:
+#   /changelog          → «v<version> (<date>)\n<for_chat>» — блок для чата, готовый к копированию; нет файла/версий →
+#                         «CHANGELOG.md не найден или пуст.»
+#   /changelog owner    → «v<version> (<date>)\n<for_owner>» (обрезка 3500)
+#   /changelog <ver>    → то же для указанной версии («0.4.0» или «v0.4.0»); нет → «Версии <ver> нет.»
+#   /status: первая строка «trolobot v<__version__>».
+#   _HELP_TEXT: «/changelog [owner|<версия>] — что нового: блок для чата или для владельца».
+```
+
+Правила процесса (для агентов и владельца):
+- Каждый PR, меняющий поведение бота, дописывает раздел `## [Unreleased]` в CHANGELOG.md — оба блока.
+- Релиз: поднять `version` в `pyproject.toml`, `uv lock`, перенести Unreleased в `## [X.Y.Z] — YYYY-MM-DD`, обновить ссылки
+  внизу, смержить, затем `git tag vX.Y.Z <squash-commit> && git push origin vX.Y.Z`.
+- Docker-образ по-прежнему тегируется `sha-…`, версия к деплою не привязана.
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»
