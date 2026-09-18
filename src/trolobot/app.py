@@ -21,6 +21,7 @@ from trolobot.db import Database
 from trolobot.followup import FollowupChecker
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
+from trolobot.reactions import ReactionChooser, ReactionScheduler
 from trolobot.responder import Responder
 from trolobot.retention import retention_loop
 from trolobot.settings import Settings
@@ -53,6 +54,7 @@ async def main() -> None:
     memory_task: asyncio.Task[None] | None = None
     llm: LLMClient | None = None
     responder: Responder | None = None
+    reaction_scheduler: ReactionScheduler | None = None
     try:
         config_store = ConfigStore(settings.config_path, db)
         await config_store.load()
@@ -98,6 +100,7 @@ async def main() -> None:
         dispatcher.include_router(build_router(deps))
 
         api_key = settings.openrouter_api_key
+        reaction_chooser: ReactionChooser | None = None
         if api_key is None:
             logger.warning("LLM отключён, ответы не генерируются: openrouter_api_key не задан")
         else:
@@ -140,6 +143,12 @@ async def main() -> None:
             # модель проверяются на каждом снимке, а не один раз при старте.
             vision_prompt = settings.vision_prompt_path.read_text(encoding="utf-8")
             deps.vision = VisionDescriber(llm, config_store.get, vision_prompt)
+
+            # Выбор реакции моделью (CLAUDE.md, "реакции с задержкой и смыслом") —
+            # как followup и зрение, создаётся при наличии ключа; модель и
+            # semantic проверяются на каждом вызове, а не один раз при старте.
+            reaction_prompt = settings.reaction_prompt_path.read_text(encoding="utf-8")
+            reaction_chooser = ReactionChooser(llm, config_store.get, reaction_prompt)
 
             # Каталог стикеров — офлайн-файл (CLAUDE.md, "Интерфейсы: стикеры"),
             # правится stickers_fill.py и владельцем руками. Пустой/отсутствующий
@@ -185,6 +194,20 @@ async def main() -> None:
             )
             deps.responder = responder
 
+        # Планировщик реакций нужен всегда: пауза перед реакцией не зависит от LLM.
+        # Без чузера (ключ не задан) он бросает кубик, как до семантических реакций —
+        # предупреждаем один раз на старте, чтобы semantic: true не выглядел рабочим.
+        if reaction_chooser is None and cfg.behaviour.reactions.semantic:
+            logger.warning("реакции выбираются кубиком: openrouter_api_key не задан")
+        reaction_scheduler = ReactionScheduler(
+            bot=bot,
+            db=db,
+            cfg_getter=config_store.get,
+            chooser=reaction_chooser,
+            rng=rng,
+        )
+        deps.reaction_scheduler = reaction_scheduler
+
         retention_task = asyncio.create_task(retention_loop(db, config_store.get))
         if responder is not None:
             await responder.restore_pending()
@@ -210,6 +233,8 @@ async def main() -> None:
                     await task
         if responder is not None:
             await responder.shutdown()
+        if reaction_scheduler is not None:
+            await reaction_scheduler.shutdown()
         if llm is not None:
             await llm.aclose()
         if bot is not None:

@@ -29,6 +29,7 @@ from trolobot.patterns import Patterns
 from trolobot.reactions import (
     REACT_REASONS,
     ReactionBotLike,
+    ReactionScheduler,
     load_reaction_state,
     pick_reaction,
     react,
@@ -113,6 +114,10 @@ class Deps:
     # Описание фото моделью со зрением (CLAUDE.md, "зрение на фото"). None — LLM не
     # настроен, фото остаётся плейсхолдером "[фото]", как до этой фичи.
     vision: VisionDescriber | None = None
+    # Отложенная реакция (CLAUDE.md, "реакции с задержкой и смыслом"): пауза перед
+    # реакцией и выбор эмодзи моделью. None — прежнее поведение: реакция ставится
+    # прямо в хендлере, сразу и тем эмодзи, что выбрал pick_reaction.
+    reaction_scheduler: ReactionScheduler | None = None
     # Сколько enabled-стикеров в каталоге (stickers.yaml) — считается один раз в
     # app.py при старте, только для /status ("(N в каталоге)"). Каталог не меняется
     # на горячую (в отличие от config_overrides), поэтому фиксированное число, а не
@@ -460,16 +465,28 @@ def build_router(deps: Deps) -> Router:
                         now=now,
                     )
                     if emoji is not None:
-                        await react(
-                            deps.bot,
-                            deps.db,
-                            chat_id=gate_message.chat_id,
-                            tg_message_id=gate_message.tg_message_id,
-                            user_id=user_id,
-                            emoji=emoji,
-                            tz=tz,
-                            now=now,
-                        )
+                        if deps.reaction_scheduler is not None:
+                            # Реакция уходит в фон: пауза "прочитал и хмыкнул", после
+                            # неё — перепроверка условий и выбор эмодзи моделью.
+                            # Хендлер при этом не ждёт (иначе чат стоял бы минуту).
+                            deps.reaction_scheduler.schedule(
+                                chat_id=gate_message.chat_id,
+                                tg_message_id=gate_message.tg_message_id,
+                                user_id=user_id,
+                                text=text,
+                                display_name=display_name,
+                            )
+                        else:
+                            await react(
+                                deps.bot,
+                                deps.db,
+                                chat_id=gate_message.chat_id,
+                                tg_message_id=gate_message.tg_message_id,
+                                user_id=user_id,
+                                emoji=emoji,
+                                tz=tz,
+                                now=now,
+                            )
             elif decision.verdict is Verdict.QUEUE_NIGHT:
                 await deps.db.enqueue_night(
                     tg_message_id=gate_message.tg_message_id,

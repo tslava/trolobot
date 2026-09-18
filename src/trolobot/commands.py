@@ -432,6 +432,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     llm_calls = int(await deps.db.get_state(day_key("llm_calls", now, tz)) or "0")
     llm_spent = float(await deps.db.get_state(day_key("llm_spent_usd", now, tz)) or "0")
     reactions = int(await deps.db.get_state(day_key("reaction_count", now, tz)) or "0")
+    reaction_calls = int(await deps.db.get_state(day_key("reaction_calls", now, tz)) or "0")
     stickers = int(await deps.db.get_state(day_key("sticker_count", now, tz)) or "0")
     followup_calls = int(await deps.db.get_state(day_key("followup_calls", now, tz)) or "0")
     vision_count = int(await deps.db.get_state(day_key("vision_count", now, tz)) or "0")
@@ -496,7 +497,8 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"Shadow: {'да' if cfg.filters.shadow else 'нет'}",
         f"Сегодня: ambient={ambient}, mention={mention}, "
         f"llm_calls={llm_calls}, llm_spent=${llm_spent:.2f}, "
-        f"reactions={reactions}/{cfg.behaviour.reactions.daily_cap}, "
+        f"reactions={reactions}/{cfg.behaviour.reactions.daily_cap}"
+        f", semantic calls {reaction_calls}/{cfg.behaviour.reactions.semantic_daily_cap}, "
         f"stickers={stickers}/{cfg.behaviour.stickers.daily_cap} "
         f"({deps.sticker_catalog_enabled} в каталоге)",
         f"Pending: {pending}",

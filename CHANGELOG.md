@@ -10,10 +10,16 @@
 
 ### Для чата
 
+- Фёдор больше не лайкает мгновенно: сначала вычитывает сообщение, а через минуту-другую ставит реакцию, и только если она к месту. Добавилось 😂 для по-настоящему смешного.
+- После своих новостей он «держит телефон в руках» десять минут, а не полчаса.
+
 ### Для владельца
 
-- Дешёвый предфильтр перед «вернулся проверить»: `behaviour.checkin.prefilter`/`prefilter_max_tokens`, `FollowupChecker.check_batch`, промпт `prompts/checkin_prefilter.txt`; `send:checkin_prefilter_no`/`send:checkin_prefilter_yes` в `/why`. Экономит вызовы основной модели, когда после её последней реплики никто не написал ничего адресованного.
-
+- Реакции с задержкой и смыслом: `behaviour.reactions.delay_sec` (20–120 с), `semantic: true` (выбор эмодзи дешёвой моделью вместо кубика), `model` (пусто → `llm.judge_model`), `max_tokens`, `semantic_daily_cap` (40, счётчик `reaction_calls`), `context_messages` (6); дефолт `emoji` — `["👍", "💩", "😂"]` (#16).
+- `probability` работает только при `semantic: false` (прежнее поведение); промпт `prompts/reaction.txt`, путь — `REACTION_PROMPT_PATH` (#16).
+- `filter_log` пополнился `react:recheck` (условия разошлись за время паузы) и `react:declined` (модель сказала «не нужно»); `/status` показывает `semantic calls <N>/<cap>` (#16).
+- `behaviour.hot_window.minutes` по умолчанию 10 (было 30) (#15).
+- Дешёвый предфильтр перед «вернулся проверить»: `behaviour.checkin.prefilter`/`prefilter_max_tokens`, `FollowupChecker.check_batch`, промпт `prompts/checkin_prefilter.txt`; `send:checkin_prefilter_no`/`send:checkin_prefilter_yes` в `/why`. Экономит вызовы основной модели, когда после последней реплики никто не написал ничего адресованного (#17).
 
 ## [0.5.0] — 2026-09-16
 
