@@ -458,7 +458,7 @@ def _make_responder(
         llm=llm,
         judge=judge,
         sticker_chooser=sticker_chooser,  # type: ignore[arg-type]
-        followup=followup,  # type: ignore[arg-type]  # FakeFollowup повторяет только .check
+        followup=followup,  # type: ignore[arg-type]  # FakeFollowup: узкий протокол check/check_batch
         patterns_getter=lambda: patterns,
         prompt_store=prompt_store if prompt_store is not None else FakePromptStore(),
         rng=rng if rng is not None else random.Random(seed),  # type: ignore[arg-type]
@@ -471,12 +471,20 @@ def _make_responder(
 
 class FakeFollowup:
     """Подделка ``FollowupChecker`` для checkin (CLAUDE.md, "меньше и разнообразнее",
-    мера 3): только ``check``, без LLM. Пишет аргументы вызовов — тестам нужно
-    убедиться, что проверяется именно выбранная строка, а не весь список."""
+    мера 3, и "дешёвый предфильтр для «вернулся проверить»"): ``check`` и
+    ``check_batch``, без LLM. Пишет аргументы вызовов — тестам нужно убедиться, что
+    проверяется именно выбранная строка (``check``), а не весь список.
 
-    def __init__(self, addressed: bool) -> None:
+    ``check_batch`` по умолчанию пропускает всю пачку (возвращает все номера) —
+    большинство тестов ``_maybe_checkin`` проверяют ЛОГИКУ ПОСЛЕ предфильтра
+    (выбор строки основной моделью, повторная проверка ``check``), а не сам
+    предфильтр, и не должны из-за него терять вызов основной модели."""
+
+    def __init__(self, addressed: bool, batch_addressed: list[int] | None = None) -> None:
         self.addressed = addressed
+        self.batch_addressed = batch_addressed
         self.calls: list[dict[str, object]] = []
+        self.batch_calls: list[dict[str, object]] = []
 
     async def check(
         self,
@@ -497,6 +505,20 @@ class FakeFollowup:
             }
         )
         return self.addressed
+
+    async def check_batch(
+        self,
+        *,
+        rows: Sequence[MessageRow],
+        recent_replies: Sequence[str],
+        now: int,
+    ) -> list[int]:
+        self.batch_calls.append(
+            {"rows": list(rows), "recent_replies": list(recent_replies), "now": now}
+        )
+        if self.batch_addressed is not None:
+            return self.batch_addressed
+        return list(range(1, len(rows) + 1))
 
 
 async def _noop_open_hot_window(_cfg: Config, _now: int) -> None:
@@ -4407,6 +4429,102 @@ async def test_maybe_checkin_followup_confirms_selected_message(db: Database) ->
         assert bot.sent[0][2] == 702
         summary = dict(await db.filter_log_summary(0))
         assert summary.get("send:checkin") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- 39b. Дешёвый предфильтр перед checkin (CLAUDE.md, "Интерфейсы: дешёвый ---
+# --- предфильтр для «вернулся проверить»") -------------------------------- #
+
+
+async def test_maybe_checkin_prefilter_empty_skips_main_model(db: Database) -> None:
+    """Предфильтр не увидел ничего для Фёдора — основная модель не вызывается
+    вовсе, checkin_last_at/checkin_due переставляются как обычно (как при
+    llm:silent), filter_log send:checkin_prefilter_no."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    followup = FakeFollowup(addressed=True, batch_addressed=[])
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom(), followup=followup)
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _prepare_checkin(db, last_reply_at=last_reply_at, human_created_at=last_reply_at + 10)
+
+        await responder._maybe_checkin()
+
+        assert calls == []
+        assert bot.sent == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:checkin_prefilter_no") == 1
+        assert "send:checkin_prefilter_yes" not in summary
+        after_min_lo = cfg.behaviour.checkin.after_min[0]
+        assert await db.get_state("checkin_last_at") == str(DAY_NOW)
+        assert await db.get_state("checkin_due") == str(DAY_NOW + after_min_lo * 60)
+        assert len(followup.batch_calls) == 1
+        rows_seen = followup.batch_calls[0]["rows"]
+        assert isinstance(rows_seen, list)
+        assert len(rows_seen) == 2
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_prefilter_nonempty_calls_main_model_with_full_rows(
+    db: Database,
+) -> None:
+    """Предфильтр отметил только одно сообщение — основной модели всё равно
+    уходят ВСЕ строки checkin_rows (контекст важен), filter_log
+    send:checkin_prefilter_yes."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _checkin_response("Бывает.", 2))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    followup = FakeFollowup(addressed=True, batch_addressed=[2])
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom(), followup=followup)
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _prepare_checkin(db, last_reply_at=last_reply_at, human_created_at=last_reply_at + 10)
+
+        await _drive(clock, responder._maybe_checkin())
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:checkin_prefilter_yes") == 1
+        assert summary.get("send:checkin") == 1
+        assert len(followup.batch_calls) == 1
+        rows_seen = followup.batch_calls[0]["rows"]
+        assert isinstance(rows_seen, list)
+        assert len(rows_seen) == 2
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_checkin_prefilter_disabled_skips_cheap_call(db: Database) -> None:
+    """behaviour.checkin.prefilter=false — как раньше, дешёвая проверка пачки не
+    вызывается вовсе, основная модель зовётся напрямую."""
+    cfg = _config()
+    cfg.behaviour.checkin.prefilter = False
+    llm, calls = _make_llm(cfg, db, lambda _req: _checkin_response("Бывает.", 2))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    followup = FakeFollowup(addressed=True)
+    responder = _make_responder(db, cfg, llm, bot, clock, rng=MinRandom(), followup=followup)
+    try:
+        last_reply_at = DAY_NOW - 20000
+        await _prepare_checkin(db, last_reply_at=last_reply_at, human_created_at=last_reply_at + 10)
+
+        await _drive(clock, responder._maybe_checkin())
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+        assert followup.batch_calls == []
+        summary = dict(await db.filter_log_summary(0))
+        assert "send:checkin_prefilter_yes" not in summary
+        assert "send:checkin_prefilter_no" not in summary
     finally:
         await responder.shutdown()
         await llm.aclose()

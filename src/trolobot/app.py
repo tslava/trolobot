@@ -127,7 +127,15 @@ async def main() -> None:
             # компонентами, как только есть ключ; enabled/model проверяются на
             # каждом вызове, а не один раз при старте.
             followup_prompt = settings.followup_prompt_path.read_text(encoding="utf-8")
-            followup_checker = FollowupChecker(llm, config_store.get, followup_prompt)
+            # Дешёвый предфильтр "вернулся проверить" (CLAUDE.md, "Интерфейсы:
+            # дешёвый предфильтр для «вернулся проверить»") — тот же чекер, второй
+            # промпт: пачка сообщений вместо одного, перед основной моделью.
+            checkin_prefilter_prompt = settings.checkin_prefilter_prompt_path.read_text(
+                encoding="utf-8"
+            )
+            followup_checker = FollowupChecker(
+                llm, config_store.get, followup_prompt, checkin_prefilter_prompt
+            )
             deps.followup = followup_checker
 
             # Зрение на фото (CLAUDE.md, "зрение на фото") — как и followup,

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from trolobot.config_models import Config
 from trolobot.db import MessageRow
 from trolobot.llm import LLMClient, LLMError
-from trolobot.prompt import render_context
+from trolobot.prompt import render_context, render_numbered_messages
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ _COUNTER_KEY = "followup_calls"
 
 _CONTEXT_EMPTY = "(пока не было)"
 _RECENT_REPLIES_EMPTY = "(пока не было)"
+_MESSAGES_EMPTY = "(пока не было)"
 
 # Дублирует вырезание разделителей из sanitize.normalize_text/prompt.py/judge.py —
 # на всякий случай ещё раз чистим то, что уходит в промпт проверки.
@@ -45,6 +46,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(r"\{(context|recent_replies|name|text)\}")
+_BATCH_SLOT_RE = re.compile(r"\{(messages|recent_replies)\}")
 
 
 def _strip_fake_delimiters(text: str) -> str:
@@ -94,16 +96,46 @@ def _parse_verdict(raw: str) -> _FollowupVerdict | None:
         return None
 
 
+def _parse_batch_verdict(raw: str) -> list[int] | None:
+    """Разбирает ответ дешёвого предфильтра ``{"addressed": [номера]}`` тем же
+    приёмом, что ``_parse_verdict``/``judge._parse_verdict``: срез ```json```
+    обёрток, поиск первой "{" и терпимый ``raw_decode``. Любой сбой или не-список
+    в ``addressed`` -> None ("не смогли проверить" — вызывающий вернёт все номера).
+    Элементы списка, не являющиеся целым числом (``bool`` — тоже не число, это
+    типичная JSON-подделка ``true``/``false`` вместо номера), просто отбрасываются,
+    а не роняют разбор целиком — диапазон всё равно проверяет вызывающий."""
+    try:
+        candidate = _strip_code_fence(raw.strip())
+        start = candidate.find("{")
+        if start == -1:
+            return None
+        data, _end = json.JSONDecoder().raw_decode(candidate, start)
+        if not isinstance(data, dict):
+            return None
+
+        addressed = data.get("addressed")
+        if not isinstance(addressed, list):
+            return None
+
+        return [item for item in addressed if isinstance(item, int) and not isinstance(item, bool)]
+    except Exception:
+        # Ответ модели — недоверенный внешний текст: любой сбой разбора означает
+        # "не смогли проверить", а не падение.
+        return None
+
+
 class FollowupChecker:
     def __init__(
         self,
         llm: LLMClient,
         cfg_getter: Callable[[], Config],
         prompt_template: str,
+        batch_prompt_template: str = "",
     ) -> None:
         self._llm = llm
         self._cfg_getter = cfg_getter
         self._prompt_template = prompt_template
+        self._batch_prompt_template = batch_prompt_template
 
     async def check(
         self,
@@ -152,3 +184,65 @@ class FollowupChecker:
 
         logger.info("followup verdict: addressed=%s reason=%s", verdict.addressed, verdict.reason)
         return verdict.addressed
+
+    async def check_batch(
+        self,
+        *,
+        rows: Sequence[MessageRow],
+        recent_replies: Sequence[str],
+        now: int,
+    ) -> list[int]:
+        """Дешёвый предфильтр «вернулся проверить» (CLAUDE.md, "Интерфейсы: дешёвый
+        предфильтр для «вернулся проверить»") — один вызов дешёвой модели по всей
+        пачке ``rows``, накопившейся с последней реплики Фёдора, вместо основной
+        модели на каждую проверку ``responder._maybe_checkin``.
+
+        Возвращает 1-based номера сообщений из ``rows``, адресованных Фёдору или
+        прямо продолжающих его тему. Пустой список означает «основной модели
+        звать незачем — там ничего для Фёдора». Когда проверить нечем (нет
+        модели, не задан ``batch_prompt_template``, ``LLMError``, невалидный
+        JSON) — решать дешевле нельзя, поэтому возвращаются ВСЕ номера: пусть
+        решает основная модель, дороже, но с шансом ответить.
+        """
+        if not rows:
+            return []
+
+        all_numbers = list(range(1, len(rows) + 1))
+        cfg = self._cfg_getter()
+        followup_cfg = cfg.behaviour.followup
+        model = followup_cfg.model or cfg.llm.judge_model
+        if not model or not self._batch_prompt_template:
+            logger.warning("checkin prefilter: no model or prompt template, not filtering")
+            return all_numbers
+
+        messages_block = _strip_fake_delimiters(render_numbered_messages(rows)).strip()
+        recent = _strip_fake_delimiters("\n".join(recent_replies)).strip()
+
+        slot_values = {
+            "messages": messages_block or _MESSAGES_EMPTY,
+            "recent_replies": recent or _RECENT_REPLIES_EMPTY,
+        }
+        system = _BATCH_SLOT_RE.sub(lambda m: slot_values[m.group(1)], self._batch_prompt_template)
+        messages = [{"role": "system", "content": system}]
+
+        try:
+            result = await self._llm.call(
+                messages,
+                model=model,
+                max_tokens=cfg.behaviour.checkin.prefilter_max_tokens,
+                now=now,
+                counter_key=_COUNTER_KEY,
+                calls_cap=followup_cfg.daily_cap,
+            )
+        except LLMError as exc:
+            logger.warning("checkin prefilter llm error: reason=%s", exc.reason)
+            return all_numbers
+
+        numbers = _parse_batch_verdict(result.text)
+        if numbers is None:
+            logger.warning("checkin prefilter: invalid verdict, not filtering")
+            return all_numbers
+
+        filtered = [number for number in numbers if 1 <= number <= len(rows)]
+        logger.info("checkin prefilter verdict: addressed=%s", filtered)
+        return filtered

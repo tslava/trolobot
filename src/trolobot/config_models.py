@@ -314,6 +314,12 @@ class CheckinConfig(BaseModel):
         le=180,
         description="Минут тишины в чате перед проверкой «вернулся»; писали позже — отложить",
     )
+    prefilter: bool = Field(
+        default=True, description="Дешёвая проверка пачки сообщений перед основной моделью"
+    )
+    prefilter_max_tokens: int = Field(
+        default=60, ge=10, le=300, description="Лимит токенов ответа дешёвого предфильтра"
+    )
 
     @field_validator("after_min")
     @classmethod

@@ -19,6 +19,7 @@
 - `probability` работает только при `semantic: false` (прежнее поведение); промпт `prompts/reaction.txt`, путь — `REACTION_PROMPT_PATH` (#16).
 - `filter_log` пополнился `react:recheck` (условия разошлись за время паузы) и `react:declined` (модель сказала «не нужно»); `/status` показывает `semantic calls <N>/<cap>` (#16).
 - `behaviour.hot_window.minutes` по умолчанию 10 (было 30) (#15).
+- Дешёвый предфильтр перед «вернулся проверить»: `behaviour.checkin.prefilter`/`prefilter_max_tokens`, `FollowupChecker.check_batch`, промпт `prompts/checkin_prefilter.txt`; `send:checkin_prefilter_no`/`send:checkin_prefilter_yes` в `/why`. Экономит вызовы основной модели, когда после последней реплики никто не написал ничего адресованного (#17).
 
 ## [0.5.0] — 2026-09-16
 
