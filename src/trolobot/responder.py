@@ -1753,8 +1753,13 @@ class Responder:
         удаляется, следующий заход начнёт "с нуля") -> ``checkin_due`` посчитан от
         актуального ``hot_until`` (изменился — новая реплика бота переоткрыла окно —
         пересчитать) и уже наступил -> есть человеческие сообщения после
-        ``max(last_reply_at, checkin_last_at)`` -> ``_respond`` с ``situation_checkin``.
-        Независимо от того, нашлись ли сообщения, следующий ``checkin_due`` всегда
+        ``max(last_reply_at, checkin_last_at)`` -> дешёвый предфильтр
+        (``behaviour.checkin.prefilter``, CLAUDE.md, "Интерфейсы: дешёвый предфильтр
+        для «вернулся проверить»") смотрит на всю пачку разом и решает, звать ли
+        основную модель вообще — «нет» пишет ``send:checkin_prefilter_no`` и выходит
+        без вызова, «да» (или предфильтр выключен/``followup`` не задан) —
+        ``_respond`` с ``situation_checkin``. Независимо от того, нашлись ли
+        сообщения и прошли ли предфильтр, следующий ``checkin_due`` всегда
         переставляется на ``now + randint(after_min)*60`` — цикл продолжается, пока
         тема не умрёт."""
         cfg = self.cfg_getter()
@@ -1828,14 +1833,48 @@ class Responder:
 
         rows = await self.db.messages_since(self.chat_id, since, checkin_cfg.max_messages)
         if rows:
-            await self._respond(
-                trigger=_CHECKIN_TRIGGER,
-                trigger_msg_id=None,
-                user_id=None,
-                situation=situation_checkin(rows),
-                delay_sec=0,
-                checkin_rows=rows,
-            )
+            call_main_model = True
+            if checkin_cfg.prefilter and self.followup is not None:
+                # Дешёвый предфильтр (CLAUDE.md, "Интерфейсы: дешёвый предфильтр для
+                # «вернулся проверить»") — 17.09 семь проверок из семи закончились
+                # llm:silent, ~20 центов в день за тишину. Дешёвая модель смотрит на
+                # всю пачку сразу и решает, звать ли основную вообще.
+                recent_replies = await self.db.recent_bot_replies(_CHECKIN_FOLLOWUP_RECENT_REPLIES)
+                addressed = await self.followup.check_batch(
+                    rows=rows, recent_replies=recent_replies, now=now
+                )
+                if addressed:
+                    await self.db.insert_filter_log(
+                        trigger_tg_message_id=None,
+                        candidate_text=None,
+                        verdict="pass",
+                        stage="send",
+                        reason="send:checkin_prefilter_yes",
+                        shadow=False,
+                        created_at=now,
+                    )
+                else:
+                    call_main_model = False
+                    await self.db.insert_filter_log(
+                        trigger_tg_message_id=None,
+                        candidate_text=None,
+                        verdict="cut",
+                        stage="send",
+                        reason="send:checkin_prefilter_no",
+                        shadow=False,
+                        created_at=now,
+                    )
+                    logger.info("checkin prefilter: nothing for Fyodor, main model not called")
+
+            if call_main_model:
+                await self._respond(
+                    trigger=_CHECKIN_TRIGGER,
+                    trigger_msg_id=None,
+                    user_id=None,
+                    situation=situation_checkin(rows),
+                    delay_sec=0,
+                    checkin_rows=rows,
+                )
 
         # Следующая проверка — всегда через after_min от "сейчас" (не от due_ref):
         # решение "ответил -> окно снова открыто, промолчал -> следующая проверка

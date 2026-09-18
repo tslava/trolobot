@@ -218,25 +218,37 @@ def situation_followup(items: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def render_numbered_messages(rows: Sequence[MessageRow]) -> str:
+    """ "1. Имя: текст" по строке, нумерация с 1, имя и текст чистятся от
+    поддельных разделителей и обрезаются тем же лимитом, что и
+    ``situation_addressed`` (``_ADDRESSED_TEXT_MAX_LEN`` символов).
+
+    Общий хелпер для ``situation_checkin`` и дешёвого предфильтра "вернулся
+    проверить" (``followup.FollowupChecker.check_batch``, CLAUDE.md,
+    "Интерфейсы: дешёвый предфильтр для «вернулся проверить»") — оба показывают
+    модели одну и ту же пронумерованную пачку сообщений, форматирование не
+    дублируется. Пустой ``rows`` -> пустая строка.
+    """
+    lines = []
+    for index, row in enumerate(rows, start=1):
+        name = _strip_fake_delimiters(row.display_name or "").strip()
+        text = _clean_addressed_text(row.text or "")
+        lines.append(f"{index}. {name}: {text}")
+    return "\n".join(lines)
+
+
 def situation_checkin(rows: Sequence[MessageRow]) -> str:
     """Ситуация для триггера ``checkin`` (CLAUDE.md, "внимание как у живого
     человека: вернулся проверить") — пронумерованный список сообщений,
     накопившихся после последней реплики персонажа, плюс инструкция ответить
     одной фразой на выбранное (номер уходит в поле ``reply_to`` JSON-ответа)
-    либо промолчать. Строки нумеруются с 1, имя и текст чистятся от поддельных
-    разделителей и обрезаются тем же лимитом, что и ``situation_addressed``
-    (``_ADDRESSED_TEXT_MAX_LEN`` символов). Пустой ``rows`` -> пустая строка —
-    вызывающий (responder.py) не должен звать генерацию без сообщений вовсе,
-    но на всякий случай это тоже "ничего не отвечать".
+    либо промолчать. Пустой ``rows`` -> пустая строка — вызывающий
+    (responder.py) не должен звать генерацию без сообщений вовсе, но на всякий
+    случай это тоже "ничего не отвечать".
     """
     if not rows:
         return ""
-    lines = [SITUATION_CHECKIN_HEADER]
-    for index, row in enumerate(rows, start=1):
-        name = _strip_fake_delimiters(row.display_name or "").strip()
-        text = _clean_addressed_text(row.text or "")
-        lines.append(f"{index}. {name}: {text}")
-    lines.append(SITUATION_CHECKIN_FOOTER)
+    lines = [SITUATION_CHECKIN_HEADER, render_numbered_messages(rows), SITUATION_CHECKIN_FOOTER]
     return "\n".join(lines)
 
 

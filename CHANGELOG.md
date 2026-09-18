@@ -12,6 +12,8 @@
 
 ### Для владельца
 
+- Дешёвый предфильтр перед «вернулся проверить»: `behaviour.checkin.prefilter`/`prefilter_max_tokens`, `FollowupChecker.check_batch`, промпт `prompts/checkin_prefilter.txt`; `send:checkin_prefilter_no`/`send:checkin_prefilter_yes` в `/why`. Экономит вызовы основной модели, когда после её последней реплики никто не написал ничего адресованного.
+
 
 ## [0.5.0] — 2026-09-16
 
