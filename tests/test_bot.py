@@ -99,6 +99,7 @@ def _deps(
     responder: object | None = None,
     followup: object | None = None,
     vision: object | None = None,
+    reaction_scheduler: object | None = None,
 ) -> Deps:
     reserved = {cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers}
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, bot_username)
@@ -124,6 +125,7 @@ def _deps(
         responder=responder,  # type: ignore[arg-type]
         followup=followup,  # type: ignore[arg-type]
         vision=vision,  # type: ignore[arg-type]
+        reaction_scheduler=reaction_scheduler,  # type: ignore[arg-type]
     )
 
 
@@ -694,8 +696,15 @@ def _config_dice_drop(*, reaction_probability: float) -> Config:
     behaviour = cfg.behaviour.model_copy(
         update={
             "ambient_probability": 0.0,
+            # semantic=False: проверяется именно кубик, иначе pick_reaction его
+            # пропускает и probability ни на что не влияет.
             "reactions": cfg.behaviour.reactions.model_copy(
-                update={"probability": reaction_probability, "cooldown_min": 0, "daily_cap": 100}
+                update={
+                    "probability": reaction_probability,
+                    "cooldown_min": 0,
+                    "daily_cap": 100,
+                    "semantic": False,
+                }
             ),
         }
     )
@@ -754,6 +763,65 @@ async def test_gate_dice_drop_with_probability_zero_does_not_react(
     summary = dict(await db.filter_log_summary(0))
     assert summary.get("gate:dice") == 1
     assert bot.calls == []
+
+
+class _FakeReactionScheduler:
+    """Подделка ReactionScheduler: только запоминает, что ей отдали сообщение."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def schedule(
+        self, *, chat_id: int, tg_message_id: int, user_id: int, text: str, display_name: str
+    ) -> None:
+        self.calls.append(
+            {
+                "chat_id": chat_id,
+                "tg_message_id": tg_message_id,
+                "user_id": user_id,
+                "text": text,
+                "display_name": display_name,
+            }
+        )
+
+
+async def test_gate_dice_drop_schedules_delayed_reaction(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """С планировщиком хендлер ничего не ставит сам: реакция уходит в фон, где будет
+    пауза и выбор эмодзи моделью (CLAUDE.md, "реакции с задержкой и смыслом")."""
+    cfg = _config_dice_drop(reaction_probability=1.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    bot = _FakeReactionBot()
+    scheduler = _FakeReactionScheduler()
+    deps = _deps(db, cfg, settings=settings, bot=bot, reaction_scheduler=scheduler)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await _send_live_talk(handler)
+
+    assert bot.calls == []  # немедленной реакции больше нет
+    assert len(scheduler.calls) == 1
+    call = scheduler.calls[0]
+    assert call["chat_id"] == OWN_CHAT_ID
+    assert call["tg_message_id"] == 302
+    assert call["text"] == "погода класс"
+    assert call["display_name"] == "Дима"
+    assert dict(await db.filter_log_summary(0)).get("react:sent") is None
+
+
+async def test_gate_dice_drop_does_not_schedule_when_pick_reaction_says_no(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Предфильтр остаётся предфильтром: кубик не выпал — задачу не заводим."""
+    cfg = _config_dice_drop(reaction_probability=0.0)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    scheduler = _FakeReactionScheduler()
+    deps = _deps(db, cfg, settings=settings, bot=_FakeReactionBot(), reaction_scheduler=scheduler)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await _send_live_talk(handler)
+
+    assert scheduler.calls == []
 
 
 async def test_gate_not_live_drop_does_not_react(

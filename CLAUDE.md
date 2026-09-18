@@ -1026,7 +1026,7 @@ shadow=false -> sent=False с причиной; LLMError -> reason; say: тек�
 # config_models.py — BehaviourConfig.hot_window: HotWindowConfig (с description у каждого поля)
 class HotWindowConfig(BaseModel):
     enabled: bool = True
-    minutes: int = Field(default=30, ge=0, le=720)  # длительность окна после /life и /say
+    minutes: int = Field(default=10, ge=0, le=720)  # длительность окна после /life и /say (было 30, решение владельца 16.09)
     mention_max_delay_sec: int = Field(
         default=120, ge=0, le=3600
     )  # потолок задержки ответа на обращение в окне
@@ -1522,6 +1522,65 @@ def latest_release(text: str) -> Release | None
 - Релиз: поднять `version` в `pyproject.toml`, `uv lock`, перенести Unreleased в `## [X.Y.Z] — YYYY-MM-DD`, обновить ссылки
   внизу, смержить, затем `git tag vX.Y.Z <squash-commit> && git push origin vX.Y.Z`.
 - Docker-образ по-прежнему тегируется `sha-…`, версия к деплою не привязана.
+
+## Интерфейсы: реакции с задержкой и смыслом
+
+Решение владельца 16.09.2026: реакция за 0,3 секунды после сообщения выглядит механически («Отец лайкнул
+через 0,3 сек»), а выбор по кубику ставит 💩 на что угодно. Реакция становится жестом человека, который
+прочитал и хмыкнул: сначала пауза, потом дешёвая модель решает, уместна ли реакция и какая. Гейт и
+`pick_reaction` остаются детерминированным предфильтром; кубик при включённой семантике не бросается —
+модель и есть фильтр.
+
+```python
+# config_models.py — ReactionsConfig дополняется (description у каждого поля):
+    delay_sec: tuple[int, int] = (20, 120)     # пауза перед реакцией, валидатор 0 <= lo <= hi <= 3600
+    semantic: bool = True                      # решение моделью; False — прежний кубик probability
+    model: str = ""                            # пусто -> llm.judge_model
+    max_tokens: int = Field(default=40, ge=10, le=200)
+    semantic_daily_cap: int = Field(default=40, ge=0, le=1000)   # вызовов модели в сутки, свой счётчик reaction_calls
+    context_messages: int = Field(default=6, ge=1, le=30)
+# emoji по умолчанию: ["👍", "💩", "😂"] (😂 добавлен — модели нужен вариант «смешно»; валидация по allowed_emoji как раньше).
+# settings.py: reaction_prompt_path: Path = Path("prompts/reaction.txt").
+
+# reactions.py
+def pick_reaction(..., cfg, rng, now) -> str | None      # без изменений по сигнатуре; при cfg.semantic=True шаг «кубик»
+                                                          # пропускается и возвращается заглушка cfg.emoji[0] (финальный
+                                                          # выбор эмодзи делает модель); при semantic=False — как раньше.
+class ReactionChooser:
+    def __init__(self, llm: LLMClient, cfg_getter: Callable[[], Config], prompt_template: str) -> None
+    async def choose(self, *, text: str, display_name: str, context_rows: Sequence[MessageRow], allowed: Sequence[str],
+                     now: int) -> str | None
+    # model = cfg.behaviour.reactions.model or cfg.llm.judge_model; пустая -> None. llm.call(..., counter_key=
+    # "reaction_calls", calls_cap=cfg.behaviour.reactions.semantic_daily_cap). Промпт prompts/reaction.txt (≤ 20 строк):
+    # кто Фёдор (два предложения, добродушный, реагирует редко); «в этом чате 👍 и 💩 значат „одобряю“, 😂 — смешно»;
+    # слоты {context} (render_context последних context_messages БЕЗ текущего), {name}, {text}, {emoji} (список через
+    # пробел); данные в <<<CHAT ... >>>, поддельные разделители вырезаны; «Поставил бы Фёдор реакцию на это сообщение?
+    # В большинстве случаев — нет. Да — только если сообщение явно удачное, смешное или заслуживает одобрения»;
+    # ответ строго JSON {"emoji": "<один из списка>"|null, "reason": "..."}. Парсинг как judge._parse_verdict; эмодзи
+    # не из allowed -> None; LLMError/не JSON -> None + WARNING.
+class ReactionScheduler:
+    def __init__(self, *, bot: ReactionBotLike, db: Database, cfg_getter, chooser: ReactionChooser | None,
+                 rng: random.Random, clock: Callable[[], int] = lambda: int(time.time())) -> None
+    def schedule(self, *, chat_id: int, tg_message_id: int, user_id: int, text: str, display_name: str) -> None
+    # создаёт asyncio.Task (хранит в set, снимает по done_callback); задача: sleep(rng.uniform(*delay_sec)) →
+    # state = load_reaction_state → перепроверка cooldown_min / daily_cap / тот же user_id (без кубика) — провал →
+    # filter_log stage="react" reason="react:recheck" (cut) → если cfg.semantic и chooser: context_rows =
+    # db.recent_messages(chat_id, context_messages + 1) без текущего; emoji = await chooser.choose(...); None →
+    # filter_log "react:declined" (cut, candidate_text=text[:200]) → иначе emoji = <заглушка из pick_reaction> при
+    # semantic=False → await react(bot, db, ..., emoji=emoji, ...). Ошибки → logger.exception, задача не роняет ничего.
+    async def shutdown(self) -> None   # отменить все задачи; незавершённые реакции теряются — это нормально
+# bot.py: вместо немедленного react(...) после pick_reaction — deps.reaction_scheduler.schedule(...) (Deps получает
+# reaction_scheduler: ReactionScheduler | None = None; None → прежнее немедленное поведение для тестов/совместимости).
+# app.py: ReactionChooser при наличии LLMClient (иначе None → кубик как раньше даже при semantic=True — логировать
+# WARNING один раз на старте), ReactionScheduler всегда; shutdown в finally.
+# filter_log: react:sent / react:error как раньше, плюс react:recheck, react:declined. /status: строка reactions
+# дополняется «, semantic calls <today>/<semantic_daily_cap>». CHANGELOG Unreleased: оба блока.
+```
+
+Тесты: `tests/test_reactions.py` (pick_reaction при semantic пропускает кубик; ReactionChooser — промпт с данными в
+разделителях, эмодзи вне списка → None, LLMError → None, счётчик reaction_calls; ReactionScheduler — задержка через
+FakeClock/патч sleep, recheck после паузы, declined, отправка и state, shutdown отменяет), `tests/test_bot.py`
+(schedule вызывается вместо react; при scheduler=None — как раньше), `tests/test_commands.py` (/status).
 
 ## Конвенции
 
