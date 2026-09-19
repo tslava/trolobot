@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     reaction_prompt_path: Path = Path("prompts/reaction.txt")
     memory_prompt_path: Path = Path("prompts/memory.txt")
     vision_prompt_path: Path = Path("prompts/vision.txt")
+    weather_place_prompt_path: Path = Path("prompts/weather_place.txt")
+    # Домашняя точка погоды (CLAUDE.md, "Интерфейсы: погода"). Координаты — личные
+    # данные владельца, а репозиторий публичный: в config.yaml и в коде их нет,
+    # только здесь, в .env. Не заданы обе -> блок погоды пуст (WARNING на старте),
+    # погода по месту из вопроса при этом работает.
+    weather_latitude: float | None = None
+    weather_longitude: float | None = None
+    weather_home_name: str = ""
     stickers_path: Path = Path("stickers.yaml")
     changelog_path: Path = Path("CHANGELOG.md")
     log_level: str = "INFO"

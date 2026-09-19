@@ -12,6 +12,7 @@
 
 - Фёдор больше не лайкает мгновенно: сначала вычитывает сообщение, а через минуту-другую ставит реакцию, и только если она к месту. Добавилось 😂 для по-настоящему смешного.
 - После своих новостей он «держит телефон в руках» десять минут, а не полчаса.
+- Фёдор знает погоду: сколько сейчас за окном, что днём и что завтра. Специально её не пересказывает, но если к слову, скажет. Спросить можно и про другой город: «а в Гданьске дождь?» — посмотрит и ответит.
 
 ### Для владельца
 
@@ -19,6 +20,8 @@
 - `probability` работает только при `semantic: false` (прежнее поведение); промпт `prompts/reaction.txt`, путь — `REACTION_PROMPT_PATH` (#16).
 - `filter_log` пополнился `react:recheck` (условия разошлись за время паузы) и `react:declined` (модель сказала «не нужно»); `/status` показывает `semantic calls <N>/<cap>` (#16).
 - `behaviour.hot_window.minutes` по умолчанию 10 (было 30) (#15).
+- Погода фоном в системном промпте: слот `{weather}` (после `{chat_memory}`, перед `{life}`), источник Open-Meteo (публичный API, ключа не нужно), настройки `behaviour.weather.*` (`enabled`, `ttl_min`, `timeout_sec`). Координаты домашней точки — только в `.env`: `WEATHER_LATITUDE`, `WEATHER_LONGITUDE`, `WEATHER_HOME_NAME` (репозиторий публичный, в `config.yaml` их нет); не заданы — блока погоды нет и на старте WARNING.
+- Погода по месту из вопроса: `behaviour.weather.place_lookup`/`lookup_model` (пусто → `llm.judge_model`)/`lookup_max_tokens`/`lookup_daily_cap` (счётчик `weather_calls`)/`geocode_ttl_days`, регулярки повода `filters.weather_request`, промпт `prompts/weather_place.txt` (путь — `WEATHER_PLACE_PROMPT_PATH`), геокодер Open-Meteo. Вызов только на прямое обращение; в `/why` — `weather:place`, `weather:no_place`, `weather:not_found`. `/status` показывает строку «погода: …, обновлена HH:MM».
 - Дешёвый предфильтр перед «вернулся проверить»: `behaviour.checkin.prefilter`/`prefilter_max_tokens`, `FollowupChecker.check_batch`, промпт `prompts/checkin_prefilter.txt`; `send:checkin_prefilter_no`/`send:checkin_prefilter_yes` в `/why`. Экономит вызовы основной модели, когда после последней реплики никто не написал ничего адресованного (#17).
 
 ## [0.5.0] — 2026-09-16

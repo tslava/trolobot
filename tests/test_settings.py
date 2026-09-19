@@ -76,6 +76,45 @@ def test_settings_empty_env_values_like_env_example(monkeypatch: pytest.MonkeyPa
     assert settings.log_level == "INFO"
 
 
+def test_settings_weather_home_point_defaults_to_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Координат домашней точки в репозитории нет: по умолчанию их просто нет."""
+    monkeypatch.setenv("BOT_TOKEN", "abc")
+
+    settings = Settings()
+
+    assert settings.weather_latitude is None
+    assert settings.weather_longitude is None
+    assert settings.weather_home_name == ""
+    assert settings.weather_place_prompt_path == Path("prompts/weather_place.txt")
+
+
+def test_settings_weather_home_point_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOT_TOKEN", "abc")
+    monkeypatch.setenv("WEATHER_LATITUDE", "50.0")
+    monkeypatch.setenv("WEATHER_LONGITUDE", "10.0")
+    monkeypatch.setenv("WEATHER_HOME_NAME", "Город")
+
+    settings = Settings()
+
+    assert settings.weather_latitude == 50.0
+    assert settings.weather_longitude == 10.0
+    assert settings.weather_home_name == "Город"
+
+
+def test_settings_empty_weather_env_values_mean_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """.env.example держит ключи пустыми — пустая строка не должна ломать float-поля."""
+    monkeypatch.setenv("BOT_TOKEN", "abc")
+    monkeypatch.setenv("WEATHER_LATITUDE", "")
+    monkeypatch.setenv("WEATHER_LONGITUDE", "")
+    monkeypatch.setenv("WEATHER_HOME_NAME", "")
+
+    settings = Settings()
+
+    assert settings.weather_latitude is None
+    assert settings.weather_longitude is None
+    assert settings.weather_home_name == ""
+
+
 def test_settings_missing_bot_token_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BOT_TOKEN", raising=False)
 

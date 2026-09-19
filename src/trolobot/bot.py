@@ -46,6 +46,7 @@ from trolobot.vision import (
     pick_photo_size,
     should_describe,
 )
+from trolobot.weather import WeatherClient
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,10 @@ class Deps:
     # Долгая память чата (CLAUDE.md, "долгая память чата") — нужна только команде
     # /memory run; сам пересказ крутит фоновый таск. None — LLM не настроен.
     memorizer: ChatMemorizer | None = None
+    # Погода (CLAUDE.md, "Интерфейсы: погода") — хендлеру сообщений не нужна вовсе,
+    # её читает Responder; здесь она только ради строки в /status. None — клиента
+    # нет (тесты хендлера), /status покажет «погода: нет».
+    weather: WeatherClient | None = None
     # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
     # не спамить лог на каждое следующее сообщение того же участника.
     warned_user_ids: set[int] = field(default_factory=set)

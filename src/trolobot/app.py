@@ -28,6 +28,7 @@ from trolobot.settings import Settings
 from trolobot.stickers import StickerChooser, load_catalog
 from trolobot.stores import ConfigStore, PromptStore
 from trolobot.vision import VisionDescriber
+from trolobot.weather import Place, WeatherClient, WeatherPlaceExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ async def main() -> None:
     llm: LLMClient | None = None
     responder: Responder | None = None
     reaction_scheduler: ReactionScheduler | None = None
+    weather: WeatherClient | None = None
     try:
         config_store = ConfigStore(settings.config_path, db)
         await config_store.load()
@@ -79,6 +81,24 @@ async def main() -> None:
         if settings.admin_user_id == 0:
             logger.warning("команды владельца отключены: admin_user_id не задан")
 
+        # Погода (CLAUDE.md, "Интерфейсы: погода"): ключ API не нужен, клиент
+        # создаётся всегда. Домашняя точка — из .env, а не из конфига: репозиторий
+        # публичный, координаты владельца в нём не лежат. Заданы не обе — клиент
+        # живёт без домашней точки: блок «за окном» пуст, а погода по месту,
+        # про которое спросили в чате, работает.
+        home: Place | None = None
+        if settings.weather_latitude is not None and settings.weather_longitude is not None:
+            home = Place(
+                name=settings.weather_home_name,
+                latitude=settings.weather_latitude,
+                longitude=settings.weather_longitude,
+            )
+        else:
+            logger.warning(
+                "погода за окном выключена: WEATHER_LATITUDE/WEATHER_LONGITUDE не заданы"
+            )
+        weather = WeatherClient(config_store.get, home=home)
+
         deps = Deps(
             settings=settings,
             config_getter=config_store.get,
@@ -91,6 +111,7 @@ async def main() -> None:
             prompt_store=prompt_store,
             bot_username=me.username or "",
             bot=bot,
+            weather=weather,
         )
 
         dispatcher = Dispatcher()
@@ -175,6 +196,12 @@ async def main() -> None:
             )
             deps.memorizer = memorizer
 
+            # Место из вопроса про погоду достаёт дешёвая модель (CLAUDE.md,
+            # "погода в другом месте") — как followup и зрение, создаётся при
+            # наличии ключа; модель и place_lookup проверяются на каждом вызове.
+            weather_place_prompt = settings.weather_place_prompt_path.read_text(encoding="utf-8")
+            weather_places = WeatherPlaceExtractor(llm, config_store.get, weather_place_prompt)
+
             responder = Responder(
                 bot=bot,
                 db=db,
@@ -182,6 +209,8 @@ async def main() -> None:
                 llm=llm,
                 judge=judge,
                 sticker_chooser=sticker_chooser,
+                weather=weather,
+                weather_places=weather_places,
                 patterns_getter=config_store.patterns,
                 prompt_store=prompt_store,
                 rng=rng,
@@ -237,6 +266,8 @@ async def main() -> None:
             await reaction_scheduler.shutdown()
         if llm is not None:
             await llm.aclose()
+        if weather is not None:
+            await weather.aclose()
         if bot is not None:
             # aiogram закрывает сессию сама при штатном выходе из start_polling; повторный
             # вызов идемпотентен и здесь нужен на случай исключения до start_polling.

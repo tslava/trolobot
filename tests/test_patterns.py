@@ -253,6 +253,7 @@ def test_empty_pattern_lists_always_none_or_false() -> None:
     empty_cfg.filters.logistics = []
     empty_cfg.filters.urgent = []
     empty_cfg.filters.places_request = []
+    empty_cfg.filters.weather_request = []
     empty_cfg.filters.model_talk = []
     empty_cfg.filters.assistant_markers = []
     patterns = Patterns(empty_cfg.filters, [], "otec_fedor_bot")
@@ -263,6 +264,7 @@ def test_empty_pattern_lists_always_none_or_false() -> None:
     assert patterns.name_trigger("федя") is None
     assert patterns.urgent("сегодня") is False
     assert patterns.places_request("куда сходить") is False
+    assert patterns.weather_request("какая погода") is False
     assert patterns.model_talk("ИИ") is None
     assert patterns.assistant_marker("конечно!") is None
 
@@ -293,3 +295,28 @@ def test_empty_motifs_and_story_markers_are_empty() -> None:
 
     assert patterns.motifs == {}
     assert patterns.story_markers == []
+
+
+# --- weather_request (CLAUDE.md, "погода в другом месте") -----------------------
+
+WEATHER_REQUEST_CASES = [
+    ("pogoda", "какая погода завтра в Познани?", True),
+    ("pogodka", "погодка сегодня так себе", True),
+    ("dozhd", "дождь обещали под вечер", True),
+    ("sneg", "снег в Гданьске уже лёг", True),
+    ("zhara", "жара на неделе", True),
+    ("upal", "upał w Warszawie", True),
+    ("temperatura", "какая там температура?", True),
+    ("gradus", "сколько градусов на улице", True),
+    ("teplo", "тепло у вас?", True),
+    ("holodno", "холодно стало", True),
+    ("no_match_plain", "поехали в гараж", False),
+    ("no_match_pogovorim", "погово000рим потом", False),
+]
+
+
+@pytest.mark.parametrize(
+    "case_id, text, expect_match", WEATHER_REQUEST_CASES, ids=[c[0] for c in WEATHER_REQUEST_CASES]
+)
+def test_weather_request(case_id: str, text: str, expect_match: bool) -> None:
+    assert PATTERNS.weather_request(text) is expect_match
