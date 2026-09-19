@@ -1637,11 +1637,20 @@ FakeClock/патч sleep, recheck после паузы, declined, отправ�
 # config_models.py — BehaviourConfig.weather: WeatherConfig (description у каждого поля)
 class WeatherConfig(BaseModel):
     enabled: bool = True
-    latitude: float = Field(default=52.4064, ge=-90.0, le=90.0)    # Познань
-    longitude: float = Field(default=16.9252, ge=-180.0, le=180.0)
     ttl_min: int = Field(default=30, ge=1, le=1440)                # как долго ответ считается свежим
     timeout_sec: int = Field(default=5, ge=1, le=60)
-# config.yaml дублирует с комментариями. Ключа в .env НЕ добавляется — API публичный.
+# Координат в config.yaml НЕТ и в коде они не захардкожены: репозиторий публичный, домашняя точка — личные
+# данные владельца (решение владельца 19.09.2026). Они живут в .env, который не коммитится:
+# settings.py: weather_latitude: float | None = None; weather_longitude: float | None = None;
+#              weather_home_name: str = ""     # как называть место в промпте; пусто -> без названия
+# .env.example: WEATHER_LATITUDE=, WEATHER_LONGITUDE=, WEATHER_HOME_NAME= с комментарием «координаты
+# домашней точки, из них берётся погода; пусто — погода выключена». Обе координаты заданы -> app.py
+# собирает Place(name=settings.weather_home_name, latitude=..., longitude=...) и отдаёт его WeatherClient;
+# задана одна из двух или ни одной -> WeatherClient без домашней точки: get() без place возвращает None,
+# блок погоды пуст, всё остальное работает; на старте один WARNING «погода выключена: WEATHER_LATITUDE/
+# WEATHER_LONGITUDE не заданы». Ключа API по-прежнему не нужно — Open-Meteo публичный.
+# WeatherClient.__init__ получает home: Place | None; render_weather пишет «Погода за окном» без названия,
+# если home.name пуст, и «Погода в <name>», если задано.
 
 # weather.py
 @dataclass(frozen=True, slots=True)
@@ -1704,8 +1713,8 @@ followup: один вызов, только когда повод есть.
     lookup_model: str = ""                                        # пусто -> llm.judge_model
     lookup_max_tokens: int = Field(default=40, ge=10, le=200)
     lookup_daily_cap: int = Field(default=30, ge=0, le=500)       # вызовов в сутки, счётчик weather_calls
-    home_name: str = Field(default="Познань")                     # как называется домашняя точка в промпте
     geocode_ttl_days: int = Field(default=30, ge=1, le=3650)      # как долго помнить координаты места
+# Имя домашней точки — Settings.weather_home_name (.env), не конфиг: см. раздел «погода» выше.
 # filters.weather_request: list[str] — регулярки повода, дефолт: ["\bпогод", "\bдожд", "\bснег",
 #   "\bжар[аеуы]\b", "\bupał", "\bтемператур", "\bградус", "\bтепл[оаы]", "\bхолодн"]
 # (компилируются как остальные списки regex, IGNORECASE). Patterns.weather_request(text) -> bool.
@@ -1748,7 +1757,9 @@ def render_weather_place(place_name: str, w: Weather | None, tz: str, now: int) 
 #   filter_log(stage="weather", verdict="pass", reason="weather:place", candidate_text=place.name) при успехе;
 #   "weather:no_place" (cut) если модель вернула None; "weather:not_found" (cut) если геокодер не нашёл.
 # Responder получает необязательный kwarg weather_places: WeatherPlaceExtractor | None = None.
-# Если место совпало с домашней точкой по имени (без учёта регистра) — второй блок не добавляется.
+# Если место совпало с домашней точкой по имени (без учёта регистра, имя из Settings.weather_home_name;
+# пусто -> сравнение не делается) — второй блок не добавляется. Домашней точки нет -> первый блок пуст,
+# но погода по спрошенному месту всё равно работает.
 # app.py: WeatherPlaceExtractor создаётся при наличии LLMClient. /why покажет weather:* сам.
 ```
 
