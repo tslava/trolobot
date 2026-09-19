@@ -122,6 +122,24 @@ NAME_TRIGGER_CASES = [
     ("dedline_no_match", "дедлайн горит", False),
     ("fyodor_mihaylovich", "Фёдор Михайлович", True),
     ("batyushka", "батюшка благослови", True),
+    # Падежи (CLAUDE.md, "имя в падежах"): «играю с внуком Федора» — тоже про него,
+    # и гейт обязан это увидеть; обращение это или разговор в третьем лице, решает
+    # дальше дешёвая модель, а не регулярка.
+    ("fedora_genitive", "играю с внуком Федора", True),
+    ("fyodoru_dative", "передай Фёдору привет", True),
+    ("fede_dative", "Феде бы зашло", True),
+    ("fedyu_accusative", "зови Федю", True),
+    ("otca_genitive", "спроси у отца", True),
+    ("otcu_dative", "отцу бы такое понравилось", True),
+    ("dedom_instrumental", "с дедом на рыбалку", True),
+    ("batyushki_genitive", "у батюшки спроси", True),
+    # Ложные срабатывания недопустимы: после стема обязана идти морфема из
+    # закрытого списка и граница слова.
+    ("batyushkam_no_match", "батюшкам и матушкам", False),
+    ("otchestvo_no_match", "имя отчество фамилия", False),
+    ("otcovskiy_no_match", "отцовский гараж", False),
+    ("federaciya_no_match", "федерация профсоюзов", False),
+    ("dedushka_no_match", "дедушка Мороз", False),
 ]
 
 

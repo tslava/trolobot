@@ -83,11 +83,15 @@ def _strip_code_fence(text: str) -> str:
     return text
 
 
-# Причины DROP гейта, на которые вместо молчания иногда ставится реакция —
-# обе недетерминированные ("кости" п.11 и кулдаун ambient п.10). Все прочие причины
-# (panic/stop/muted/topic/night/logistics/not_live/injection/mention_cap/ambient_cap...) —
-# там решено молчать полностью, реакция не ставится никогда.
-REACT_REASONS: frozenset[str] = frozenset({"gate:dice", "gate:ambient_cooldown"})
+# Причины, на которые вместо молчания иногда ставится реакция — все
+# недетерминированные: "кости" (п.11 гейта), кулдаун ambient (п.10) и отказ дешёвой
+# модели считать упоминание имени обращением (CLAUDE.md, "имя в падежах"): про Фёдора
+# говорили, влезать в разговор незачем, а хмыкнуть — ровно тот жест, который нужен.
+# Все прочие причины (panic/stop/muted/topic/night/logistics/not_live/injection/
+# mention_cap/ambient_cap...) — там решено молчать полностью, реакции нет никогда.
+REACT_REASONS: frozenset[str] = frozenset(
+    {"gate:dice", "gate:ambient_cooldown", "followup:name_no"}
+)
 
 
 class ReactionBotLike(Protocol):

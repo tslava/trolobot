@@ -11,10 +11,17 @@
 JSON ``{"addressed": true|false, "reason": "..."}``. «Да» превращает сообщение в
 обращение ``Trigger.FOLLOWUP``.
 
+Тот же приём переиспользуется ещё дважды: ``check_batch`` — дешёвый предфильтр
+пачки перед «вернулся проверить», ``check_name`` — подтверждение обращения по
+имени (CLAUDE.md, "имя в падежах и проверка обращения по имени"), где регулярка
+видит имя в любом падеже, но не отличает «Федя, ты где?» от «отец вчера лайкнул».
+
 Модуль не ходит в БД — контекст и последние реплики передаются аргументами
-(``bot.py`` готовит их и пишет ``filter_log``). Провал — ``False`` (промолчать
-дешевле, чем ошибочно ответить не по адресу): невалидный JSON, LLMError, пустая
-модель — везде один и тот же исход.
+(``bot.py`` готовит их и пишет ``filter_log``). Провал (невалидный JSON, LLMError,
+пустая модель) у каждой проверки трактуется в свою, более дешёвую сторону:
+``check`` -> ``False`` (промолчать дешевле, чем ответить не по адресу),
+``check_name`` -> ``True`` (пропустить обращение хуже лишней реплики),
+``check_batch`` -> все номера (пусть решает основная модель).
 """
 
 from __future__ import annotations
@@ -66,10 +73,15 @@ class _FollowupVerdict:
     reason: str
 
 
-def _parse_verdict(raw: str) -> _FollowupVerdict | None:
+def _parse_verdict(raw: str, key: str = "addressed") -> _FollowupVerdict | None:
     """Разбирает ответ проверки так же строго и терпимо, как ``judge._parse_verdict``:
     срез ```json``` обёрток, поиск первой "{" и ``json.JSONDecoder.raw_decode`` от
-    неё. Любой сбой или неверный тип ``addressed`` -> None (значит "не адресовано")."""
+    неё. Любой сбой или неверный тип булева поля -> None. Что значит None —
+    решает вызывающий: для ``check`` это "не адресовано", для ``check_name`` —
+    наоборот, "не смогли проверить, отвечаем".
+
+    ``key`` — имя булева поля в ответе: ``addressed`` у проверки горячего окна,
+    ``answer`` у проверки обращения по имени (промпты разные, приём один)."""
     try:
         candidate = _strip_code_fence(raw.strip())
         start = candidate.find("{")
@@ -79,7 +91,7 @@ def _parse_verdict(raw: str) -> _FollowupVerdict | None:
         if not isinstance(data, dict):
             return None
 
-        addressed = data.get("addressed")
+        addressed = data.get(key)
         if not isinstance(addressed, bool):
             return None
 
@@ -131,11 +143,34 @@ class FollowupChecker:
         cfg_getter: Callable[[], Config],
         prompt_template: str,
         batch_prompt_template: str = "",
+        name_prompt_template: str = "",
     ) -> None:
         self._llm = llm
         self._cfg_getter = cfg_getter
         self._prompt_template = prompt_template
         self._batch_prompt_template = batch_prompt_template
+        self._name_prompt_template = name_prompt_template
+
+    def _render_single(
+        self,
+        template: str,
+        *,
+        text: str,
+        display_name: str,
+        context_rows: Sequence[MessageRow],
+        recent_replies: Sequence[str],
+    ) -> str:
+        """Подстановка слотов {context}/{recent_replies}/{name}/{text} за один проход
+        (общая и для ``check``, и для ``check_name``: промпты разные, слоты те же)."""
+        context = _strip_fake_delimiters(render_context(list(context_rows))).strip()
+        recent = _strip_fake_delimiters("\n".join(recent_replies)).strip()
+        slot_values = {
+            "context": context or _CONTEXT_EMPTY,
+            "recent_replies": recent or _RECENT_REPLIES_EMPTY,
+            "name": _strip_fake_delimiters(display_name).strip(),
+            "text": _strip_fake_delimiters(text).strip(),
+        }
+        return _SLOT_RE.sub(lambda m: slot_values[m.group(1)], template)
 
     async def check(
         self,
@@ -152,16 +187,13 @@ class FollowupChecker:
         if not model:
             return False
 
-        context = _strip_fake_delimiters(render_context(list(context_rows))).strip()
-        recent = _strip_fake_delimiters("\n".join(recent_replies)).strip()
-
-        slot_values = {
-            "context": context or _CONTEXT_EMPTY,
-            "recent_replies": recent or _RECENT_REPLIES_EMPTY,
-            "name": _strip_fake_delimiters(display_name).strip(),
-            "text": _strip_fake_delimiters(text).strip(),
-        }
-        system = _SLOT_RE.sub(lambda m: slot_values[m.group(1)], self._prompt_template)
+        system = self._render_single(
+            self._prompt_template,
+            text=text,
+            display_name=display_name,
+            context_rows=context_rows,
+            recent_replies=recent_replies,
+        )
         messages = [{"role": "system", "content": system}]
 
         try:
@@ -183,6 +215,64 @@ class FollowupChecker:
             return False
 
         logger.info("followup verdict: addressed=%s reason=%s", verdict.addressed, verdict.reason)
+        return verdict.addressed
+
+    async def check_name(
+        self,
+        *,
+        text: str,
+        display_name: str,
+        context_rows: Sequence[MessageRow],
+        recent_replies: Sequence[str],
+        now: int,
+    ) -> bool:
+        """Подтверждение обращения по имени (CLAUDE.md, "имя в падежах и проверка
+        обращения по имени").
+
+        Регулярка теперь ловит имя во всех падежах, но не отличает обращение
+        («Федя, ты где?») от разговора о нём в третьем лице («отец вчера лайкнул
+        сообщение выше»). Различает дешёвая модель — та же механика, что у
+        ``check``, только другой промпт и другое поле ответа (``answer``).
+
+        Провал (нет модели, нет шаблона, ``LLMError``, невалидный JSON) — ``True``,
+        зеркально ``check``: там молчание дешевле ошибки, здесь наоборот —
+        пропустить настоящее обращение хуже лишней реплики.
+        """
+        cfg = self._cfg_getter()
+        followup_cfg = cfg.behaviour.followup
+        model = followup_cfg.model or cfg.llm.judge_model
+        if not model or not self._name_prompt_template:
+            logger.warning("name check: no model or prompt template, treating as addressed")
+            return True
+
+        system = self._render_single(
+            self._name_prompt_template,
+            text=text,
+            display_name=display_name,
+            context_rows=context_rows,
+            recent_replies=recent_replies,
+        )
+        messages = [{"role": "system", "content": system}]
+
+        try:
+            result = await self._llm.call(
+                messages,
+                model=model,
+                max_tokens=followup_cfg.name_check_max_tokens,
+                now=now,
+                counter_key=_COUNTER_KEY,
+                calls_cap=followup_cfg.daily_cap,
+            )
+        except LLMError as exc:
+            logger.warning("name check llm error: reason=%s", exc.reason)
+            return True
+
+        verdict = _parse_verdict(result.text, key="answer")
+        if verdict is None:
+            logger.warning("name check: invalid verdict, treating as addressed")
+            return True
+
+        logger.info("name check verdict: answer=%s reason=%s", verdict.addressed, verdict.reason)
         return verdict.addressed
 
     async def check_batch(

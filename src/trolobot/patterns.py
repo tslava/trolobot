@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from trolobot.config_models import FiltersConfig
+from trolobot.morph import name_pattern
 
 
 def _compile_regex_list(patterns: list[str]) -> list[re.Pattern[str]]:
@@ -48,8 +49,12 @@ class Patterns:
             label: _compile_regex_list(patterns) for label, patterns in filters.motifs.items()
         }
         self._story_markers = _compile_regex_list(filters.story_markers)
+        # Имя ищется во всех падежах единственного числа (CLAUDE.md, "имя в
+        # падежах"): «внуком Федора» и «спроси у отца» — то же обращение, что
+        # «Федор» и «отец». Формы даёт morph.name_pattern закрытым списком
+        # окончаний, чтобы «федерация» и «дедлайн» по-прежнему не совпадали.
         self._name_triggers = [
-            re.compile(rf"\b{re.escape(trigger)}\b", re.IGNORECASE) for trigger in name_triggers
+            re.compile(name_pattern(trigger), re.IGNORECASE) for trigger in name_triggers
         ]
         # "\b" не работает перед "@" (@ не словообразующий символ), поэтому границу
         # слева ставим лукбихайндом "не словообразующий символ перед @", а справа — "\b".

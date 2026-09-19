@@ -851,11 +851,37 @@ async def test_gate_not_live_drop_does_not_react(
 
 
 class _FakeFollowupChecker:
-    """Подделка FollowupChecker: записывает аргументы вызова, отдаёт заданный result."""
+    """Подделка FollowupChecker: записывает аргументы вызова, отдаёт заданный result.
 
-    def __init__(self, result: bool) -> None:
+    ``name_result`` — ответ ``check_name`` (проверка обращения по имени, CLAUDE.md,
+    "имя в падежах"); по умолчанию «да», как ведёт себя настоящий чекер, когда
+    проверить нечем."""
+
+    def __init__(self, result: bool, name_result: bool = True) -> None:
         self.result = result
+        self.name_result = name_result
         self.calls: list[dict[str, object]] = []
+        self.name_calls: list[dict[str, object]] = []
+
+    async def check_name(
+        self,
+        *,
+        text: str,
+        display_name: str,
+        context_rows: list[MessageRow],
+        recent_replies: list[str],
+        now: int,
+    ) -> bool:
+        self.name_calls.append(
+            {
+                "text": text,
+                "display_name": display_name,
+                "context_rows": context_rows,
+                "recent_replies": recent_replies,
+                "now": now,
+            }
+        )
+        return self.name_result
 
     async def check(
         self,
@@ -1053,6 +1079,194 @@ async def test_followup_disabled_by_config_skips_checker(
     assert checker.calls == []
     summary = dict(await db.filter_log_summary(0))
     assert summary.get("gate:dice") == 1
+
+
+# --- Проверка обращения по имени (CLAUDE.md, "имя в падежах") ---
+
+
+def _config_name_check(**updates: object) -> Config:
+    """Config с ambient_probability=0: обращение по имени проходит гейт по шагу
+    прямого обращения, а не случайно по кубику ambient."""
+    cfg = Config()
+    followup = cfg.behaviour.followup.model_copy(update=updates)
+    behaviour = cfg.behaviour.model_copy(update={"followup": followup, "ambient_probability": 0.0})
+    return cfg.model_copy(update={"behaviour": behaviour})
+
+
+def _name_message(message_id: int = 501) -> Message:
+    return _message(
+        message_id=message_id,
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="Федя, ты сегодня в гараже?",
+        date=DAY,
+    )
+
+
+async def test_name_trigger_confirmed_by_model_passes(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Модель сказала «да» — обычный ответ по имени плюс строка followup:name_yes."""
+    cfg = _config_name_check()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(False, name_result=True)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, followup=checker, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await handler(_name_message())
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("pass:name") == 1
+    assert summary.get("followup:name_yes") == 1
+    assert "followup:name_no" not in summary
+
+    assert len(responder.calls) == 1
+    assert responder.calls[0][1] is Trigger.NAME
+
+    assert len(checker.name_calls) == 1
+    call = checker.name_calls[0]
+    assert call["text"] == "Федя, ты сегодня в гараже?"
+    assert call["display_name"] == "Дима"
+    assert call["now"] == int(DAY.timestamp())
+    # Текущее сообщение уже записано insert_message — в контекст проверки не идёт.
+    context_rows = call["context_rows"]
+    assert isinstance(context_rows, list)
+    assert all(row.tg_message_id != 501 for row in context_rows)
+
+
+async def test_name_trigger_rejected_by_model_is_silent(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Про него говорили в третьем лице — ответа нет, в filter_log followup:name_no."""
+    cfg = _config_name_check()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(False, name_result=False)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, followup=checker, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await handler(_name_message())
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("followup:name_no") == 1
+    assert summary.get("pass:name") == 1  # гейт-то пропустил, срезала проверка
+    assert responder.calls == []
+    assert len(checker.name_calls) == 1
+
+
+async def test_name_trigger_rejected_by_model_can_still_react(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """followup:name_no — причина из REACT_REASONS: вместо ответа возможна реакция."""
+    cfg = _config_name_check()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(False, name_result=False)
+    scheduler = _FakeReactionScheduler()
+    deps = _deps(
+        db,
+        cfg,
+        settings=settings,
+        followup=checker,
+        bot=_FakeReactionBot(),
+        reaction_scheduler=scheduler,
+    )
+    handler = build_router(deps).message.handlers[0].callback
+
+    await handler(_name_message())
+
+    assert len(scheduler.calls) == 1
+    assert scheduler.calls[0]["tg_message_id"] == 501
+
+
+async def test_name_check_disabled_skips_model(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config_name_check(name_check=False)
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(False, name_result=False)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, followup=checker, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await handler(_name_message())
+
+    assert checker.name_calls == []
+    assert len(responder.calls) == 1
+    assert responder.calls[0][1] is Trigger.NAME
+    summary = dict(await db.filter_log_summary(0))
+    assert "followup:name_yes" not in summary
+    assert "followup:name_no" not in summary
+
+
+async def test_name_check_skipped_without_checker(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LLM не настроен (followup=None) — имя работает как до этой фичи."""
+    cfg = _config_name_check()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+
+    await handler(_name_message())
+
+    assert len(responder.calls) == 1
+    assert responder.calls[0][1] is Trigger.NAME
+
+
+async def test_reply_to_bot_does_not_call_name_check(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Реплай на бота — обращение без всяких сомнений, модель не зовётся."""
+    cfg = _config_name_check()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(False, name_result=False)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, followup=checker, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+
+    bot_message = _message(
+        message_id=600,
+        from_user=User(id=deps.bot_user_id, is_bot=True, first_name="Отец Фёдор"),
+        text="Бывает.",
+        date=DAY,
+    )
+    message = _message(
+        message_id=601,
+        from_user=_user(user_id=5, first_name="Дима"),
+        text="согласен полностью",
+        reply_to_message=bot_message,
+        date=DAY,
+    )
+    await handler(message)
+
+    assert checker.name_calls == []
+    assert len(responder.calls) == 1
+    assert responder.calls[0][1] is Trigger.REPLY
+
+
+async def test_mention_does_not_call_name_check(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@username — тоже обращение без сомнений, модель не зовётся."""
+    cfg = _config_name_check()
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    checker = _FakeFollowupChecker(False, name_result=False)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg, settings=settings, followup=checker, responder=responder)
+    handler = build_router(deps).message.handlers[0].callback
+
+    message = _message(
+        message_id=602,
+        from_user=_user(user_id=5, first_name="Дима"),
+        text=f"@{BOT_USERNAME} ты там живой",
+        date=DAY,
+    )
+    await handler(message)
+
+    assert checker.name_calls == []
+    assert len(responder.calls) == 1
+    assert responder.calls[0][1] is Trigger.MENTION
 
 
 # --- Зрение на фото (vision.py) ---
