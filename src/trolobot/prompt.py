@@ -143,7 +143,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(
-    r"\{(age|few_shot|life|chat_memory|context|recent_replies|places|avoid|situation)\}"
+    r"\{(age|few_shot|life|chat_memory|weather|context|recent_replies|places|avoid|situation)\}"
 )
 
 
@@ -307,6 +307,7 @@ def build_messages(
     avoid: str = "",
     life: str = "",
     chat_memory: str = "",
+    weather: str = "",
     json_reminder: str = _JSON_REMINDER,
 ) -> list[dict[str, str]]:
     """Собирает [system, user] для LLMClient.call().
@@ -327,12 +328,16 @@ def build_messages(
     {avoid} (CLAUDE.md, "меньше и разнообразнее", мера 5) — тоже в system: это не
     данные участников, а инструкция, собранная motifs.render_avoid из того, что
     персонаж сам уже наговорил («жену и гараж ты уже поминал, сейчас без них»).
+    {weather} (CLAUDE.md, "Интерфейсы: погода") — тоже в system: это факт из
+    открытого API (weather.render_weather), фон жизни персонажа, а не сообщение
+    участника; название места внутри блока приходит от геокодера, не из чата.
     """
     slot_values = {
         "age": str(age),
         "few_shot": few_shot,
         "life": life,
         "chat_memory": chat_memory,
+        "weather": _strip_fake_delimiters(weather).strip(),
         "context": _CONTEXT_MARKER,
         "recent_replies": _RECENT_REPLIES_MARKER,
         "places": _PLACES_MARKER,

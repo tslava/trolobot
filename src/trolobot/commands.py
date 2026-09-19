@@ -38,6 +38,7 @@ from trolobot.few_shot import FewShot
 from trolobot.sanitize import normalize_text, sanitize_display_name
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, day_start, local_dt
+from trolobot.weather import Place, Weather, describe, format_temp
 
 if TYPE_CHECKING:
     # Только для аннотаций: "from __future__ import annotations" делает их строками,
@@ -229,6 +230,14 @@ class _PromptStoreLike(Protocol):
     def examples(self) -> list[FewShot]: ...
 
 
+class _WeatherLike(Protocol):
+    """Подмножество WeatherClient, нужное /status: один снимок погоды. Как и
+    остальные протоколы здесь — структурный, чтобы тестам не собирать настоящий
+    клиент с httpx."""
+
+    async def get(self, place: Place | None = None) -> Weather | None: ...
+
+
 class _CommandsDeps(Protocol):
     """Зависимости build_commands_router. bot.Deps потом дополнят этими полями.
 
@@ -264,6 +273,8 @@ class _CommandsDeps(Protocol):
     def sticker_catalog_enabled(self) -> int: ...
     @property
     def memorizer(self) -> _ChatMemorizerLike | None: ...
+    @property
+    def weather(self) -> _WeatherLike | None: ...
 
 
 def _truncate(text: str) -> str:
@@ -486,6 +497,20 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         else "checkin: нет"
     )
 
+    # Погода (CLAUDE.md, "Интерфейсы: погода"): get() может сходить в сеть, если
+    # кэш протух, — /status зовут редко, это нормально. Нет домашней точки
+    # (координаты не заданы в .env) или клиент выключен -> «погода: нет».
+    weather_line = "погода: нет"
+    weather_client = deps.weather
+    snapshot = await weather_client.get() if weather_client is not None else None
+    if snapshot is not None:
+        now_desc = describe(snapshot.code_now)
+        weather_line = (
+            f"погода: {format_temp(snapshot.temp_now)}"
+            f"{f', {now_desc}' if now_desc else ''}, "
+            f"обновлена {local_dt(snapshot.fetched_at, tz).strftime('%H:%M')}"
+        )
+
     lines = [
         f"trolobot v{__version__}",
         f"Паника: {'да' if panic else 'нет'}",
@@ -510,6 +535,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"vision: {vision_count}/{cfg.behaviour.vision.daily_cap}",
         checkin_line,
         presence_line,
+        weather_line,
     ]
     await _reply(message, "\n".join(lines))
 

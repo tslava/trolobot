@@ -46,6 +46,7 @@ from trolobot.prompt import PLACES_NONE, SITUATION_LATE, SITUATION_MORNING
 from trolobot.responder import Responder
 from trolobot.stickers import Sticker
 from trolobot.timeutil import day_key, in_window
+from trolobot.weather import Place, Weather
 
 CHAT_ID = -100123456
 BOT_USER_ID = 999
@@ -63,6 +64,14 @@ PROMPT_TEMPLATE = (
 PROMPT_TEMPLATE_WITH_LIFE = (
     "Ты Фёдор, тебе {age} лет.\n"
     "{life}\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{situation}"
+)
+
+# То же самое для слота {weather} (CLAUDE.md, "Интерфейсы: погода").
+PROMPT_TEMPLATE_WITH_WEATHER = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "{weather}\n"
     "Примеры:\n{few_shot}\n"
     "{context}\n{recent_replies}\n{places}\n{situation}"
 )
@@ -436,6 +445,61 @@ class FakePromptStore:
         return self.few_shot_version_value
 
 
+class FakeWeatherClient:
+    """Подделка WeatherClient: снимок и геокодер без сети (CLAUDE.md, "погода")."""
+
+    def __init__(
+        self,
+        snapshot: Weather | None,
+        *,
+        home_name: str = "Город",
+        place_snapshot: Weather | None = None,
+        geocoded: Place | None = None,
+    ) -> None:
+        self.snapshot = snapshot
+        self._home_name = home_name
+        self.place_snapshot = place_snapshot if place_snapshot is not None else snapshot
+        self.geocoded = geocoded
+        self.geocode_calls: list[str] = []
+
+    @property
+    def home_name(self) -> str:
+        return self._home_name
+
+    async def get(self, place: Place | None = None) -> Weather | None:
+        return self.place_snapshot if place is not None else self.snapshot
+
+    async def geocode(self, query: str) -> Place | None:
+        self.geocode_calls.append(query)
+        return self.geocoded
+
+
+class FakeWeatherPlaces:
+    """Подделка WeatherPlaceExtractor: возвращает заготовленное название."""
+
+    def __init__(self, place: str | None) -> None:
+        self.place = place
+        self.calls: list[str] = []
+
+    async def extract(self, text: str, *, now: int) -> str | None:
+        self.calls.append(text)
+        return self.place
+
+
+def _weather_snapshot(fetched_at: int = DAY_NOW) -> Weather:
+    return Weather(
+        temp_now=9.4,
+        code_now=3,
+        today_min=4.2,
+        today_max=11.6,
+        today_code=3,
+        tomorrow_min=-2.6,
+        tomorrow_max=3.4,
+        tomorrow_code=61,
+        fetched_at=fetched_at,
+    )
+
+
 def _make_responder(
     db_: Database,
     cfg: Config,
@@ -449,6 +513,8 @@ def _make_responder(
     sticker_chooser: FakeStickerChooser | None = None,
     prompt_store: FakePromptStore | None = None,
     followup: FakeFollowup | None = None,
+    weather: FakeWeatherClient | None = None,
+    weather_places: FakeWeatherPlaces | None = None,
 ) -> Responder:
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
     return Responder(
@@ -459,6 +525,8 @@ def _make_responder(
         judge=judge,
         sticker_chooser=sticker_chooser,  # type: ignore[arg-type]
         followup=followup,  # type: ignore[arg-type]  # FakeFollowup: узкий протокол check/check_batch
+        weather=weather,  # type: ignore[arg-type]  # FakeWeatherClient: get/geocode/home_name
+        weather_places=weather_places,  # type: ignore[arg-type]  # FakeWeatherPlaces: extract
         patterns_getter=lambda: patterns,
         prompt_store=prompt_store if prompt_store is not None else FakePromptStore(),
         rng=rng if rng is not None else random.Random(seed),  # type: ignore[arg-type]
@@ -4721,6 +4789,431 @@ async def test_avoid_slot_empty_without_recent_replies(db: Database) -> None:
         system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
         assert "{avoid}" not in system
         assert "уже поминал" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- погода (CLAUDE.md, "Интерфейсы: погода" и "погода в другом месте") --------
+
+
+async def test_weather_block_in_system_for_ambient(db: Database) -> None:
+    """Погода — фон для любого триггера, не только для обращения."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=FakeWeatherClient(_weather_snapshot()),
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=900, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Погода за окном (это фон, упоминай только если к слову): сейчас +9" in system
+        assert "Завтра от -3 до +3, дождь." in system
+        assert "{weather}" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_block_in_system_for_mention(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=FakeWeatherClient(_weather_snapshot()),
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=901,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, привет",
+                addressed_items=[("Дима", "Федя, привет")],
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Погода за окном" in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_slot_empty_without_client(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=902, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Погода" not in system
+        assert "{weather}" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_slot_empty_when_client_has_no_home_point(db: Database) -> None:
+    """Координаты не заданы в .env -> get() вернул None, блок пуст."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=FakeWeatherClient(None, home_name=""),
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT, trigger_msg_id=903, user_id=None, situation="", delay_sec=0
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Погода" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_place_block_added_for_address_with_weather_question(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    weather = FakeWeatherClient(
+        _weather_snapshot(),
+        geocoded=Place(name="Гданьск", latitude=54.35, longitude=18.65),
+    )
+    places = FakeWeatherPlaces("Гданьск")
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=weather,
+        weather_places=places,
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=910,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, а в Гданьске дождь?",
+                addressed_items=[("Дима", "Федя, а в Гданьске дождь?")],
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Погода за окном" in system
+        assert (
+            "Спрашивают про место: Гданьск. Сейчас +9 и пасмурно, завтра от -3 до +3, дождь."
+            in system
+        )
+        assert places.calls == ["Федя, а в Гданьске дождь?"]
+        assert weather.geocode_calls == ["Гданьск"]
+
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("weather:place") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_place_not_looked_up_without_regex_hit(db: Database) -> None:
+    """Регулярка повода не сработала — дешёвого вызова нет вовсе."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    weather = FakeWeatherClient(_weather_snapshot())
+    places = FakeWeatherPlaces("Гданьск")
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=weather,
+        weather_places=places,
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=911,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, как гараж?",
+                addressed_items=[("Дима", "Федя, как гараж?")],
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Спрашивают про" not in system
+        assert places.calls == []
+        assert weather.geocode_calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_place_not_found_logs_and_keeps_home_block(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    weather = FakeWeatherClient(_weather_snapshot(), geocoded=None)
+    places = FakeWeatherPlaces("Нетакогоместа")
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=weather,
+        weather_places=places,
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=912,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, а какая погода в Нетакогоместа?",
+                addressed_items=[("Дима", "Федя, а какая погода в Нетакогоместа?")],
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Погода за окном" in system
+        assert "Спрашивают про" not in system
+
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("weather:not_found") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_place_model_found_nothing_logs_no_place(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    weather = FakeWeatherClient(_weather_snapshot())
+    places = FakeWeatherPlaces(None)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=weather,
+        weather_places=places,
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=913,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, дождь достал",
+                addressed_items=[("Дима", "Федя, дождь достал")],
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Спрашивают про" not in system
+        assert weather.geocode_calls == []
+
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("weather:no_place") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_place_skipped_when_asked_about_home(db: Database) -> None:
+    """Спросили про домашнюю точку — второй блок не дублируется."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    weather = FakeWeatherClient(_weather_snapshot())
+    places = FakeWeatherPlaces("город")
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=weather,
+        weather_places=places,
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=914,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, какая погода в Городе?",
+                addressed_items=[("Дима", "Федя, какая погода в Городе?")],
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Спрашивают про" not in system
+        assert weather.geocode_calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_place_not_looked_up_for_ambient(db: Database) -> None:
+    """Неадресный повод: про погоду в Гданьске персонаж сам не заговаривает."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    weather = FakeWeatherClient(
+        _weather_snapshot(), geocoded=Place(name="Гданьск", latitude=54.35, longitude=18.65)
+    )
+    places = FakeWeatherPlaces("Гданьск")
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=weather,
+        weather_places=places,
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.AMBIENT,
+                trigger_msg_id=915,
+                user_id=None,
+                situation="",
+                delay_sec=0,
+                trigger_text="а в Гданьске дождь",
+            ),
+        )
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Погода за окном" in system
+        assert "Спрашивают про" not in system
+        assert places.calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_weather_place_lookup_disabled_by_config(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.weather.place_lookup = False
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    places = FakeWeatherPlaces("Гданьск")
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_WEATHER),
+        weather=FakeWeatherClient(_weather_snapshot()),
+        weather_places=places,
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=916,
+                user_id=5,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федя, а в Гданьске дождь?",
+                addressed_items=[("Дима", "Федя, а в Гданьске дождь?")],
+            ),
+        )
+
+        assert places.calls == []
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Спрашивают про" not in system
     finally:
         await responder.shutdown()
         await llm.aclose()

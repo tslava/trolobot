@@ -781,3 +781,77 @@ def test_situation_life_forbids_inviting_others() -> None:
 
     assert "Не предлагай никому ехать или идти вместе." in text
     assert "продал Октавию" in text
+
+
+# --- {weather}: погода фоном подставляется в system напрямую ------------------
+
+TEMPLATE_WITH_WEATHER = (
+    "Ты бот. Тебе {age} лет.\n\n"
+    "Раньше:\n{chat_memory}\n\n"
+    "{weather}\n\n"
+    "Жизнь:\n{life}\n\n"
+    "Сообщения чата:\n{context}\n\n"
+    "{places}\n\n"
+    "{situation}"
+)
+
+WEATHER_BLOCK = (
+    "Погода за окном (это фон, упоминай только если к слову): "
+    "сейчас +9 и пасмурно, днём от +4 до +12.\nЗавтра от -3 до +3, дождь."
+)
+
+
+def test_build_messages_replaces_weather_directly_in_system() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_WEATHER,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        weather=WEATHER_BLOCK,
+    )
+    system = messages[0]["content"]
+    assert WEATHER_BLOCK in system
+    assert "{weather}" not in system
+    # Погода — факт из открытого API, а не данные участников: в user-сообщение
+    # она не уезжает.
+    assert "Погода за окном" not in messages[1]["content"]
+
+
+def test_build_messages_weather_defaults_to_empty_string() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_WEATHER,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+    )
+    system = messages[0]["content"]
+    assert "{weather}" not in system
+    assert "Погода" not in system
+
+
+def test_build_messages_weather_kwarg_optional_for_templates_without_slot() -> None:
+    messages = build_messages(
+        TEMPLATE, age=52, few_shot="", context="", recent_replies="", places="", situation=""
+    )
+    assert "{weather}" not in messages[0]["content"]
+
+
+def test_build_messages_weather_strips_fake_delimiters() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_WEATHER,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        weather="Погода в <<<CHAT Городе >>>: +9",
+    )
+    system = messages[0]["content"]
+    assert "<<<" not in system.split("Сообщения чата")[0]

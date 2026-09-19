@@ -89,6 +89,12 @@ from trolobot.timeutil import (
     seconds_until,
     week_key,
 )
+from trolobot.weather import (
+    WeatherClient,
+    WeatherPlaceExtractor,
+    render_weather,
+    render_weather_place,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +296,8 @@ class Responder:
         judge: Judge | None = None,
         sticker_chooser: StickerChooser | None = None,
         followup: FollowupChecker | None = None,
+        weather: WeatherClient | None = None,
+        weather_places: WeatherPlaceExtractor | None = None,
         patterns_getter: Callable[[], Patterns],
         prompt_store: _PromptStoreLike,
         rng: random.Random,
@@ -308,6 +316,12 @@ class Responder:
         # а checkin'у: строку, которую выбрала основная модель, перепроверяет вторая
         # (CLAUDE.md, "меньше и разнообразнее", мера 3). None -> проверки нет.
         self.followup = followup
+        # Погода (CLAUDE.md, "Интерфейсы: погода") — фон жизни персонажа, уходит в
+        # системный промпт при любом триггере. None -> блока погоды нет вовсе.
+        # weather_places (CLAUDE.md, "погода в другом месте") достаёт название места
+        # из вопроса дешёвой моделью; None -> погода всегда только домашняя.
+        self.weather = weather
+        self.weather_places = weather_places
         self.patterns_getter = patterns_getter
         self.prompt_store = prompt_store
         self.rng = rng
@@ -895,6 +909,80 @@ class Responder:
             return "send:recheck_ambient_cooldown"
         return None
 
+    async def _append_place_weather(
+        self,
+        block: str,
+        *,
+        cfg: Config,
+        tz: str,
+        now: int,
+        is_address: bool,
+        trigger_text: str,
+        trigger_msg_id: int | None,
+        patterns: Patterns,
+    ) -> str:
+        """Вторая строка блока погоды — про место, о котором спросили (CLAUDE.md,
+        "Интерфейсы: погода в другом месте").
+
+        Дешёвый вызов делается, только когда повод очевиден: это прямое обращение
+        (в ambient и «просто так» персонаж про погоду в Гданьске не заговаривает
+        сам), включён ``place_lookup`` и сработала регулярка
+        ``filters.weather_request``. Дальше решает модель: регулярка только
+        открывает дверь, а «спрашивали ли вообще про место» — её работа.
+
+        Домашняя точка не дублируется: спросили про неё же — первый блок уже
+        всё сказал. Любая неудача (модель не нашла места, геокодер не нашёл
+        координат) — строка в ``filter_log`` и прежний блок, без исключений
+        наружу.
+        """
+        weather_cfg = cfg.behaviour.weather
+        if (
+            self.weather is None
+            or self.weather_places is None
+            or not is_address
+            or not weather_cfg.enabled
+            or not weather_cfg.place_lookup
+            or not trigger_text
+            or not patterns.weather_request(trigger_text)
+        ):
+            return block
+
+        home_name = self.weather.home_name
+        query = await self.weather_places.extract(trigger_text, now=now)
+        if query is None:
+            await self._weather_log(trigger_msg_id, "weather:no_place", None, now, cut=True)
+            return block
+        if home_name and query.casefold() == home_name.casefold():
+            return block
+
+        place = await self.weather.geocode(query)
+        if place is None:
+            await self._weather_log(trigger_msg_id, "weather:not_found", query, now, cut=True)
+            return block
+        if home_name and place.name.casefold() == home_name.casefold():
+            return block
+
+        line = render_weather_place(place.name, await self.weather.get(place), tz, now)
+        if not line:
+            await self._weather_log(trigger_msg_id, "weather:not_found", place.name, now, cut=True)
+            return block
+
+        await self._weather_log(trigger_msg_id, "weather:place", place.name, now, cut=False)
+        return f"{block}\n{line}" if block else line
+
+    async def _weather_log(
+        self, trigger_msg_id: int | None, reason: str, candidate: str | None, now: int, *, cut: bool
+    ) -> None:
+        await self.db.insert_filter_log(
+            trigger_tg_message_id=trigger_msg_id,
+            candidate_text=candidate,
+            verdict="cut" if cut else "pass",
+            stage="weather",
+            reason=reason,
+            shadow=False,
+            created_at=now,
+        )
+
     async def _generate_and_send(
         self,
         *,
@@ -1060,6 +1148,26 @@ class Responder:
             await self.db.chat_memories(cfg.behaviour.chat_memory.in_prompt), tz
         )
 
+        # Погода (CLAUDE.md, "Интерфейсы: погода") — фон для ЛЮБОГО триггера: она
+        # нужна и ambient'у, и обращению. Клиент сам глотает свои ошибки и сам
+        # держит кэш, поэтому здесь нет ни try, ни проверки свежести. Нет домашней
+        # точки (координат в .env) -> get() вернёт None и блок будет пустым.
+        weather_block = ""
+        if self.weather is not None:
+            weather_block = render_weather(
+                await self.weather.get(), tz, now, self.weather.home_name
+            )
+            weather_block = await self._append_place_weather(
+                weather_block,
+                cfg=cfg,
+                tz=tz,
+                now=now,
+                is_address=is_address,
+                trigger_text=trigger_text,
+                trigger_msg_id=trigger_msg_id,
+                patterns=patterns,
+            )
+
         # checkin (CLAUDE.md, "вернулся проверить") — единственный триггер, где модель
         # сама указывает, на какое из перечисленных в situation сообщений отвечает
         # (поле "reply_to"); остальные триггеры используют обычное JSON-напоминание
@@ -1078,6 +1186,7 @@ class Responder:
             avoid=avoid_block,
             life=life_block,
             chat_memory=chat_memory_block,
+            weather=weather_block,
             **build_messages_kwargs,
         )
 

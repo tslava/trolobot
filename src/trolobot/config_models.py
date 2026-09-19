@@ -466,6 +466,56 @@ class VisionConfig(BaseModel):
         return value
 
 
+class WeatherConfig(BaseModel):
+    """Погода как фон жизни персонажа (CLAUDE.md, "Интерфейсы: погода" и
+    "Интерфейсы: погода в другом месте"). Источник — Open-Meteo, публичный API
+    без ключа.
+
+    Координат домашней точки здесь НЕТ и в коде они не захардкожены: репозиторий
+    публичный, а где живёт владелец — его личные данные. Широта, долгота и
+    название лежат в ``.env`` (``WEATHER_LATITUDE``/``WEATHER_LONGITUDE``/
+    ``WEATHER_HOME_NAME``, см. settings.py). Не заданы — блок погоды пуст, а
+    погода по месту из вопроса всё равно работает.
+    """
+
+    enabled: bool = Field(
+        default=True, description="Включает погоду в системном промпте (Open-Meteo, без ключа)"
+    )
+    ttl_min: int = Field(
+        default=30, ge=1, le=1440, description="Сколько минут ответ о погоде считается свежим"
+    )
+    timeout_sec: int = Field(
+        default=5, ge=1, le=60, description="Таймаут запроса к Open-Meteo, секунд"
+    )
+    place_lookup: bool = Field(
+        default=True, description="Искать погоду по месту, про которое спросили в обращении"
+    )
+    lookup_model: str = Field(
+        default="",
+        description="Дешёвая модель, достающая место из вопроса; пусто -> llm.judge_model",
+    )
+    lookup_max_tokens: int = Field(
+        default=40, ge=10, le=200, description="Лимит токенов ответа модели, достающей место"
+    )
+    lookup_daily_cap: int = Field(
+        default=30, ge=0, le=500, description="Потолок таких вызовов в сутки, счётчик weather_calls"
+    )
+    geocode_ttl_days: int = Field(
+        default=30, ge=1, le=3650, description="Сколько дней помнятся координаты найденного места"
+    )
+
+    @field_validator("lookup_model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
+
+
 class BehaviourConfig(BaseModel):
     quiet_window: tuple[str, str] = Field(
         default=("02:00", "07:00"), description="Окно полной тишины, включая прямые обращения"
@@ -521,6 +571,10 @@ class BehaviourConfig(BaseModel):
     vision: VisionConfig = Field(
         default_factory=VisionConfig,
         description="Описание фото моделью со зрением вместо плейсхолдера «[фото]»",
+    )
+    weather: WeatherConfig = Field(
+        default_factory=WeatherConfig,
+        description="Погода фоном в системном промпте; координаты домашней точки — в .env",
     )
 
     # Кулдаун = задержка, не отказ (решение владельца): обращение всегда получает
@@ -793,6 +847,21 @@ _PLACES_REQUEST_DEFAULT = [
     r"\bпивняк\b",
 ]
 
+# Повод посмотреть погоду в месте, про которое спросили (CLAUDE.md, "погода в
+# другом месте"). Регулярка только включает дешёвый вызов, который достаёт из
+# текста название места, — само решение «спрашивали ли про погоду» за моделью.
+_WEATHER_REQUEST_DEFAULT = [
+    r"\bпогод",
+    r"\bдожд",
+    r"\bснег",
+    r"\bжар[аеуы]\b",
+    r"\bupał",
+    r"\bтемператур",
+    r"\bградус",
+    r"\bтепл[оаы]",
+    r"\bхолодн",
+]
+
 _MODEL_TALK_DEFAULT = [
     r"языковая модель",
     r"нейросет\w*",
@@ -920,6 +989,7 @@ _REGEX_LIST_FIELDS = (
     "logistics",
     "urgent",
     "places_request",
+    "weather_request",
     "model_talk",
     "grumpy_markers",
     "story_markers",
@@ -982,6 +1052,10 @@ class FiltersConfig(BaseModel):
     places_request: list[str] = Field(
         default_factory=lambda: list(_PLACES_REQUEST_DEFAULT),
         description="Маркеры запроса про заведение («куда сходить», «посоветуй»)",
+    )
+    weather_request: list[str] = Field(
+        default_factory=lambda: list(_WEATHER_REQUEST_DEFAULT),
+        description="Маркеры разговора о погоде — повод узнать погоду в названном месте",
     )
     model_talk: list[str] = Field(
         default_factory=lambda: list(_MODEL_TALK_DEFAULT),

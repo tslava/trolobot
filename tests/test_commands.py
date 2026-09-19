@@ -25,6 +25,7 @@ from trolobot.few_shot import FewShot
 from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, local_dt
+from trolobot.weather import Place, Weather
 
 OWN_CHAT_ID = -1001234567890
 FOREIGN_CHAT_ID = -100999
@@ -284,6 +285,23 @@ class FakeMemorizer:
         return self.run_due_result
 
 
+class FakeWeather:
+    """Подделка WeatherClient для /status: снимок без сети (CLAUDE.md, "погода")."""
+
+    def __init__(self, snapshot: Weather | None = None, home_name: str = "") -> None:
+        self.snapshot = snapshot
+        self._home_name = home_name
+        self.calls = 0
+
+    @property
+    def home_name(self) -> str:
+        return self._home_name
+
+    async def get(self, place: Place | None = None) -> Weather | None:
+        self.calls += 1
+        return self.snapshot
+
+
 @dataclass
 class FakeDeps:
     """Структурно подходит под commands._CommandsDeps."""
@@ -297,6 +315,7 @@ class FakeDeps:
     bot_username: str
     sticker_catalog_enabled: int = 0
     memorizer: FakeMemorizer | None = None
+    weather: FakeWeather | None = None
 
 
 # --- вспомогательные конструкторы -------------------------------------------------
@@ -372,6 +391,7 @@ def _deps(
     db: FakeDb | None = None,
     responder: FakeResponder | None = None,
     memorizer: FakeMemorizer | None = None,
+    weather: FakeWeather | None = None,
 ) -> tuple[FakeDeps, FakeDb, FakeConfigStore, FakePromptStore]:
     fake_db = db if db is not None else FakeDb()
     config_store = FakeConfigStore(cfg=config)
@@ -385,6 +405,7 @@ def _deps(
         bot_user_id=BOT_USER_ID,
         bot_username=BOT_USERNAME,
         memorizer=memorizer,
+        weather=weather,
     )
     return deps, fake_db, config_store, prompt_store
 
@@ -1774,6 +1795,86 @@ async def test_status_shows_checkin_due_local_time(
 
     expected_time = local_dt(due, config.persona.timezone).strftime("%H:%M")
     assert f"checkin: due {expected_time}" in sent[0]
+
+
+async def test_status_shows_no_weather_without_client(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """Клиента нет вовсе (или координаты не заданы) — «погода: нет»."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "погода: нет" in sent[0]
+
+
+async def test_status_shows_no_weather_when_snapshot_is_none(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    weather = FakeWeather(snapshot=None, home_name="Город")
+    deps, _, _, _ = _deps(settings=settings, config=config, weather=weather)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "погода: нет" in sent[0]
+    assert weather.calls == 1
+
+
+async def test_status_shows_weather_and_fetch_time(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    fetched_at = int(NOW.timestamp()) - 600
+    snapshot = Weather(
+        temp_now=9.4,
+        code_now=3,
+        today_min=4.2,
+        today_max=11.6,
+        today_code=3,
+        tomorrow_min=-2.6,
+        tomorrow_max=3.4,
+        tomorrow_code=61,
+        fetched_at=fetched_at,
+    )
+    weather = FakeWeather(snapshot=snapshot, home_name="Город")
+    deps, _, _, _ = _deps(settings=settings, config=config, weather=weather)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    expected_time = local_dt(fetched_at, config.persona.timezone).strftime("%H:%M")
+    assert f"погода: +9, пасмурно, обновлена {expected_time}" in sent[0]
+
+
+async def test_status_weather_without_home_name(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    snapshot = Weather(
+        temp_now=-0.4,
+        code_now=4242,  # неизвестный код -> описания нет
+        today_min=-3.0,
+        today_max=1.0,
+        today_code=3,
+        tomorrow_min=-5.0,
+        tomorrow_max=0.0,
+        tomorrow_code=71,
+        fetched_at=int(NOW.timestamp()),
+    )
+    deps, _, _, _ = _deps(settings=settings, config=config, weather=FakeWeather(snapshot=snapshot))
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    assert "погода: 0, обновлена" in sent[0]
 
 
 # --- справка ------------------------------------------------------------------

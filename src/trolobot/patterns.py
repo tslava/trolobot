@@ -36,6 +36,8 @@ class Patterns:
         self._logistics = _compile_regex_list(filters.logistics)
         self._urgent = _compile_regex_list(filters.urgent)
         self._places_request = _compile_regex_list(filters.places_request)
+        # Повод узнать погоду в названном месте (CLAUDE.md, "погода в другом месте").
+        self._weather_request = _compile_regex_list(filters.weather_request)
         self._model_talk = _compile_regex_list(filters.model_talk)
         self._assistant_markers = _compile_phrase_list(filters.assistant_markers)
         self._grumpy_markers = _compile_regex_list(filters.grumpy_markers)
@@ -79,6 +81,9 @@ class Patterns:
 
     def places_request(self, text: str) -> bool:
         return _first_match(self._places_request, text) is not None
+
+    def weather_request(self, text: str) -> bool:
+        return _first_match(self._weather_request, text) is not None
 
     def model_talk(self, text: str) -> str | None:
         return _first_match(self._model_talk, text)
