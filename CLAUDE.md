@@ -1626,6 +1626,70 @@ class ReactionScheduler:
 FakeClock/патч sleep, recheck после паузы, declined, отправка и state, shutdown отменяет), `tests/test_bot.py`
 (schedule вызывается вместо react; при scheduler=None — как раньше), `tests/test_commands.py` (/status).
 
+## Интерфейсы: погода
+
+Решение владельца 19.09.2026 (повод — «@otec_fedor_bot какая погода завтра в Познани?», на что Фёдор
+ответил «узнаю по коленке»): у него должны быть настоящие данные о погоде. Источник — Open-Meteo:
+бесплатно, без ключа, без регистрации. Погода — фон жизни персонажа (участок, теплица, гараж), а не
+справочная услуга: одна строка в системном промпте, модель сама решает, к слову она или нет.
+
+```python
+# config_models.py — BehaviourConfig.weather: WeatherConfig (description у каждого поля)
+class WeatherConfig(BaseModel):
+    enabled: bool = True
+    latitude: float = Field(default=52.4064, ge=-90.0, le=90.0)    # Познань
+    longitude: float = Field(default=16.9252, ge=-180.0, le=180.0)
+    ttl_min: int = Field(default=30, ge=1, le=1440)                # как долго ответ считается свежим
+    timeout_sec: int = Field(default=5, ge=1, le=60)
+# config.yaml дублирует с комментариями. Ключа в .env НЕ добавляется — API публичный.
+
+# weather.py
+@dataclass(frozen=True, slots=True)
+class Weather:
+    temp_now: float; code_now: int
+    today_min: float; today_max: float; today_code: int
+    tomorrow_min: float; tomorrow_max: float; tomorrow_code: int
+    fetched_at: int
+WMO: dict[int, str]   # коды Open-Meteo -> по-русски: 0 ясно; 1-2 переменная облачность; 3 пасмурно;
+                      # 45/48 туман; 51-57 морось; 61-65 дождь; 66/67 ледяной дождь; 71-77 снег;
+                      # 80-82 ливни; 85/86 снегопад; 95-99 гроза. Неизвестный код -> "" (строка без описания).
+def describe(code: int) -> str
+def render_weather(w: Weather | None, tz: str, now: int) -> str
+# None -> "". Иначе одна-две строки, без слова Open-Meteo и без цифр времени:
+# "Погода за окном (это фон, упоминай только если к слову): сейчас <temp_now> и <describe(code_now)>,
+#  днём от <today_min> до <today_max>. Завтра от <tomorrow_min> до <tomorrow_max>, <describe(tomorrow_code)>."
+# Температуры — целые со знаком ("+9", "-3", "0"). Строка НЕ начинается с "- " (regex:prompt_leak).
+class WeatherClient:
+    def __init__(self, cfg_getter: Callable[[], Config], http: httpx.AsyncClient | None = None,
+                 clock: Callable[[], int] = lambda: int(time.time())) -> None
+    async def get(self) -> Weather | None
+    # enabled=False -> None. Кэш в памяти: свежий (now - fetched_at < ttl_min*60) -> отдать его, не ходя в сеть.
+    # Иначе GET https://api.open-meteo.com/v1/forecast с параметрами latitude, longitude,
+    # current="temperature_2m,weather_code", daily="temperature_2m_min,temperature_2m_max,weather_code",
+    # timezone=<persona.timezone>, forecast_days=2; timeout из конфига. 2xx и разбор ок -> Weather в кэш.
+    # Любая ошибка (httpx.HTTPError, таймаут, не 2xx, KeyError/ValueError при разборе) -> logger.warning
+    # и вернуть ПРОШЛЫЙ кэш, даже протухший (лучше вчерашняя погода, чем никакой); кэша нет -> None.
+    # Параллельные вызовы сериализуются asyncio.Lock: один поход в сеть, остальные ждут результат.
+    async def aclose(self) -> None
+# Сеть только здесь. Тесты — через httpx.MockTransport, без настоящих запросов.
+
+# prompt.py: слот {weather} в _SLOT_RE и build_messages(weather: str = ""); prompts/system.txt — {weather}
+# отдельным абзацем СРАЗУ ПОСЛЕ {chat_memory} и перед {life} (фон, потом свежее про него самого).
+# responder._generate_and_send: weather = render_weather(await self.weather.get(), tz, now) if self.weather
+# else "" — для ЛЮБОГО триггера (фон нужен и ambient, и обращению). Responder получает необязательный
+# kwarg weather: WeatherClient | None = None. Ошибка клиента наружу не выходит (он сам её глотает).
+# app.py: WeatherClient создаётся всегда (ключ не нужен), передаётся в Responder; aclose() в finally.
+# commands.py /status: строка "погода: <сейчас>, обновлена HH:MM | нет" (persona.timezone) — по
+# weather.get() без похода в сеть? get() может сходить — это нормально, /status зовётся редко.
+```
+
+Тесты: `tests/test_weather.py` (describe по кодам и неизвестный код; render_weather формат, знаки температур,
+None -> "", нет "- " в начале строк; WeatherClient через MockTransport — успешный разбор, кэш в пределах ttl без
+второго запроса, протухший кэш обновляется, ошибка сети -> прошлый кэш, ошибка без кэша -> None, enabled=false ->
+None без запроса, таймаут и параметры запроса, параллельные вызовы -> один запрос), `tests/test_prompt.py` (слот),
+`tests/test_responder.py` (строка погоды в system для ambient и для обращения; weather=None -> пусто),
+`tests/test_commands.py` (/status). README: абзац в разделе про контекст. CHANGELOG Unreleased: оба блока.
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»
