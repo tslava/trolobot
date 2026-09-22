@@ -87,10 +87,13 @@ def _strip_code_fence(text: str) -> str:
 # недетерминированные: "кости" (п.11 гейта), кулдаун ambient (п.10) и отказ дешёвой
 # модели считать упоминание имени обращением (CLAUDE.md, "имя в падежах"): про Фёдора
 # говорили, влезать в разговор незачем, а хмыкнуть — ровно тот жест, который нужен.
-# Все прочие причины (panic/stop/muted/topic/night/logistics/not_live/injection/
-# mention_cap/ambient_cap...) — там решено молчать полностью, реакции нет никогда.
+# Все прочие причины (panic/stop/muted/topic/night/logistics/injection/mention_cap/
+# ambient_cap...) — там решено молчать полностью, реакции нет никогда.
+# "gate:not_live" добавлена 22.09.2026 по разбору тишины: это самая частая причина
+# отказа (54 из 68 сообщений за двое суток), и без неё реакции почти не появлялись —
+# чат, в котором один человек пишет подряд, вообще не давал повода хмыкнуть.
 REACT_REASONS: frozenset[str] = frozenset(
-    {"gate:dice", "gate:ambient_cooldown", "followup:name_no"}
+    {"gate:dice", "gate:ambient_cooldown", "gate:not_live", "followup:name_no"}
 )
 
 

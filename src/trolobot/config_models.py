@@ -65,13 +65,13 @@ class LiveTalkConfig(BaseModel):
     """Что считается «живым разговором» для ambient-реплик."""
 
     min_messages: int = Field(
-        default=3, ge=1, le=50, description="Минимум сообщений в окне для живого разговора"
+        default=2, ge=1, le=50, description="Минимум сообщений в окне для живого разговора"
     )
     min_people: int = Field(
         default=2, ge=1, le=50, description="Минимум разных людей в окне для живого разговора"
     )
     window_min: int = Field(
-        default=10, ge=1, le=1440, description="Окно в минутах, за которое считается разговор"
+        default=20, ge=1, le=1440, description="Окно в минутах, за которое считается разговор"
     )
 
 
@@ -184,7 +184,7 @@ class StickersConfig(BaseModel):
 
     enabled: bool = Field(default=True, description="Включает отправку стикеров вместо текста")
     min_replies_between: int = Field(
-        default=4,
+        default=2,
         ge=0,
         le=50,
         description="Текстовых реплик должно пройти после стикера до следующего",
@@ -536,7 +536,7 @@ class BehaviourConfig(BaseModel):
         default_factory=LiveTalkConfig, description="Что считается живым разговором для ambient"
     )
     ambient_probability: float = Field(
-        default=0.15, ge=0.0, le=1.0, description="Шанс ambient-реплики внутри живого разговора"
+        default=0.25, ge=0.0, le=1.0, description="Шанс ambient-реплики внутри живого разговора"
     )
     chat_cooldown_min: int = Field(
         default=25, ge=0, le=1440, description="Минимум минут между ambient-репликами"

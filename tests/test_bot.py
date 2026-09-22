@@ -130,9 +130,18 @@ def _deps(
 
 
 def _config_ambient_always() -> Config:
-    """Config с ambient_probability=1.0 — шаг "кости" гейта детерминированно пропускает."""
+    """Config с ambient_probability=1.0 — шаг "кости" гейта детерминированно пропускает.
+
+    live_talk пинится к порогу «три сообщения», хотя дефолт с 22.09.2026 — два:
+    сценарий этих тестов описан как «три сообщения от двух людей», и от значения
+    дефолта он зависеть не должен (дефолты проверяет tests/test_config.py)."""
     cfg = Config()
-    behaviour = cfg.behaviour.model_copy(update={"ambient_probability": 1.0})
+    behaviour = cfg.behaviour.model_copy(
+        update={
+            "ambient_probability": 1.0,
+            "live_talk": cfg.behaviour.live_talk.model_copy(update={"min_messages": 3}),
+        }
+    )
     return cfg.model_copy(update={"behaviour": behaviour})
 
 
@@ -696,6 +705,8 @@ def _config_dice_drop(*, reaction_probability: float) -> Config:
     behaviour = cfg.behaviour.model_copy(
         update={
             "ambient_probability": 0.0,
+            # См. _config_ambient_always: сценарий на три сообщения, дефолт теперь два.
+            "live_talk": cfg.behaviour.live_talk.model_copy(update={"min_messages": 3}),
             # semantic=False: проверяется именно кубик, иначе pick_reaction его
             # пропускает и probability ни на что не влияет.
             "reactions": cfg.behaviour.reactions.model_copy(
@@ -743,10 +754,12 @@ async def test_gate_dice_drop_with_probability_one_reacts(
 
     summary = dict(await db.filter_log_summary(0))
     assert summary.get("gate:dice") == 1
-    assert len(bot.calls) == 1
-    _, _, reaction = bot.calls[0]
+    # Первые два сообщения пачки — gate:not_live, и они тоже дают право на реакцию
+    # (с 22.09.2026), поэтому проверяем именно реакцию на сообщение с кубиком.
+    dice_calls = [call for call in bot.calls if call[1] == 302]
+    assert len(dice_calls) == 1
+    _, _, reaction = dice_calls[0]
     assert reaction[0].emoji in cfg.behaviour.reactions.emoji  # type: ignore[index]
-    assert dict(await db.filter_log_summary(0)).get("react:sent") == 1
 
 
 async def test_gate_dice_drop_with_probability_zero_does_not_react(
@@ -800,10 +813,12 @@ async def test_gate_dice_drop_schedules_delayed_reaction(
     await _send_live_talk(handler)
 
     assert bot.calls == []  # немедленной реакции больше нет
-    assert len(scheduler.calls) == 1
-    call = scheduler.calls[0]
+    # not_live-сообщения пачки тоже уходят в планировщик (см. соседний тест), берём
+    # задачу именно для сообщения с кубиком.
+    dice_calls = [call for call in scheduler.calls if call["tg_message_id"] == 302]
+    assert len(dice_calls) == 1
+    call = dice_calls[0]
     assert call["chat_id"] == OWN_CHAT_ID
-    assert call["tg_message_id"] == 302
     assert call["text"] == "погода класс"
     assert call["display_name"] == "Дима"
     assert dict(await db.filter_log_summary(0)).get("react:sent") is None
@@ -824,11 +839,10 @@ async def test_gate_dice_drop_does_not_schedule_when_pick_reaction_says_no(
     assert scheduler.calls == []
 
 
-async def test_gate_not_live_drop_does_not_react(
-    db: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """DROP по детерминированной причине (gate:not_live, не gate:dice/gate:ambient_cooldown)
-    никогда не ставит реакцию, даже при probability=1.0."""
+async def test_gate_not_live_drop_reacts(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    """gate:not_live с 22.09.2026 входит в REACT_REASONS: это самая частая причина
+    отказа, и без неё в медленном чате реакций не появлялось вовсе. Причины, которых
+    в REACT_REASONS нет (gate:night и прочие), по-прежнему молчат — tests/test_reactions.py."""
     cfg = _config_dice_drop(reaction_probability=1.0)
     settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
     bot = _FakeReactionBot()
@@ -844,7 +858,7 @@ async def test_gate_not_live_drop_does_not_react(
 
     summary = dict(await db.filter_log_summary(0))
     assert summary.get("gate:not_live") == 1
-    assert bot.calls == []
+    assert len(bot.calls) == 1
 
 
 # --- Дешёвая проверка "это мне?" в горячем окне (followup.py) ---

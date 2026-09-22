@@ -702,7 +702,8 @@ class ReactionsConfig(BaseModel):
 # механизмом, что filters.topic_stop (yaml.safe_load строки-значения).
 
 # reactions.py
-REACT_REASONS: frozenset[str] = frozenset({"gate:dice", "gate:ambient_cooldown"})
+REACT_REASONS: frozenset[str] = frozenset({"gate:dice", "gate:ambient_cooldown", "gate:not_live",
+                                           "followup:name_no"})   # not_live добавлена 22.09.2026
 
 @dataclass(frozen=True, slots=True)
 class ReactionState:
