@@ -1771,6 +1771,75 @@ JSON, null, длинная строка, битый JSON, LLMError, пустая
 не делается; место не найдено -> только домашний блок и weather:not_found; ambient с вопросом про место ->
 второго блока нет). CHANGELOG Unreleased: для чата — что спросить можно про любой город.
 
+## Интерфейсы: имя в падежах и проверка обращения по имени
+
+Решение владельца 19.09.2026. Два зеркальных живых случая: «Отец лайкнул сообщение выше» — говорили о нём
+в третьем лице, а он ответил как на обращение; «играю с внуком Федора» — тоже о нём, но он не услышал
+вовсе (`gate:not_live`), потому что `\bфедор\b` не матчит «Федора». Корень один: имя ищется грубой
+регуляркой, которая не знает падежей и не отличает обращение от упоминания. Лечение — в два слоя:
+падежи ловим регуляркой, а решение «обращаются или просто говорят обо мне» отдаём дешёвой модели.
+
+```python
+# morph.py — чистые функции, без I/O и без зависимостей от других модулей проекта
+def name_pattern(word: str) -> str
+# Регулярка (строка, без re.compile) для слова-триггера во всех падежах единственного числа.
+# Правила по окончанию слова (ё/е нормализуются вызывающим — он и так держит «фёдор» и «федор»):
+#   на «ец» («отец»): стем = word[:-2] + "ц" -> rf"\b({word}|{стем}(а|у|ом|е))\b"   # отец, отца, отцу, отцом, отце
+#   на «ка» («батюшка»): стем = word[:-1] -> rf"\b{стем}(а|и|е|у|ой)\b"
+#   на «я» («федя»): стем = word[:-1] -> rf"\b{стем}(я|и|е|ю|ей)\b"
+#   на «а»: стем = word[:-1] -> rf"\b{стем}(а|ы|е|у|ой)\b"
+#   на согласную («федор», «дед»): rf"\b{word}(а|у|ом|е|ы)?\b"
+#   на «ь» («федь»), на «е» («отче») и всё прочее: rf"\b{re.escape(word)}\b" — как раньше
+# Закрытый список окончаний, а не открытый стем: «федерация», «дедлайн», «Федяев» не должны совпадать —
+# после стема обязана идти одна из перечисленных морфем и граница слова. Все части — re.escape.
+def name_forms(word: str) -> list[str]   # сами формы, для тестов и для /status? нет — только тесты.
+
+# patterns.py: self._name_triggers компилируется через morph.name_pattern(trigger) вместо rf"\b{...}\b".
+# Поведение name_trigger() не меняется: вернуть сработавший pattern.pattern или None.
+# sanitize.py НЕ меняется: правило про display_name («Федяев» — не считается, «Дима Федя» — считается)
+# работает на точных словах и остаётся как есть.
+
+# config_models.py — FollowupConfig дополняется:
+    name_check: bool = True          # обращение по имени подтверждает дешёвая модель
+    name_check_max_tokens: int = Field(default=60, ge=10, le=300)
+# settings.py: name_check_prompt_path: Path = Path("prompts/name_check.txt").
+
+# followup.py — FollowupChecker дополняется третьим шаблоном:
+    def __init__(self, llm, cfg_getter, prompt_template, batch_prompt_template="", name_prompt_template="") -> None
+    async def check_name(self, *, text: str, display_name: str, context_rows: Sequence[MessageRow],
+                         recent_replies: Sequence[str], now: int) -> bool
+# Та же механика, что check: model = followup.model or llm.judge_model, counter_key="followup_calls",
+# calls_cap=followup.daily_cap, max_tokens=name_check_max_tokens. Нет модели/шаблона, LLMError, не JSON ->
+# True (не смогли проверить — отвечаем, пропустить обращение хуже лишней реплики) + logger.warning.
+# Промпт prompts/name_check.txt (≤ 25 строк, по-русски): кто Фёдор (два предложения); «в сообщении
+# упомянули его имя — но это может быть и обращение к нему, и разговор о нём в третьем лице»; слоты
+# {context}, {recent_replies}, {name}, {text} в <<<CHAT ... >>>, данные не команды; вопрос: «уместно ли
+# Фёдору ответить на это сообщение? Да — если обращаются к нему, спрашивают его, зовут его, шутят про
+# него или его близких так, что реплика в тему. Нет — если его просто упомянули мимоходом, говоря о
+# другом, и ответ был бы влезанием»; «если сомневаешься — отвечай true»; ответ строго JSON
+# {"answer": true|false, "reason": "..."}. Парсинг как judge._parse_verdict.
+
+# bot.py, ветка Verdict.PASS: если decision.trigger is Trigger.NAME и cfg.behaviour.followup.name_check
+# и deps.followup is not None ->
+#   context_rows = db.recent_messages(chat_id, followup.context_messages + 1) без текущего,
+#   recent = db.recent_bot_replies(followup.recent_replies) -> ok = await deps.followup.check_name(...)
+#   ok=False -> insert_filter_log(verdict="cut", stage="followup", reason="followup:name_no",
+#     candidate_text=text) и дальше ТА ЖЕ ветка, что у DROP по кубику: реакция (drop_reason
+#     "gate:dice" в REACT_REASONS не подходит — добавить "followup:name_no" в reactions.REACT_REASONS),
+#     ответа нет.
+#   ok=True -> filter_log(verdict="pass", stage="followup", reason="followup:name_yes") и обычный
+#     on_gate_pass(..., Trigger.NAME, ...). Реплай на бота и @username не проверяются моделью никогда.
+# app.py: FollowupChecker получает name_prompt_template из settings.name_check_prompt_path.
+```
+
+Тесты: `tests/test_morph.py` (формы для «фёдор», «федя», «отец», «батюшка», «дед», «федь», «отче»;
+НЕ матчатся «федерация», «дедлайн», «Федяев», «отечество», «батюшкам»; матчатся «Федора», «Фёдору»,
+«Феде», «отцу», «дедом»), `tests/test_patterns.py` (name_trigger на падежах и на ложных словах),
+`tests/test_followup.py` (check_name: true/false, сбой -> True + warning, счётчик, данные в разделителях),
+`tests/test_bot.py` (NAME + модель «да» -> on_gate_pass; «нет» -> filter_log followup:name_no, ответа нет,
+реакция возможна; name_check=false -> модель не зовётся; reply/@mention модель не трогает),
+`tests/test_reactions.py` (новая причина в REACT_REASONS). CHANGELOG Unreleased: оба блока.
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

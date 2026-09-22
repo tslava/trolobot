@@ -24,6 +24,7 @@ from trolobot.config_models import Config, ReactionsConfig
 from trolobot.db import Database, MessageRow
 from trolobot.llm import LLMClient
 from trolobot.reactions import (
+    REACT_REASONS,
     ReactionChooser,
     ReactionScheduler,
     ReactionState,
@@ -80,6 +81,18 @@ def test_pick_reaction_wrong_reason_returns_none() -> None:
         drop_reason="gate:not_live", user_id=USER_A, state=_state(), cfg=cfg, rng=rng, now=NOW
     )
     assert result is None
+
+
+def test_pick_reaction_name_no_is_a_react_reason() -> None:
+    """Отказ модели считать упоминание имени обращением (CLAUDE.md, "имя в падежах")
+    — тоже повод хмыкнуть реакцией вместо полного молчания."""
+    assert "followup:name_no" in REACT_REASONS
+    cfg = _cfg(probability=1.0)
+    rng = random.Random(1)
+    result = pick_reaction(
+        drop_reason="followup:name_no", user_id=USER_A, state=_state(), cfg=cfg, rng=rng, now=NOW
+    )
+    assert result in cfg.emoji
 
 
 def test_pick_reaction_daily_cap_returns_none() -> None:

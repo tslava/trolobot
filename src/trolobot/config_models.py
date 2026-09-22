@@ -273,6 +273,13 @@ class FollowupConfig(BaseModel):
     recent_replies: int = Field(
         default=3, ge=1, le=10, description="Сколько последних реплик Фёдора дать проверке"
     )
+    name_check: bool = Field(
+        default=True,
+        description="Обращение по имени подтверждает дешёвая модель, а не только регулярка",
+    )
+    name_check_max_tokens: int = Field(
+        default=60, ge=10, le=300, description="Лимит токенов ответа проверки обращения по имени"
+    )
 
     @field_validator("model")
     @classmethod

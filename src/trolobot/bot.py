@@ -20,7 +20,7 @@ from aiogram.types import Message
 
 from trolobot.chat_memory import ChatMemorizer
 from trolobot.config_models import Config
-from trolobot.db import Database
+from trolobot.db import Database, MessageRow
 from trolobot.followup import FollowupChecker
 from trolobot.gate import should_consider
 from trolobot.gate_state import load_gate_state
@@ -242,6 +242,73 @@ async def _describe_photo(
     return photo_text(description, caption)
 
 
+async def _followup_inputs(
+    deps: Deps, cfg: Config, gate_message: GateMessage
+) -> tuple[list[MessageRow], list[str]]:
+    """Контекст для дешёвой проверки: последние сообщения чата БЕЗ текущего (оно
+    уже записано insert_message) и последние реплики бота. Общее для проверки
+    «это мне?» в горячем окне и проверки обращения по имени."""
+    followup_cfg = cfg.behaviour.followup
+    rows = await deps.db.recent_messages(gate_message.chat_id, followup_cfg.context_messages + 1)
+    context_rows = [row for row in rows if row.tg_message_id != gate_message.tg_message_id]
+    recent_replies = await deps.db.recent_bot_replies(followup_cfg.recent_replies)
+    return context_rows, recent_replies
+
+
+async def _maybe_react(
+    deps: Deps,
+    cfg: Config,
+    *,
+    gate_message: GateMessage,
+    user_id: int,
+    display_name: str,
+    text: str,
+    reason: str,
+    now: int,
+) -> None:
+    """Реакция вместо полного молчания (CLAUDE.md, "Интерфейсы: реакции") — только
+    на недетерминированные причины из ``REACT_REASONS`` (кости, кулдаун ambient,
+    отказ модели считать упоминание имени обращением) и только в разрешённом чате
+    (вызывается уже после проверок chat_id в хендлере). Решение живёт снаружи
+    гейта, ``gate.py`` не меняется."""
+    if reason not in REACT_REASONS or deps.bot is None:
+        return
+    tz = cfg.persona.timezone
+    rstate = await load_reaction_state(deps.db, tz, now)
+    emoji = pick_reaction(
+        drop_reason=reason,
+        user_id=user_id,
+        state=rstate,
+        cfg=cfg.behaviour.reactions,
+        rng=deps.rng,
+        now=now,
+    )
+    if emoji is None:
+        return
+    if deps.reaction_scheduler is not None:
+        # Реакция уходит в фон: пауза "прочитал и хмыкнул", после неё —
+        # перепроверка условий и выбор эмодзи моделью. Хендлер при этом не ждёт
+        # (иначе чат стоял бы минуту).
+        deps.reaction_scheduler.schedule(
+            chat_id=gate_message.chat_id,
+            tg_message_id=gate_message.tg_message_id,
+            user_id=user_id,
+            text=text,
+            display_name=display_name,
+        )
+        return
+    await react(
+        deps.bot,
+        deps.db,
+        chat_id=gate_message.chat_id,
+        tg_message_id=gate_message.tg_message_id,
+        user_id=user_id,
+        emoji=emoji,
+        tz=tz,
+        now=now,
+    )
+
+
 def build_router(deps: Deps) -> Router:
     """Собирает Router с единственным хендлером на сообщения чужого/своего чата.
 
@@ -401,16 +468,7 @@ def build_router(deps: Deps) -> Router:
                     # признал ambient-репликой — дешёвая проверка решает, не
                     # адресовано ли оно боту всё же. context_rows без текущего
                     # сообщения (оно уже записано insert_message выше).
-                    followup_cfg = cfg.behaviour.followup
-                    context_rows = await deps.db.recent_messages(
-                        gate_message.chat_id, followup_cfg.context_messages + 1
-                    )
-                    context_rows = [
-                        row
-                        for row in context_rows
-                        if row.tg_message_id != gate_message.tg_message_id
-                    ]
-                    recent_replies = await deps.db.recent_bot_replies(followup_cfg.recent_replies)
+                    context_rows, recent_replies = await _followup_inputs(deps, cfg, gate_message)
                     addressed = await deps.followup.check(
                         text=text,
                         display_name=display_name,
@@ -454,44 +512,16 @@ def build_router(deps: Deps) -> Router:
                     created_at=now,
                 )
                 logger.debug("gate drop: %s (%s)", decision.reason, gate_message.tg_message_id)
-                if decision.reason in REACT_REASONS and deps.bot is not None:
-                    # Реакция вместо полного молчания — только на недетерминированные
-                    # причины (gate:dice/gate:ambient_cooldown), только в разрешённом
-                    # чате (эта ветка недостижима в discovery mode и для чужого чата —
-                    # см. проверки выше). Решение живёт снаружи гейта, gate.py не меняется.
-                    tz = cfg.persona.timezone
-                    rstate = await load_reaction_state(deps.db, tz, now)
-                    emoji = pick_reaction(
-                        drop_reason=decision.reason,
-                        user_id=user_id,
-                        state=rstate,
-                        cfg=cfg.behaviour.reactions,
-                        rng=deps.rng,
-                        now=now,
-                    )
-                    if emoji is not None:
-                        if deps.reaction_scheduler is not None:
-                            # Реакция уходит в фон: пауза "прочитал и хмыкнул", после
-                            # неё — перепроверка условий и выбор эмодзи моделью.
-                            # Хендлер при этом не ждёт (иначе чат стоял бы минуту).
-                            deps.reaction_scheduler.schedule(
-                                chat_id=gate_message.chat_id,
-                                tg_message_id=gate_message.tg_message_id,
-                                user_id=user_id,
-                                text=text,
-                                display_name=display_name,
-                            )
-                        else:
-                            await react(
-                                deps.bot,
-                                deps.db,
-                                chat_id=gate_message.chat_id,
-                                tg_message_id=gate_message.tg_message_id,
-                                user_id=user_id,
-                                emoji=emoji,
-                                tz=tz,
-                                now=now,
-                            )
+                await _maybe_react(
+                    deps,
+                    cfg,
+                    gate_message=gate_message,
+                    user_id=user_id,
+                    display_name=display_name,
+                    text=text,
+                    reason=decision.reason,
+                    now=now,
+                )
             elif decision.verdict is Verdict.QUEUE_NIGHT:
                 await deps.db.enqueue_night(
                     tg_message_id=gate_message.tg_message_id,
@@ -529,7 +559,59 @@ def build_router(deps: Deps) -> Router:
                         gate_message.tg_message_id,
                         decision.reason,
                     )
-                elif deps.responder is not None:
+                    return
+                if (
+                    decision.trigger is Trigger.NAME
+                    and cfg.behaviour.followup.name_check
+                    and deps.followup is not None
+                ):
+                    # Имя ловится во всех падежах (CLAUDE.md, "имя в падежах"), но
+                    # регулярка не отличает обращение от разговора о нём в третьем
+                    # лице («отец вчера лайкнул сообщение выше»). Решает дешёвая
+                    # модель; она же — единственная проверка, которой подвергается
+                    # имя: реплай на бота и @username не проверяются никогда.
+                    context_rows, recent_replies = await _followup_inputs(deps, cfg, gate_message)
+                    addressed = await deps.followup.check_name(
+                        text=text,
+                        display_name=display_name,
+                        context_rows=context_rows,
+                        recent_replies=recent_replies,
+                        now=now,
+                    )
+                    if not addressed:
+                        await deps.db.insert_filter_log(
+                            trigger_tg_message_id=gate_message.tg_message_id,
+                            candidate_text=text,
+                            verdict="cut",
+                            stage="followup",
+                            reason="followup:name_no",
+                            shadow=False,
+                            created_at=now,
+                        )
+                        logger.info("name check: not addressed, %s", text[:_LOG_TEXT_MAX_LEN])
+                        # Дальше — та же ветка, что у DROP по кубику: ответа нет, но
+                        # хмыкнуть реакцией можно (причина есть в REACT_REASONS).
+                        await _maybe_react(
+                            deps,
+                            cfg,
+                            gate_message=gate_message,
+                            user_id=user_id,
+                            display_name=display_name,
+                            text=text,
+                            reason="followup:name_no",
+                            now=now,
+                        )
+                        return
+                    await deps.db.insert_filter_log(
+                        trigger_tg_message_id=gate_message.tg_message_id,
+                        candidate_text=None,
+                        verdict="pass",
+                        stage="followup",
+                        reason="followup:name_yes",
+                        shadow=False,
+                        created_at=now,
+                    )
+                if deps.responder is not None:
                     await deps.responder.on_gate_pass(gate_message, decision.trigger, display_name)
                 else:
                     logger.info("gate pass: %s (%s)", decision.trigger, text[:_LOG_TEXT_MAX_LEN])

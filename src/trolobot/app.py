@@ -154,8 +154,17 @@ async def main() -> None:
             checkin_prefilter_prompt = settings.checkin_prefilter_prompt_path.read_text(
                 encoding="utf-8"
             )
+            # Подтверждение обращения по имени (CLAUDE.md, "имя в падежах и
+            # проверка обращения по имени") — тот же чекер, третий промпт: имя
+            # в любом падеже нашла регулярка, а обращение это или разговор о
+            # нём в третьем лице, решает дешёвая модель.
+            name_check_prompt = settings.name_check_prompt_path.read_text(encoding="utf-8")
             followup_checker = FollowupChecker(
-                llm, config_store.get, followup_prompt, checkin_prefilter_prompt
+                llm,
+                config_store.get,
+                followup_prompt,
+                checkin_prefilter_prompt,
+                name_check_prompt,
             )
             deps.followup = followup_checker
 
