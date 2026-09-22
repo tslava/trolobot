@@ -472,7 +472,7 @@ def test_ambient_does_not_bypass_logistics() -> None:
 
 
 def test_not_live_too_few_messages() -> None:
-    decision = default_call(state=make_state(recent=LIVE_RECENT[:2]))
+    decision = default_call(state=make_state(recent=LIVE_RECENT[:1]))
     assert decision.verdict == Verdict.DROP
     assert decision.reason == "gate:not_live"
 

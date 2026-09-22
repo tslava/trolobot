@@ -13,10 +13,10 @@ behaviour:
 
   # ambient — сам заговаривает, только в живой разговор
   live_talk:                           # что считается живым разговором
-    min_messages: 3
+    min_messages: 2
     min_people: 2
-    window_min: 10
-  ambient_probability: 0.15            # шанс на сообщение внутри живого разговора
+    window_min: 20
+  ambient_probability: 0.25            # шанс на сообщение внутри живого разговора
   chat_cooldown_min: 25                # между ambient-репликами
   daily_cap: 3                         # ambient и «просто так» вместе, в сутки; сутки по timezone
 
@@ -48,7 +48,7 @@ behaviour:
   # не подмешивается никогда (дороже основной запрос не нужен, скорость не важна)
   stickers:
     enabled: true
-    min_replies_between: 4             # сколько текстовых реплик должно пройти после стикера
+    min_replies_between: 2             # сколько текстовых реплик должно пройти после стикера
     daily_cap: 1                       # не больше одного стикера в день (решение владельца)
     recent_window: 10                  # столько последних использованных стикеров не повторять
     model: ""                          # пусто -> llm.judge_model (та же дешёвая модель, что судья)

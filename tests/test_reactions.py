@@ -78,7 +78,7 @@ def test_pick_reaction_wrong_reason_returns_none() -> None:
     cfg = _cfg(probability=1.0)
     rng = random.Random(1)
     result = pick_reaction(
-        drop_reason="gate:not_live", user_id=USER_A, state=_state(), cfg=cfg, rng=rng, now=NOW
+        drop_reason="gate:night", user_id=USER_A, state=_state(), cfg=cfg, rng=rng, now=NOW
     )
     assert result is None
 

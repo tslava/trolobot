@@ -115,7 +115,7 @@ def test_config_builds_with_defaults_without_yaml() -> None:
     cfg = Config()
 
     assert cfg.persona.birth_date == date(1974, 4, 12)
-    assert cfg.behaviour.ambient_probability == 0.15
+    assert cfg.behaviour.ambient_probability == 0.25
 
 
 def test_override_changes_value_and_coerces_int() -> None:
