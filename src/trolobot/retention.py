@@ -30,6 +30,11 @@ class _RetentionDiary(Protocol):
     def keep_days(self) -> int: ...
 
 
+class _RetentionCallback(Protocol):
+    @property
+    def max_age_days(self) -> int: ...
+
+
 class _RetentionBehaviour(Protocol):
     # Свойства, а не атрибуты: mypy проверяет атрибуты Protocol инвариантно
     # и не принял бы BehaviourConfig на месте _RetentionBehaviour.
@@ -39,6 +44,8 @@ class _RetentionBehaviour(Protocol):
     def chat_memory(self) -> _RetentionChatMemory: ...
     @property
     def diary(self) -> _RetentionDiary: ...
+    @property
+    def callback(self) -> _RetentionCallback: ...
 
 
 class _RetentionPersona(Protocol):
@@ -60,6 +67,7 @@ async def run_retention(
     now: int,
     chat_memory_keep_days: int | None = None,
     diary_keep_days: int | None = None,
+    callback_max_age_days: int | None = None,
 ) -> PurgeStats:
     """Удаляет из БД всё, что старше `retention_days` относительно `now`, и логирует итоги.
 
@@ -72,6 +80,9 @@ async def run_retention(
     аргументами).
 
     `diary_keep_days` — срок фактов дневника дня (CLAUDE.md, "дневник дня"); None — не трогаем.
+
+    Шутки чата живут тот же срок, что пересказы (`chat_memory_keep_days`); истории людей —
+    `callback_max_age_days` (CLAUDE.md, "шутки чата и истории людей"); None — не трогаем.
     """
     cutoff = now - retention_days * 86400
     stats = await db.purge_older_than(cutoff, tz)
@@ -79,10 +90,16 @@ async def run_retention(
         chat_memory_deleted = await db.purge_chat_memory_older_than(
             now - chat_memory_keep_days * 86400
         )
-        stats = replace(stats, chat_memory_deleted=chat_memory_deleted)
+        jokes_deleted = await db.purge_jokes_older_than(now - chat_memory_keep_days * 86400)
+        stats = replace(stats, chat_memory_deleted=chat_memory_deleted, jokes_deleted=jokes_deleted)
     if diary_keep_days is not None:
         self_facts_deleted = await db.purge_self_facts_older_than(now - diary_keep_days * 86400)
         stats = replace(stats, self_facts_deleted=self_facts_deleted)
+    if callback_max_age_days is not None:
+        threads_deleted = await db.purge_people_threads_older_than(
+            now - callback_max_age_days * 86400
+        )
+        stats = replace(stats, threads_deleted=threads_deleted)
     total = (
         stats.messages
         + stats.night_queue
@@ -91,11 +108,13 @@ async def run_retention(
         + stats.state_keys
         + stats.chat_memory_deleted
         + stats.self_facts_deleted
+        + stats.jokes_deleted
+        + stats.threads_deleted
     )
     if total:
         logger.info(
             "retention purge: messages=%d night_queue=%d pending_replies=%d "
-            "filter_log_texts=%d state_keys=%d chat_memory=%d self_facts=%d",
+            "filter_log_texts=%d state_keys=%d chat_memory=%d self_facts=%d jokes=%d threads=%d",
             stats.messages,
             stats.night_queue,
             stats.pending_replies,
@@ -103,6 +122,8 @@ async def run_retention(
             stats.state_keys,
             stats.chat_memory_deleted,
             stats.self_facts_deleted,
+            stats.jokes_deleted,
+            stats.threads_deleted,
         )
     return stats
 
@@ -124,7 +145,13 @@ async def retention_loop(
             keep_days = cfg.behaviour.chat_memory.keep_days
             diary_keep_days = cfg.behaviour.diary.keep_days
             await run_retention(
-                db, retention_days, tz, int(time.time()), keep_days, diary_keep_days
+                db,
+                retention_days,
+                tz,
+                int(time.time()),
+                keep_days,
+                diary_keep_days,
+                cfg.behaviour.callback.max_age_days,
             )
         except asyncio.CancelledError:
             logger.info("retention_loop: cancelled, stopping")

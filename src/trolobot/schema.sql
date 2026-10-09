@@ -145,6 +145,26 @@ CREATE TABLE self_facts (
     created_at INTEGER NOT NULL
 );
 
+-- Шутки чата и истории людей (CLAUDE.md, "шутки чата и истории людей") — их достаёт
+-- недельный ChatMemorizer; шутки живут chat_memory.keep_days, истории — callback.max_age_days.
+CREATE TABLE chat_jokes (
+    id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL,                       -- дословно, <= 80 символов
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER,
+    uses INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE people_threads (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    display_name TEXT NOT NULL,
+    text TEXT NOT NULL,                       -- «ждёт ответа после собеседования», <= 120 символов
+    created_at INTEGER NOT NULL,
+    asked_at INTEGER,                         -- NULL: ещё не спрашивал
+    closed INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX idx_messages_chat_created ON messages (chat_id, created_at);
 CREATE INDEX idx_messages_tg_message_id ON messages (tg_message_id);
 CREATE INDEX idx_bot_replies_created ON bot_replies (created_at);
@@ -154,4 +174,4 @@ CREATE INDEX idx_pending_replies_done_due ON pending_replies (done_at, due_at);
 CREATE INDEX idx_chat_memory_period_end ON chat_memory (period_end);
 CREATE INDEX idx_self_facts_created ON self_facts (created_at);
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

@@ -5732,3 +5732,596 @@ async def test_diary_say_blocked_by_panic_does_not_extract(db: Database) -> None
     finally:
         await responder.shutdown()
         await llm.aclose()
+
+
+# --- шутки чата и «ну как там?» (CLAUDE.md, "шутки чата и истории людей") -----------
+
+PROMPT_TEMPLATE_WITH_JOKES = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "{chat_memory}\n"
+    "{jokes}\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{situation}"
+)
+
+
+async def test_jokes_slot_filled_and_cooled_down_joke_hidden(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    await db.insert_joke(text="опять Ильины гвозди", created_at=DAY_NOW - 3 * 86400)
+    cooled = await db.insert_joke(text="про теплицу", created_at=DAY_NOW - 4 * 86400)
+    await db.mark_joke_used(cooled, DAY_NOW - 86400)
+    responder = _make_responder(
+        db, cfg, llm, bot, clock, prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_JOKES)
+    )
+    try:
+        await _ambient(clock, responder)
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Шутки и словечки вашего чата" in system
+        assert "«опять Ильины гвозди»" in system
+        assert "про теплицу" not in system
+        assert "{jokes}" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_jokes_slot_empty_without_jokes_or_when_disabled(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _varied_responses("Бывает.", "Ну да, бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db, cfg, llm, bot, clock, prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_JOKES)
+    )
+    try:
+        await _ambient(clock, responder)
+        await db.insert_joke(text="опять Ильины гвозди", created_at=DAY_NOW - 86400)
+        cfg.behaviour.jokes.enabled = False
+        await _ambient(clock, responder)
+
+        for call in calls:
+            system = _payload(call)["messages"][0]["content"]  # type: ignore[index]
+            assert "Шутки и словечки" not in system
+            assert "{jokes}" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_joke_marked_used_after_text_send_only_for_matching_joke(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Ну вот, опять Ильины гвозди."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    used_id = await db.insert_joke(text="опять Ильины гвозди", created_at=DAY_NOW - 86400)
+    other_id = await db.insert_joke(text="про теплицу", created_at=DAY_NOW - 86400)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _ambient(clock, responder)
+
+        assert len(bot.sent) == 1
+        rows = {row.id: row for row in await db.jokes(10)}
+        assert rows[used_id].last_used_at == DAY_NOW
+        assert rows[used_id].uses == 1
+        assert rows[other_id].last_used_at is None
+        assert rows[other_id].uses == 0
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_joke_not_marked_when_nothing_sent(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _silent_response())
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    joke_id = await db.insert_joke(text="опять Ильины гвозди", created_at=DAY_NOW - 86400)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _ambient(clock, responder)
+
+        assert bot.sent == []
+        assert (await db.jokes(10))[0].id == joke_id
+        assert (await db.jokes(10))[0].uses == 0
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- callback: «ну как там?» ---
+
+CALLBACK_AUTHOR_ID = 5
+
+
+async def _callback_setup(
+    db_: Database,
+    *,
+    thread_age_days: int = 3,
+    author_last_msg_ago_sec: int = 3600,
+    name: str = "Дима",
+    text: str = "ждёт ответа после собеседования",
+) -> int:
+    """Тред автора, который недавно писал в чат, и сам факт его сообщения."""
+    await _insert_message(
+        db_,
+        tg_message_id=900,
+        user_id=CALLBACK_AUTHOR_ID,
+        display_name=name,
+        text="всем привет",
+        created_at=DAY_NOW - author_last_msg_ago_sec,
+    )
+    return await db_.insert_people_thread(
+        user_id=CALLBACK_AUTHOR_ID,
+        display_name=name,
+        text=text,
+        created_at=DAY_NOW - thread_age_days * 86400,
+    )
+
+
+async def _assert_callback_untouched(db_: Database, thread_id: int, calls: list[object]) -> None:
+    assert calls == []
+    assert [t.id for t in await db_.open_people_threads()] == [thread_id]
+    assert await db_.get_state("callback_last_at") is None
+
+
+async def test_maybe_callback_sends_question_and_closes_thread(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Дима, чем кончилось?"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        thread_id = await _callback_setup(db)
+
+        await _drive(clock, responder._maybe_callback())
+
+        assert len(calls) == 1
+        assert bot.sent == [(CHAT_ID, "Дима, чем кончилось?", None)]  # без реплая
+        user_message = _payload(calls[0])["messages"][1]["content"]  # type: ignore[index]
+        assert "Несколько дней назад Дима говорил, что ждёт ответа после собеседования" in (
+            user_message
+        )
+        thread = (await db.people_threads_all())[0]
+        assert thread.id == thread_id
+        assert thread.closed is True
+        # время ушло вперёд на «набор текста», закрытие — уже после отправки
+        assert thread.asked_at is not None
+        assert thread.asked_at >= DAY_NOW
+        assert await db.get_state("callback_last_at") == str(thread.asked_at)
+
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:callback") == 1
+        replies = await db.last_bot_replies(1)
+        assert replies[0].trigger == "callback"
+        assert replies[0].text == "Дима, чем кончилось?"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_does_not_touch_counters_or_open_hot_window(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.hot_window.open_on_any_reply = True  # обычный триггер окно бы открыл
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Дима, чем кончилось?"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _callback_setup(db)
+
+        await _drive(clock, responder._maybe_callback())
+
+        assert len(bot.sent) == 1
+        tz = cfg.persona.timezone
+        for key in ("mention_count", "ambient_count", "sticker_count"):
+            assert await db.get_state(day_key(key, DAY_NOW, tz)) is None
+        assert await db.get_state("last_ambient_at") is None
+        assert await db.get_state("last_mention_reply_at") is None
+        assert await db.get_state(f"last_mention_reply_at:{CALLBACK_AUTHOR_ID}") is None
+        assert await db.get_state("hot_until") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_system_prompt_has_no_places_and_no_sticker(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Дима, чем кончилось?"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    chooser = FakeStickerChooser(Sticker(id=1, file_id="F", text="ок", enabled=True))
+    responder = _make_responder(db, cfg, llm, bot, clock, sticker_chooser=chooser)
+    try:
+        await _callback_setup(db)
+        await db.upsert_place(
+            PlaceRow(
+                place_id="p1",
+                name="Pub X",
+                district="Wilda",
+                category="pub",
+                rating=4.5,
+                reviews=100,
+                price_level=1,
+                quiet=1,
+                fact="тихо",
+                operational=1,
+                refreshed_at=DAY_NOW,
+            )
+        )
+
+        await _drive(clock, responder._maybe_callback())
+
+        user_message = _payload(calls[0])["messages"][1]["content"]  # type: ignore[index]
+        assert "Pub X" not in user_message
+        assert bot.sent_stickers == []
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_silence_closes_thread_and_sets_last_at(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _silent_response())
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _callback_setup(db)
+
+        await _drive(clock, responder._maybe_callback())
+
+        assert len(calls) == 1
+        assert bot.sent == []
+        assert await db.open_people_threads() == []
+        assert await db.get_state("callback_last_at") == str(DAY_NOW)
+        assert dict(await db.filter_log_summary(0)).get("llm:silent") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_filter_cut_closes_thread(db: Database) -> None:
+    cfg = _config()
+    # style:exclaim режет даже при shadow (enforce_stages), реплики нет, тред закрыт
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Дима! Ну как там!"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _callback_setup(db)
+
+        await _drive(clock, responder._maybe_callback())
+
+        assert bot.sent == []
+        assert await db.open_people_threads() == []
+        assert await db.get_state("callback_last_at") == str(DAY_NOW)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_llm_error_closes_thread(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: httpx.Response(500, json={}))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _callback_setup(db)
+
+        await _drive(clock, responder._maybe_callback())
+
+        assert len(calls) == 1
+        assert bot.sent == []
+        assert await db.open_people_threads() == []
+        assert await db.get_state("callback_last_at") == str(DAY_NOW)
+        assert dict(await db.filter_log_summary(0)).get("llm:http") == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_picks_oldest_eligible_and_skips_muted_and_inactive(
+    db: Database,
+) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Аня, чем кончилось?"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        # самый старый — замьюченного автора; следом — автор, давно не писавший
+        await _insert_message(
+            db, tg_message_id=1, user_id=11, display_name="Молчун", text="я тут",
+            created_at=DAY_NOW - 3600,
+        )  # fmt: skip
+        await db.add_mute(11, "Молчун", 999, DAY_NOW - 5000)
+        muted = await db.insert_people_thread(
+            user_id=11, display_name="Молчун", text="ремонт", created_at=DAY_NOW - 9 * 86400
+        )
+        await _insert_message(
+            db, tg_message_id=2, user_id=12, display_name="Тихий", text="давно писал",
+            created_at=DAY_NOW - 8 * 86400,
+        )  # fmt: skip
+        inactive = await db.insert_people_thread(
+            user_id=12, display_name="Тихий", text="поездка", created_at=DAY_NOW - 8 * 86400
+        )
+        await _insert_message(
+            db, tg_message_id=3, user_id=13, display_name="Аня", text="привет",
+            created_at=DAY_NOW - 7200,
+        )  # fmt: skip
+        eligible = await db.insert_people_thread(
+            user_id=13, display_name="Аня", text="выбирает машину", created_at=DAY_NOW - 5 * 86400
+        )
+        await db.insert_people_thread(
+            user_id=13, display_name="Аня", text="покупка", created_at=DAY_NOW - 4 * 86400
+        )
+
+        await _drive(clock, responder._maybe_callback())
+
+        assert len(calls) == 1
+        user_message = _payload(calls[0])["messages"][1]["content"]  # type: ignore[index]
+        assert "Аня говорил, что выбирает машину" in user_message
+        closed = {t.id for t in await db.people_threads_all() if t.closed}
+        assert closed == {eligible}
+        open_ids = {t.id for t in await db.open_people_threads()}
+        assert muted in open_ids
+        assert inactive in open_ids
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_closes_expired_thread_without_asking(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        thread_id = await _callback_setup(db, thread_age_days=15)
+
+        await responder._maybe_callback()
+
+        assert calls == []
+        assert bot.sent == []
+        thread = (await db.people_threads_all())[0]
+        assert thread.id == thread_id
+        assert thread.closed is True
+        # про просроченную историю не спрашивали — интервал между вопросами не ставится
+        assert await db.get_state("callback_last_at") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_no_open_threads_does_nothing(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        thread_id = await _callback_setup(db)
+        await db.close_people_thread(thread_id, DAY_NOW - 100)
+
+        await responder._maybe_callback()
+
+        assert calls == []
+        assert await db.get_state("callback_last_at") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_disabled(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.callback.enabled = False
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+
+        await responder._maybe_callback()
+
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_blocked_by_panic_and_stop(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+
+        await db.set_state("panic", "1")
+        await responder._maybe_callback()
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+
+        await db.delete_state("panic")
+        await db.set_state("stop_until", str(DAY_NOW + 1000))
+        await responder._maybe_callback()
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_blocked_by_topic_cooldown(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+        await db.set_state("topic_cooldown_until", str(DAY_NOW + 1000))
+
+        await responder._maybe_callback()
+
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_blocked_at_night(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(NIGHT_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+
+        await responder._maybe_callback()
+
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_blocked_outside_window(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    # 21:00 локального: вне callback.window (11:00-20:00), но и вне ночной тишины
+    clock = FakeClock(DAY_NOW + 6 * 3600)
+    responder = _make_responder(db, cfg, llm, FakeBot(), clock)
+    try:
+        thread_id = await _callback_setup(db)
+
+        await responder._maybe_callback()
+
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_respects_min_days(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+        await db.set_state("callback_last_at", str(DAY_NOW - 2 * 86400))
+
+        await responder._maybe_callback()
+
+        assert calls == []
+        assert [t.id for t in await db.open_people_threads()] == [thread_id]
+        assert await db.get_state("callback_last_at") == str(DAY_NOW - 2 * 86400)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_asks_again_after_min_days(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Дима, чем кончилось?"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _callback_setup(db)
+        await db.set_state("callback_last_at", str(DAY_NOW - 3 * 86400))
+
+        await _drive(clock, responder._maybe_callback())
+
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_waits_for_quiet_in_chat(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+        await _insert_message(
+            db, tg_message_id=901, user_id=6, display_name="Аня", text="ща пишу",
+            created_at=DAY_NOW - 60,
+        )  # fmt: skip
+
+        await responder._maybe_callback()
+
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_blocked_by_presence_cap(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+        # одно сообщение людей -> allowance 2; две реплики бота сегодня выбирают потолок
+        await _insert_bot_reply(db, created_at=DAY_NOW - 7200, tg_message_id=1)
+        await _insert_bot_reply(db, created_at=DAY_NOW - 3 * 3600, tg_message_id=2)
+
+        await responder._maybe_callback()
+
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_maybe_callback_blocked_by_min_gap(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        thread_id = await _callback_setup(db)
+        await _insert_bot_reply(db, created_at=DAY_NOW - 60)
+
+        await responder._maybe_callback()
+
+        await _assert_callback_untouched(db, thread_id, calls)  # type: ignore[arg-type]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_callback_job_survives_failing_iteration(
+    db: Database, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, FakeBot(), clock)
+    try:
+        state = {"calls": 0}
+
+        async def flaky() -> None:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise RuntimeError("callback is on fire")
+
+        monkeypatch.setattr(responder, "_maybe_callback", flaky)
+
+        task: asyncio.Task[None] = asyncio.ensure_future(responder.callback_job())
+        try:
+            with caplog.at_level(logging.ERROR):
+                await _tick_until(clock, lambda: state["calls"] >= 2)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "callback_job" in errors[0].message
+    finally:
+        await responder.shutdown()
+        await llm.aclose()

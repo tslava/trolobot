@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -51,7 +52,17 @@ _HEADER = "Что было в чате раньше, по неделям (тво
 _LT_RUN_RE = re.compile(r"<{3,}")
 _GT_RUN_RE = re.compile(r">{3,}")
 
-_SLOT_RE = re.compile(r"\{(period|chat)\}")
+_SLOT_RE = re.compile(r"\{(period|chat|limit)\}")
+
+# Шутки и истории людей (CLAUDE.md, "шутки чата и истории людей"): потолки длины
+# из контракта, токены ответа — шутки из контракта, истории — с запасом на JSON.
+_JOKE_MAX_LEN = 80
+_JOKES_MAX_TOKENS = 200
+_THREAD_MAX_LEN = 120
+_THREADS_MAX_TOKENS = 300
+_THREADS_MAX_PER_PERIOD = 5
+_EXISTING_JOKES_LOOKUP = 200
+_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 # Ведущие маркеры списка и нумерация, которые модель любит дописывать вопреки
 # инструкции. Срезаются: строка пересказа, начинающаяся с "- ", попала бы в
@@ -63,6 +74,38 @@ _JSON_RE = re.compile(r"json", re.IGNORECASE)
 
 def _strip_fake_delimiters(text: str) -> str:
     return _GT_RUN_RE.sub(" ", _LT_RUN_RE.sub(" ", text))
+
+
+def _parse_json_object(raw: str) -> dict[str, object] | None:
+    """Терпимый разбор ответа модели (как ``judge._parse_verdict``): срез ```json```
+    обёрток, первая "{" и ``raw_decode``. Любой сбой -> None."""
+    try:
+        candidate = raw.strip()
+        match = _CODE_FENCE_RE.match(candidate)
+        if match is not None:
+            candidate = match.group(1).strip()
+        start = candidate.find("{")
+        if start == -1:
+            return None
+        data, _end = json.JSONDecoder().raw_decode(candidate, start)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        # Ответ модели — недоверенный внешний текст: любой сбой разбора значит
+        # «ничего не нашли», а не падение.
+        return None
+
+
+def _clean_note(raw: object, max_len: int) -> str | None:
+    """Строка из ответа модели -> заметка для БД/промпта: без разделителей, буллета,
+    переносов; пусто или длиннее ``max_len`` (модель пересказала, а не сжала) -> None."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = normalize_text(_BULLET_RE.sub("", _strip_fake_delimiters(raw))).strip()
+    if not cleaned or len(cleaned) > max_len:
+        return None
+    return cleaned
 
 
 def _local_midnight(ts: int, tz: str) -> int:
@@ -147,6 +190,8 @@ class ChatMemorizer:
         chat_id: int,
         clock: Callable[[], int] = lambda: int(time.time()),
         interval_sec: int = _JOB_INTERVAL_SEC,
+        jokes_prompt: str = "",
+        threads_prompt: str = "",
     ) -> None:
         self._llm = llm
         self._db = db
@@ -155,6 +200,8 @@ class ChatMemorizer:
         self._chat_id = chat_id
         self._clock = clock
         self._interval_sec = interval_sec
+        self._jokes_prompt = jokes_prompt
+        self._threads_prompt = threads_prompt
 
     async def summarize_period(self, start: int, end: int, *, now: int) -> ChatMemoryRow | None:
         """Один вызов модели на период ``[start, end)``; строка в БД или None.
@@ -227,9 +274,126 @@ class ChatMemorizer:
             len(tail),
             len(text),
         )
+        # Два дополнительных вызова по тем же строкам периода. Пересказ уже сохранён,
+        # поэтому любой их сбой (кроме отмены) пересказ не ломает.
+        try:
+            await self._extract_jokes(cfg, model, start, end, chat_block, now)
+            await self._extract_threads(cfg, model, start, end, chat_block, muted, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("chat memory: извлечение шуток/историй упало")
         return ChatMemoryRow(
             id=memory_id, period_start=start, period_end=end, text=text, created_at=now
         )
+
+    async def _call_extra(
+        self,
+        template: str,
+        *,
+        model: str,
+        max_tokens: int,
+        period: str,
+        chat_block: str,
+        limit: int,
+        now: int,
+        what: str,
+    ) -> dict[str, object] | None:
+        slot_values = {"period": period, "chat": chat_block, "limit": str(limit)}
+        prompt = _SLOT_RE.sub(lambda m: slot_values[m.group(1)], template)
+        try:
+            result = await self._llm.call(
+                [{"role": "system", "content": prompt}],
+                model=model,
+                max_tokens=max_tokens,
+                now=now,
+            )
+        except LLMError as exc:
+            logger.warning("chat memory %s llm error: reason=%s", what, exc.reason)
+            return None
+        data = _parse_json_object(result.text)
+        if data is None:
+            logger.warning("chat memory %s: ответ модели не JSON", what)
+        return data
+
+    async def _extract_jokes(
+        self, cfg: Config, model: str, start: int, end: int, chat_block: str, now: int
+    ) -> None:
+        jokes_cfg = cfg.behaviour.jokes
+        if not (jokes_cfg.enabled and self._jokes_prompt and jokes_cfg.per_period > 0):
+            return
+        data = await self._call_extra(
+            self._jokes_prompt,
+            model=model,
+            max_tokens=_JOKES_MAX_TOKENS,
+            period=format_period(start, end, cfg.persona.timezone),
+            chat_block=chat_block,
+            limit=jokes_cfg.per_period,
+            now=now,
+            what="jokes",
+        )
+        raw_items = data.get("jokes") if data is not None else None
+        if not isinstance(raw_items, list):
+            return
+        known = {row.text.casefold() for row in await self._db.jokes(_EXISTING_JOKES_LOOKUP)}
+        saved = 0
+        for raw in raw_items:
+            joke = _clean_note(raw, _JOKE_MAX_LEN)
+            if joke is None or joke.casefold() in known:
+                continue
+            known.add(joke.casefold())
+            await self._db.insert_joke(text=joke, created_at=now)
+            saved += 1
+            if saved >= jokes_cfg.per_period:
+                break
+        logger.info("chat memory: шуток сохранено %d", saved)
+
+    async def _extract_threads(
+        self,
+        cfg: Config,
+        model: str,
+        start: int,
+        end: int,
+        chat_block: str,
+        muted: frozenset[int],
+        now: int,
+    ) -> None:
+        if not (cfg.behaviour.callback.enabled and self._threads_prompt):
+            return
+        data = await self._call_extra(
+            self._threads_prompt,
+            model=model,
+            max_tokens=_THREADS_MAX_TOKENS,
+            period=format_period(start, end, cfg.persona.timezone),
+            chat_block=chat_block,
+            limit=_THREADS_MAX_PER_PERIOD,
+            now=now,
+            what="threads",
+        )
+        raw_items = data.get("threads") if data is not None else None
+        if not isinstance(raw_items, list):
+            return
+        bot_names = {
+            name.casefold() for name in (cfg.persona.name, cfg.persona.display_name) if name
+        }
+        saved = 0
+        for item in raw_items[:_THREADS_MAX_PER_PERIOD]:
+            if not isinstance(item, dict):
+                continue
+            name = _clean_note(item.get("name"), _JOKE_MAX_LEN)
+            text = _clean_note(item.get("text"), _THREAD_MAX_LEN)
+            if name is None or text is None or name.casefold() in bot_names:
+                continue
+            # Только точное совпадение display_name среди сообщений периода: имя из
+            # ответа модели — не повод привязать историю к чужому человеку.
+            user_id = await self._db.user_id_by_display_name(self._chat_id, name, start)
+            if user_id is None or user_id in muted:
+                continue
+            await self._db.insert_people_thread(
+                user_id=user_id, display_name=name, text=text, created_at=now
+            )
+            saved += 1
+        logger.info("chat memory: историй сохранено %d", saved)
 
     async def run_due(self, *, now: int) -> list[ChatMemoryRow]:
         """Пересказывает все периоды, целиком уместившиеся до начала текущих суток.

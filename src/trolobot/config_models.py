@@ -543,6 +543,48 @@ class DiaryConfig(BaseModel):
         return value
 
 
+class JokesConfig(BaseModel):
+    """Шутки чата (CLAUDE.md, "шутки чата и истории людей"): недельный пересказ
+    достаёт словечки, которые чат подхватил, и они идут в системный промпт слотом {jokes}.
+    """
+
+    enabled: bool = Field(default=True, description="Включает память о общих шутках чата")
+    per_period: int = Field(
+        default=3, ge=0, le=10, description="Сколько шуток доставать из одного недельного периода"
+    )
+    in_prompt: int = Field(
+        default=6, ge=0, le=30, description="Сколько шуток класть в системный промпт"
+    )
+    cooldown_days: int = Field(
+        default=5, ge=0, le=60, description="Сколько суток не показывать уже использованную шутку"
+    )
+
+
+class CallbackConfig(BaseModel):
+    """«Ну как там?» (CLAUDE.md, "шутки чата и истории людей"): через несколько дней
+    персонаж сам спрашивает человека, чем кончилась история, о которой тот говорил.
+    """
+
+    enabled: bool = Field(default=True, description="Включает вопросы «ну как там?» людям")
+    min_days: int = Field(
+        default=3, ge=1, le=30, description="Не чаще одного вопроса «ну как там?» в столько суток"
+    )
+    max_age_days: int = Field(
+        default=14, ge=1, le=90, description="История старше этого срока в сутках не спрашивается"
+    )
+    author_active_days: int = Field(
+        default=7, ge=1, le=60, description="Автор истории должен писать в чат за столько суток"
+    )
+    window: tuple[str, str] = Field(
+        default=("11:00", "20:00"), description="Окно локального времени HH:MM для вопроса"
+    )
+
+    @field_validator("window")
+    @classmethod
+    def _validate_window(cls, value: tuple[str, str]) -> tuple[str, str]:
+        return (_validate_hhmm(value[0]), _validate_hhmm(value[1]))
+
+
 class VisionConfig(BaseModel):
     """Зрение на фото (CLAUDE.md, "Интерфейсы: зрение на фото"). Снимок из чата
     описывается моделью со зрением одной-двумя фразами, и описание становится
@@ -695,6 +737,14 @@ class BehaviourConfig(BaseModel):
     diary: DiaryConfig = Field(
         default_factory=DiaryConfig,
         description="Дневник дня: факты о себе из своих реплик, слот {diary} в промпте",
+    )
+    jokes: JokesConfig = Field(
+        default_factory=JokesConfig,
+        description="Общие шутки чата: недельный пересказ достаёт, слот {jokes} в промпте",
+    )
+    callback: CallbackConfig = Field(
+        default_factory=CallbackConfig,
+        description="«Ну как там?»: вопрос человеку про его незакрытую историю",
     )
     vision: VisionConfig = Field(
         default_factory=VisionConfig,

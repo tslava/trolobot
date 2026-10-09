@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -20,7 +21,7 @@ from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
 from trolobot.commands import build_commands_router
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import ChatMemoryRow, LifeEventRow, SelfFactRow
+from trolobot.db import ChatMemoryRow, JokeRow, LifeEventRow, PeopleThreadRow, SelfFactRow
 from trolobot.few_shot import FewShot
 from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
@@ -81,6 +82,8 @@ class FakeDb:
     _next_life_event_id: int = 1
     chat_memory_store: dict[int, ChatMemoryRow] = field(default_factory=dict)
     self_facts_store: dict[int, SelfFactRow] = field(default_factory=dict)
+    jokes_store: dict[int, JokeRow] = field(default_factory=dict)
+    threads_store: dict[int, PeopleThreadRow] = field(default_factory=dict)
     # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): /status считает его по
     # таблицам, здесь — просто два числа.
     messages_today_value: int = 0
@@ -181,6 +184,19 @@ class FakeDb:
 
     async def delete_self_fact(self, fact_id: int) -> bool:
         return self.self_facts_store.pop(fact_id, None) is not None
+
+    async def jokes(self, limit: int) -> list[JokeRow]:
+        rows = sorted(self.jokes_store.values(), key=lambda r: (r.created_at, r.id), reverse=True)
+        return rows[:limit]
+
+    async def delete_joke(self, joke_id: int) -> bool:
+        return self.jokes_store.pop(joke_id, None) is not None
+
+    async def people_threads_all(self) -> list[PeopleThreadRow]:
+        return sorted(self.threads_store.values(), key=lambda r: (r.created_at, r.id))
+
+    async def delete_people_thread(self, thread_id: int) -> bool:
+        return self.threads_store.pop(thread_id, None) is not None
 
 
 @dataclass
@@ -2515,3 +2531,164 @@ async def test_status_shows_diary_line(
 
     cap = config.behaviour.diary.daily_cap
     assert f"diary: 1, calls 4/{cap}" in sent[0]
+
+
+# --- /jokes и /people (CLAUDE.md, "шутки чата и истории людей") -----------------
+
+
+def _joke(joke_id: int, text: str, created_at: datetime, used: datetime | None = None) -> JokeRow:
+    return JokeRow(
+        id=joke_id,
+        text=text,
+        created_at=int(created_at.timestamp()),
+        last_used_at=int(used.timestamp()) if used is not None else None,
+        uses=1 if used is not None else 0,
+    )
+
+
+def _thread(
+    thread_id: int, name: str, text: str, created_at: datetime, asked: datetime | None = None
+) -> PeopleThreadRow:
+    return PeopleThreadRow(
+        id=thread_id,
+        user_id=100 + thread_id,
+        display_name=name,
+        text=text,
+        created_at=int(created_at.timestamp()),
+        asked_at=int(asked.timestamp()) if asked is not None else None,
+        closed=asked is not None,
+    )
+
+
+async def _owner_say(handler: Any, text: str) -> None:
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text=text))
+
+
+async def test_jokes_list_empty_and_newest_first(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    await _owner_say(handler, "/jokes")
+    assert sent == ["Шуток пока нет."]
+
+    db.jokes_store[1] = _joke(1, "опять гвозди", datetime(2026, 1, 1, tzinfo=UTC))
+    db.jokes_store[2] = _joke(
+        2, "как у Лёхи", datetime(2026, 1, 5, tzinfo=UTC), used=datetime(2026, 1, 9, 9, tzinfo=UTC)
+    )
+    sent.clear()
+    await _owner_say(handler, "/jokes")
+
+    assert sent == ["#2 как у Лёхи (использована 09.01)\n#1 опять гвозди (использована —)"]
+
+
+async def test_jokes_rm_deletes_audits_and_bad_args(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.jokes_store[1] = _joke(1, "опять гвозди", NOW)
+    handler = _handler(deps)
+
+    for text in ("/jokes rm 7", "/jokes rm", "/jokes что-то", "/jokes rm 1"):
+        await _owner_say(handler, text)
+
+    usage = "Использование: /jokes | /jokes rm N"
+    assert sent == ["Нет шутки #7.", usage, usage, "Шутка #1 удалена."]
+    assert db.jokes_store == {}
+    assert db.audit_stop_calls == [("jokes:rm", ADMIN_ID, int(NOW.timestamp()))]
+    assert db.audit_values["jokes:rm"] == "опять гвозди"
+
+
+async def test_people_list_empty_and_statuses(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    await _owner_say(handler, "/people")
+    assert sent == ["Историй пока нет."]
+
+    db.threads_store[1] = _thread(
+        1,
+        "Илья",
+        "ждёт ответа после собеседования",
+        datetime(2026, 1, 2, tzinfo=UTC),
+        asked=datetime(2026, 1, 8, 12, tzinfo=UTC),
+    )
+    db.threads_store[2] = _thread(2, "Аня", "ищет машину", datetime(2026, 1, 3, tzinfo=UTC))
+    sent.clear()
+    await _owner_say(handler, "/people")
+
+    assert sent == [
+        "#1 Илья: ждёт ответа после собеседования (спросил 08.01)\n#2 Аня: ищет машину (открыт)"
+    ]
+
+
+async def test_people_rm_deletes_audits_and_bad_args(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.threads_store[1] = _thread(1, "Аня", "ищет машину", NOW)
+    handler = _handler(deps)
+
+    for text in ("/people rm 9", "/people rm", "/people x", "/people rm 1"):
+        await _owner_say(handler, text)
+
+    usage = "Использование: /people | /people rm N"
+    assert sent == ["Нет истории #9.", usage, usage, "История #1 удалена."]
+    assert db.threads_store == {}
+    assert db.audit_stop_calls == [("people:rm", ADMIN_ID, int(NOW.timestamp()))]
+    assert db.audit_values["people:rm"] == "ищет машину"
+
+
+async def test_jokes_and_people_in_chat_do_nothing(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.jokes_store[1] = _joke(1, "опять гвозди", NOW)
+    handler = _handler(deps)
+
+    await handler(_message(chat=_chat(), from_user=_user(ADMIN_ID), text="/jokes"))
+    await handler(_message(chat=_chat(), from_user=_user(ADMIN_ID), text="/people"))
+
+    assert sent == []
+
+
+async def test_help_mentions_jokes_people_and_fits_limit(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    await _owner_say(handler, "/help")
+
+    assert "/jokes" in sent[0]
+    assert "/people" in sent[0]
+    assert len(sent[0]) <= 3500
+
+
+async def test_status_shows_jokes_people_callback_line(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    await _owner_say(handler, "/status")
+    assert "jokes: 0, people: 0, callback: нет" in sent[0]
+
+    db.jokes_store[1] = _joke(1, "опять гвозди", NOW)
+    db.threads_store[1] = _thread(1, "Аня", "ищет машину", NOW)
+    db.threads_store[2] = _thread(2, "Илья", "ремонт", NOW, asked=NOW)
+    db.state["callback_last_at"] = str(int(datetime(2026, 1, 8, 12, tzinfo=UTC).timestamp()))
+    sent.clear()
+    await _owner_say(handler, "/status")
+
+    assert "jokes: 1, people: 1, callback: последний 08.01" in sent[0]

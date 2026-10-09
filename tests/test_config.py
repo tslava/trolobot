@@ -10,8 +10,10 @@ from pydantic import ValidationError
 from trolobot.config import describe_key, flatten_config, load_config
 from trolobot.config_models import (
     BehaviourConfig,
+    CallbackConfig,
     Config,
     FiltersConfig,
+    JokesConfig,
     LlmConfig,
     PlacesConfig,
     ReplyDelayBucket,
@@ -372,6 +374,37 @@ def test_describe_key_overridden_default_differs_from_value() -> None:
     assert info.value == "false"
     assert info.default == "true"
     assert info.value != info.default
+
+
+def test_jokes_and_callback_defaults_and_real_config() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    assert cfg.behaviour.jokes.enabled is True
+    assert cfg.behaviour.jokes.per_period == 3
+    assert cfg.behaviour.jokes.in_prompt == 6
+    assert cfg.behaviour.jokes.cooldown_days == 5
+    callback = cfg.behaviour.callback
+    assert (callback.min_days, callback.max_age_days, callback.author_active_days) == (3, 14, 7)
+    assert callback.window == ("11:00", "20:00")
+
+
+def test_callback_window_validated_like_quiet_window() -> None:
+    with pytest.raises(ValidationError):
+        CallbackConfig(window=("25:00", "20:00"))
+    with pytest.raises(ValidationError):
+        CallbackConfig(window=("11-00", "20:00"))
+    assert CallbackConfig(window=("09:30", "18:00")).window == ("09:30", "18:00")
+
+
+def test_jokes_and_callback_bounds() -> None:
+    with pytest.raises(ValidationError):
+        JokesConfig(per_period=11)
+    with pytest.raises(ValidationError):
+        JokesConfig(in_prompt=-1)
+    with pytest.raises(ValidationError):
+        CallbackConfig(min_days=0)
+    with pytest.raises(ValidationError):
+        CallbackConfig(max_age_days=91)
 
 
 def test_describe_key_all_leaf_keys_have_short_description() -> None:

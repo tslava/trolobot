@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     reaction_prompt_path: Path = Path("prompts/reaction.txt")
     memory_prompt_path: Path = Path("prompts/memory.txt")
     diary_prompt_path: Path = Path("prompts/diary.txt")
+    jokes_prompt_path: Path = Path("prompts/memory_jokes.txt")
+    threads_prompt_path: Path = Path("prompts/memory_threads.txt")
     vision_prompt_path: Path = Path("prompts/vision.txt")
     weather_place_prompt_path: Path = Path("prompts/weather_place.txt")
     # Домашняя точка погоды (CLAUDE.md, "Интерфейсы: погода"). Координаты — личные

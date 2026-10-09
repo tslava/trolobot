@@ -61,6 +61,7 @@ from trolobot.followup import FollowupChecker
 from trolobot.gate import PRESENCE_EXEMPT
 from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Trigger
+from trolobot.jokes import joke_used, render_jokes
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
 from trolobot.motifs import render_avoid, story_count, used_motifs
@@ -77,6 +78,7 @@ from trolobot.prompt import (
     render_context,
     render_life,
     situation_addressed,
+    situation_callback,
     situation_checkin,
     situation_followup,
     situation_life,
@@ -201,6 +203,12 @@ _CHECKIN_TRIGGER = "checkin"
 _CHECKIN_DUE_KEY = "checkin_due"
 _CHECKIN_DUE_REF_KEY = "checkin_due_hot_until"
 _CHECKIN_LAST_AT_KEY = "checkin_last_at"
+
+# «Ну как там?» (CLAUDE.md, "шутки чата и истории людей") — тоже строка, как "checkin":
+# фоновый джоб, не обращение (НЕ в _ADDRESS_TRIGGER_VALUES), без заведений, стикеров,
+# реплая и счётчиков бюджета. Свой state-ключ: когда последний раз спрашивал.
+_CALLBACK_TRIGGER = "callback"
+_CALLBACK_LAST_AT_KEY = "callback_last_at"
 
 # Сколько последних реплик персонажа отдаётся дешёвой проверке "это мне?" при разборе
 # выбранного checkin-сообщения (CLAUDE.md, "меньше и разнообразнее", мера 3).
@@ -1237,6 +1245,17 @@ class Responder:
             await self.db.chat_memories(cfg.behaviour.chat_memory.in_prompt), tz
         )
 
+        # Слот {jokes} (CLAUDE.md, "шутки чата и истории людей") — тоже всегда и для
+        # любого триггера. Строки читаются один раз: после отправки по ним же
+        # проверяется, какая шутка прозвучала.
+        jokes_cfg = cfg.behaviour.jokes
+        joke_rows = (
+            await self.db.jokes(jokes_cfg.in_prompt)
+            if jokes_cfg.enabled and jokes_cfg.in_prompt > 0
+            else []
+        )
+        jokes_block = render_jokes(joke_rows, now=now, cooldown_days=jokes_cfg.cooldown_days)
+
         # Погода (CLAUDE.md, "Интерфейсы: погода") — фон для ЛЮБОГО триггера: она
         # нужна и ambient'у, и обращению. Клиент сам глотает свои ошибки и сам
         # держит кэш, поэтому здесь нет ни try, ни проверки свежести. Нет домашней
@@ -1276,6 +1295,7 @@ class Responder:
             life=life_block,
             diary=diary_block,
             chat_memory=chat_memory_block,
+            jokes=jokes_block,
             weather=weather_block,
             **build_messages_kwargs,
         )
@@ -1546,12 +1566,17 @@ class Responder:
         await self._finish_pending(pending_id, now)
         if sticker is None:
             self._spawn_diary(sent_text, sent_message_id)
+            # Шутка, которую персонаж вернул в чат, отдыхает cooldown_days суток.
+            for joke in joke_rows:
+                if joke_used(sent_text, joke.text):
+                    await self.db.mark_joke_used(joke.id, now)
         # Горячее окно из ОБЩЕГО хвоста — только если владелец включил
         # hot_window.open_on_any_reply (CLAUDE.md, "меньше и разнообразнее", мера 2).
         # По умолчанию окно открывают лишь /life и /say: «после каждой своей реплики
         # быть внимательнее» на практике означало, что бот сам себе продлевал
         # присутствие в чате бесконечно.
-        if cfg.behaviour.hot_window.open_on_any_reply:
+        # «Ну как там?» окно не открывает (CLAUDE.md, "шутки чата и истории людей").
+        if cfg.behaviour.hot_window.open_on_any_reply and trigger_value != _CALLBACK_TRIGGER:
             await self._maybe_open_hot_window(cfg, now)
         return SendOutcome(
             sent=True, text=sent_text, reason=send_reason, tg_message_id=sent_message_id
@@ -2114,6 +2139,92 @@ class Responder:
         await self.db.set_state(
             _CHECKIN_DUE_KEY, str(after_now + self.rng.randint(*checkin_cfg.after_min) * 60)
         )
+
+    # ------------------------------------------------------------------ #
+    # «Ну как там?» (CLAUDE.md, "шутки чата и истории людей").
+    # ------------------------------------------------------------------ #
+
+    async def callback_job(self) -> None:
+        """Бесконечный цикл по образцу ``checkin_job``: раз в
+        ``cfg.behaviour.checkin.poll_sec`` смотрит, не пора ли спросить человека,
+        чем кончилась его история. Падение итерации логируется, цикл живёт дальше."""
+        while True:
+            try:
+                poll_sec = self.cfg_getter().behaviour.checkin.poll_sec
+                await self.sleep(float(poll_sec))
+                await self._maybe_callback()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("callback_job: iteration failed")
+                await self.sleep(_ERROR_RETRY_SEC)
+
+    async def _maybe_callback(self) -> None:
+        """Один заход: enabled -> не panic/stop/ночь/topic_cooldown -> окно
+        ``callback.window`` -> прошло ``min_days`` суток с прошлого вопроса -> в чате
+        тихо (``checkin.quiet_min``) -> не над потолком присутствия -> пауза между
+        репликами выдержана -> самый старый открытый тред: старше ``max_age_days``
+        закрывается, замьюченный автор и автор, давно не писавший в чат, пропускаются.
+        Любой исход генерации (отправлено, молчание, срез) закрывает тред и ставит
+        ``callback_last_at``: про одно и то же второй раз не спрашиваем."""
+        cfg = self.cfg_getter()
+        callback_cfg = cfg.behaviour.callback
+        if not callback_cfg.enabled:
+            return
+
+        tz = cfg.persona.timezone
+        now = self._clock()
+        if await self._spontaneous_gate_blocked(cfg, now):
+            return
+        if not in_window(now, tz, callback_cfg.window):
+            return
+
+        last_raw = await self.db.get_state(_CALLBACK_LAST_AT_KEY)
+        if last_raw is not None:
+            try:
+                if now - int(last_raw) < callback_cfg.min_days * 86400:
+                    return
+            except ValueError:
+                pass
+
+        quiet_sec = cfg.behaviour.checkin.quiet_min * 60
+        if quiet_sec > 0:
+            last_human_at = await self.db.last_message_at(self.chat_id)
+            if last_human_at is not None and now - last_human_at < quiet_sec:
+                return
+
+        if await self._presence_over_cap(cfg, now):
+            return
+        if await self._min_gap_due(cfg, now) is not None:
+            return
+
+        muted = await self.db.muted_user_ids()
+        chosen = None
+        for thread in await self.db.open_people_threads():
+            if now - thread.created_at > callback_cfg.max_age_days * 86400:
+                await self.db.close_people_thread(thread.id, now)
+                continue
+            if thread.user_id in muted:
+                continue
+            author_last = await self.db.last_message_at_by_user(self.chat_id, thread.user_id)
+            if author_last is None or now - author_last > callback_cfg.author_active_days * 86400:
+                continue
+            chosen = thread
+            break
+        if chosen is None:
+            return
+
+        await self._respond(
+            trigger=_CALLBACK_TRIGGER,
+            trigger_msg_id=None,
+            user_id=chosen.user_id,
+            situation=situation_callback(chosen.display_name, chosen.text),
+            delay_sec=0,
+        )
+        # Не в finally: при отмене (SIGTERM) тред остаётся открытым и спросится позже.
+        after_now = self._clock()
+        await self.db.close_people_thread(chosen.id, after_now)
+        await self.db.set_state(_CALLBACK_LAST_AT_KEY, str(after_now))
 
     async def shutdown(self) -> None:
         """Отменяет дебаунс- и pending-таймеры. Сами pending остаются в БД —

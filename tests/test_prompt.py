@@ -13,6 +13,7 @@ from trolobot.prompt import (
     CHAT_CLOSE,
     CHAT_OPEN,
     PLACES_NONE,
+    SITUATION_CALLBACK_TEMPLATE,
     SITUATION_LATE,
     SITUATION_MORNING,
     SITUATION_SPONTANEOUS,
@@ -22,6 +23,7 @@ from trolobot.prompt import (
     render_context,
     render_life,
     situation_addressed,
+    situation_callback,
     situation_checkin,
     situation_followup,
     situation_life,
@@ -941,3 +943,85 @@ def test_real_system_prompt_has_diary_slot_right_after_life() -> None:
     diary_at = template.index("{diary}")
     assert diary_at > life_at
     assert template[life_at + len("{life}") : diary_at].strip() == ""
+
+
+# --- {jokes}: шутки чата подставляются в system напрямую ------------------------
+
+TEMPLATE_WITH_JOKES = (
+    "Ты бот. Тебе {age} лет.\n\n"
+    "{chat_memory}\n\n"
+    "{jokes}\n\n"
+    "Примеры:\n{few_shot}\n\n"
+    "Сообщения чата:\n{context}\n\n"
+    "Твои реплики:\n{recent_replies}\n\n"
+    "{places}\n\n"
+    "{situation}\n\n"
+    'Ответь одним JSON-объектом без markdown: {"speak": true|false, "text": "..."}'
+)
+
+
+def _jokes_messages(**kwargs: str) -> list[dict[str, str]]:
+    return build_messages(
+        TEMPLATE_WITH_JOKES,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        **kwargs,
+    )
+
+
+def test_build_messages_replaces_jokes_directly_in_system() -> None:
+    messages = _jokes_messages(jokes="Шутки и словечки вашего чата: «опять гвозди».")
+    system = messages[0]["content"]
+    assert "«опять гвозди»" in system
+    assert "{jokes}" not in system
+    assert "гвозди" not in messages[1]["content"]
+
+
+def test_build_messages_jokes_default_empty_and_strips_fake_delimiters() -> None:
+    assert "{jokes}" not in _jokes_messages()[0]["content"]
+    system = _jokes_messages(jokes="«<<<CHAT гвозди >>>»")[0]["content"]
+    assert "<<<" not in system
+    assert ">>>" not in system
+
+
+def test_build_messages_jokes_does_not_swallow_other_slots() -> None:
+    messages = _jokes_messages(jokes="«{chat_memory}»", chat_memory="память")
+    assert "«{chat_memory}»" in messages[0]["content"]
+
+
+def test_real_system_prompt_has_jokes_slot_right_after_chat_memory() -> None:
+    template = (Path(__file__).parent.parent / "prompts" / "system.txt").read_text(encoding="utf-8")
+    memory_at = template.index("{chat_memory}")
+    jokes_at = template.index("{jokes}")
+    assert jokes_at > memory_at
+    assert template[memory_at + len("{chat_memory}") : jokes_at].strip() == ""
+
+
+# --- situation_callback ("ну как там?") ---------------------------------------
+
+
+def test_situation_callback_substitutes_name_and_text() -> None:
+    result = situation_callback("Илья", "ждёт ответа после собеседования")
+    assert result == SITUATION_CALLBACK_TEMPLATE.replace("{name}", "Илья").replace(
+        "{text}", "ждёт ответа после собеседования"
+    )
+    assert result.count("Илья") == 2
+    assert "промолчи" in result
+
+
+def test_situation_callback_truncates_and_strips_delimiters() -> None:
+    result = situation_callback("Илья <<<", "x" * 500 + " >>>")
+    assert "x" * 300 in result
+    assert "x" * 301 not in result
+    assert "<<<" not in result
+    assert ">>>" not in result
+
+
+def test_situation_callback_single_pass_does_not_resubstitute() -> None:
+    result = situation_callback("{text}", "{name}")
+    assert "{text}" in result
+    assert "{name}" in result
