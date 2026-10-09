@@ -15,6 +15,88 @@ _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _MODEL_ID_RE = re.compile(r"^[\w.-]+/[\w.:-]+$")
 
 
+# Стандартный набор реакций Telegram Bot API (ReactionTypeEmoji.emoji). Всё остальное
+# (например 😂) Telegram отвергает с REACTION_INVALID. Это не filters.allowed_emoji: тот
+# список — для эмодзи в тексте реплик.
+TELEGRAM_REACTIONS: frozenset[str] = frozenset(
+    {
+        "👍",
+        "👎",
+        "❤",
+        "🔥",
+        "🥰",
+        "👏",
+        "😁",
+        "🤔",
+        "🤯",
+        "😱",
+        "🤬",
+        "😢",
+        "🎉",
+        "🤩",
+        "🤮",
+        "💩",
+        "🙏",
+        "👌",
+        "🕊",
+        "🤡",
+        "🥱",
+        "🥴",
+        "😍",
+        "🐳",
+        "❤‍🔥",
+        "🌚",
+        "🌭",
+        "💯",
+        "🤣",
+        "⚡",
+        "🍌",
+        "🏆",
+        "💔",
+        "🤨",
+        "😐",
+        "🍓",
+        "🍾",
+        "💋",
+        "🖕",
+        "😈",
+        "😴",
+        "😭",
+        "🤓",
+        "👻",
+        "👨‍💻",
+        "👀",
+        "🎃",
+        "🙈",
+        "😇",
+        "😨",
+        "🤝",
+        "✍",
+        "🤗",
+        "🫡",
+        "🎅",
+        "🎄",
+        "☃",
+        "💅",
+        "🤪",
+        "🗿",
+        "🆒",
+        "💘",
+        "🙉",
+        "🦄",
+        "😘",
+        "💊",
+        "🙊",
+        "😎",
+        "👾",
+        "🤷‍♂",
+        "🤷",
+        "🤷‍♀",
+        "😡",
+    }
+)
+
+
 def _validate_hhmm(value: str) -> str:
     if not _HHMM_RE.match(value):
         raise ValueError(f"invalid time {value!r}, expected HH:MM")
@@ -121,9 +203,9 @@ class ReactionsConfig(BaseModel):
     с задержкой и смыслом"): сначала пауза ``delay_sec`` — человек сперва читает, —
     потом при ``semantic`` дешёвая модель решает, уместна ли реакция и какая.
     ``probability`` остаётся только для ``semantic: false`` (прежнее поведение).
-    ``emoji`` валидируется на уровне ``Config`` (см. ``Config._check_reactions_emoji_allowed``):
-    каждый элемент обязан входить в ``filters.allowed_emoji``, иначе ``/set
-    behaviour.reactions.emoji`` падает с понятной ошибкой.
+    ``emoji`` валидируется на уровне ``Config`` (см. ``Config._check_reactions_emoji_telegram``):
+    каждый элемент обязан входить в ``TELEGRAM_REACTIONS`` (набор реакций Bot API),
+    иначе ``/set behaviour.reactions.emoji`` падает с понятной ошибкой.
     """
 
     enabled: bool = Field(default=True, description="Включает реакции-эмодзи вместо молчания")
@@ -137,8 +219,8 @@ class ReactionsConfig(BaseModel):
         default=8, ge=0, le=100, description="Потолок реакций в сутки, отдельно от ambient/mention"
     )
     emoji: list[str] = Field(
-        default_factory=lambda: ["👍", "💩", "😂"],
-        description="Из чего выбирается реакция; каждый элемент — из filters.allowed_emoji",
+        default_factory=lambda: ["👍", "💩", "🤣"],
+        description="Из чего выбирается реакция; только из набора реакций Telegram (не 😂)",
     )
     delay_sec: tuple[int, int] = Field(
         default=(20, 120),
@@ -149,7 +231,7 @@ class ReactionsConfig(BaseModel):
     )
     model: str = Field(default="", description="Модель выбора реакции; пусто -> llm.judge_model")
     max_tokens: int = Field(
-        default=40, ge=10, le=200, description="Потолок ответа модели выбора реакции, токенов"
+        default=120, ge=10, le=200, description="Потолок ответа модели выбора реакции, токенов"
     )
     semantic_daily_cap: int = Field(
         default=40, ge=0, le=1000, description="Потолок вызовов модели на реакции в сутки"
@@ -1164,19 +1246,17 @@ class Config(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _check_reactions_emoji_allowed(self) -> "Config":
-        """behaviour.reactions.emoji — подмножество filters.allowed_emoji.
+    def _check_reactions_emoji_telegram(self) -> "Config":
+        """behaviour.reactions.emoji — подмножество TELEGRAM_REACTIONS.
 
-        Проверка живёт здесь, а не на ReactionsConfig: только Config видит оба
-        поля одновременно. /set behaviour.reactions.emoji с мусором (не входящим
-        в allowed_emoji) должен падать с понятной ошибкой, а не тихо позволять
-        боту реагировать эмодзи, которого нет в голосе персонажа.
+        Telegram принимает в реакциях только свой стандартный набор; всё прочее
+        (😂 и т.п.) даёт REACTION_INVALID, и реакция молча не ставится. Поэтому
+        проверяем по набору Bot API, а не по filters.allowed_emoji (тот — для текста).
         """
-        allowed = set(self.filters.allowed_emoji)
-        bad = [e for e in self.behaviour.reactions.emoji if e not in allowed]
+        bad = [e for e in self.behaviour.reactions.emoji if e not in TELEGRAM_REACTIONS]
         if bad:
             raise ValueError(
-                f"behaviour.reactions.emoji: {bad!r} not in "
-                f"filters.allowed_emoji {sorted(allowed)!r}"
+                f"behaviour.reactions.emoji: {bad!r} не входит в набор реакций Telegram "
+                "(например, вместо 😂 нужен 🤣)"
             )
         return self

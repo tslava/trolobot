@@ -35,11 +35,11 @@ behaviour:
     probability: 0.2                   # шанс реакции; работает только при semantic: false
     cooldown_min: 60                   # не чаще одного раза в час
     daily_cap: 8                       # в сутки, отдельно от ambient/mention
-    emoji: ["👍", "💩", "😂"]            # только из filters.allowed_emoji; 💩 в этом чате значит «одобряю»
+    emoji: ["👍", "💩", "🤣"]            # только из набора реакций Telegram (😂 нельзя, есть 🤣); 💩 значит «одобряю»
     delay_sec: [20, 120]               # пауза перед реакцией: прочитал и хмыкнул
     semantic: true                     # реакцию выбирает модель; false — прежний кубик
     model: ""                          # пусто -> llm.judge_model (та же дешёвая модель, что судья)
-    max_tokens: 40
+    max_tokens: 120                    # JSON с reason не должен обрезаться
     semantic_daily_cap: 40             # вызовов модели на реакции в сутки, счётчик reaction_calls
     context_messages: 6                # сколько последних сообщений чата показать модели
 

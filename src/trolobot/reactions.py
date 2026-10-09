@@ -342,7 +342,7 @@ class ReactionChooser:
 
         verdict = _parse_choice(result.text)
         if verdict is None:
-            logger.warning("reaction chooser: invalid answer")
+            logger.warning("reaction chooser: invalid answer: %r", result.text[:80])
             return None
         if verdict.emoji is None:
             logger.info("reaction chooser: none (%s)", verdict.reason[:_REASON_LOG_MAX_LEN])

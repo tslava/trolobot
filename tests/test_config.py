@@ -383,3 +383,17 @@ def test_describe_key_all_leaf_keys_have_short_description() -> None:
         assert info is not None, key
         assert info.description, f"{key}: empty description"
         assert len(info.description) <= 90, f"{key}: description too long ({len(info.description)})"
+
+
+def test_reactions_emoji_laugh_not_in_telegram_set_rejected() -> None:
+    """😂 есть в allowed_emoji, но не в наборе реакций Telegram (REACTION_INVALID)."""
+    with pytest.raises(ValidationError, match="набор"):
+        Config.model_validate(
+            {"behaviour": {"reactions": {"emoji": ["👍", "😂"]}}},
+        )
+
+
+def test_reactions_emoji_rofl_accepted_without_allowed_emoji() -> None:
+    cfg = Config.model_validate({"behaviour": {"reactions": {"emoji": ["👍", "🤣"]}}})
+    assert "🤣" in cfg.behaviour.reactions.emoji
+    assert "🤣" not in cfg.filters.allowed_emoji
