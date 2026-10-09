@@ -65,6 +65,8 @@ def test_motifs_in_factory_forms() -> None:
     ):
         assert motifs_in(text, _motifs()) == ["завод"], text
     assert "завод" not in motifs_in("Линейка лежит на столе, я сменил батарейку.", _motifs())
+    assert "завод" not in motifs_in("Машина не заводится, заводи с толкача.", _motifs())
+    assert motifs_in("Там заводская столовая была.", _motifs()) == ["завод"]
 
 
 # --- used_motifs -------------------------------------------------------------------

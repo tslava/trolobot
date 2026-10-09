@@ -507,6 +507,25 @@ async def test_chooser_returns_emoji_from_allowed_list(db: Database) -> None:
     assert len(calls) == 1
 
 
+async def test_chooser_accepts_variation_selector(db: Database) -> None:
+    """Модель ответила «❤️», в списке «❤» — это та же реакция, отдаём форму из набора."""
+    cfg = _full_config()
+    handler, _calls = _counting_handler(lambda _req: _choice_response("❤\ufe0f"))
+    chooser, llm = _chooser(handler, cfg, db)
+    try:
+        result = await chooser.choose(
+            text="и тут у него колесо отвалилось",
+            display_name="Дима",
+            context_rows=[],
+            allowed=["👍", "❤"],
+            now=NOW,
+        )
+    finally:
+        await llm.aclose()
+
+    assert result == "❤"
+
+
 async def test_chooser_null_emoji_returns_none(db: Database) -> None:
     """В большинстве случаев правильный ответ — null: реакции просто не будет."""
     cfg = _full_config()

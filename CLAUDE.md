@@ -1854,7 +1854,8 @@ def name_forms(word: str) -> list[str]   # сами формы, для тест�
 # reactions.py: TELEGRAM_REACTIONS: frozenset[str] — стандартный набор реакций Bot API (ReactionTypeEmoji.emoji:
 # 👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈
 # 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡).
-# Валидатор Config: reactions.emoji ⊆ TELEGRAM_REACTIONS (НЕ filters.allowed_emoji — тот список для текста).
+# Валидатор Config: reactions.emoji ⊆ TELEGRAM_REACTIONS (НЕ filters.allowed_emoji — тот список для текста);
+# U+FE0F срезается и в конфиге, и в ответе модели («❤️» == «❤»).
 # Константа живёт в config_models.py (reactions.py импортирует оттуда), чтобы не было цикла импорта.
 # prompts/reaction.txt: «🤣 — смешно»; «reason — не больше пяти слов».
 # ReactionChooser: _parse_choice -> None => logger.warning("reaction chooser: invalid answer: %r", result.text[:80]).
@@ -1869,8 +1870,8 @@ def name_forms(word: str) -> list[str]   # сами формы, для тест�
 # responder._recheck: send:recheck_topic только для ambient-подобных pending (у обращений не проверять).
 # _spontaneous_gate_blocked / checkin — без изменений (они не обращения).
 
-# A4. Мотив «завод»: filters.motifs += завод: ['\bзавод', '\bлини[яиюейи]\b', '\bцех', '\bсмен[аеуы]\b',
-# '\bналадчик'] (config.yaml и дефолт в config_models.py); motifs.py: склонение «завод» -> «завод».
+# A4. Мотив «завод»: filters.motifs += завод: ['\bзавод(а|у|ом|е|ы|ов|ах|ам|ами)?\b', '\bзаводск',
+# '\bлини(я|и|ю|ей)\b', '\bцех', '\bсмен[аеуы]\b', '\bналадчик'] («заводится» — не мотив) (config.yaml и дефолт в config_models.py); motifs.py: склонение «завод» -> «завод».
 # prompts/system.txt, блок «КАК ТЫ ПИШЕШЬ», и CHARACTER.md раздел 3: «Не своди разговор к себе: чаще
 # отвечай про то, что сказал человек, чем рассказывай свой случай. „У меня тоже…“ — не больше раза на
 # несколько реплик.» Ambient-ситуацию НЕ добавлять (решение владельца: вклиниться можно и в тему вообще).
@@ -1886,7 +1887,9 @@ def name_forms(word: str) -> list[str]   # сами формы, для тест�
 # filter_log(stage="send", verdict="cut", reason="send:llm_retry"), update_pending_due(now + rng.randint(120, 300)),
 # _pending_info[pending_id] = addressed_items (чтобы ситуация не потерялась), таймер заново (PendingRow с новым
 # due), pending НЕ закрывается. Иначе — как раньше (filter_log с e.reason, _finish_pending).
-# Ambient/checkin/morning/life — без переноса. circuit_open/budget/calls_cap — без переноса.
+# Ambient/checkin/morning/life — без переноса. circuit_open/budget/calls_cap — без переноса. Схлопнувшиеся
+# за время вызова обращения дописываются, более ранний due_at сохраняется; _finish_pending чистит _llm_retried.
+# followup остаётся под кулдауном стоп-темы в recheck (не явное обращение).
 ```
 
 Тесты: `test_reactions.py` (TELEGRAM_REACTIONS, длинный reason разбирается, WARNING с обрезанным ответом),

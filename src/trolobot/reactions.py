@@ -347,7 +347,9 @@ class ReactionChooser:
         if verdict.emoji is None:
             logger.info("reaction chooser: none (%s)", verdict.reason[:_REASON_LOG_MAX_LEN])
             return None
-        if verdict.emoji not in set(allowed):
+        # Модель может ответить «❤️» на «❤» из списка: вариационный селектор не считаем.
+        chosen = verdict.emoji.replace("\ufe0f", "")
+        if chosen not in {e.replace("\ufe0f", "") for e in allowed}:
             logger.warning("reaction chooser: emoji outside allowed list")
             return None
 
@@ -355,7 +357,7 @@ class ReactionChooser:
         logger.info(
             "reaction chooser: %s (%s)", verdict.emoji, verdict.reason[:_REASON_LOG_MAX_LEN]
         )
-        return verdict.emoji
+        return chosen
 
 
 class ReactionScheduler:

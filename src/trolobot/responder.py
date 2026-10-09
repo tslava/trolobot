@@ -765,8 +765,10 @@ class Responder:
         if row.user_id in state.muted_user_ids:
             return "send:recheck_muted"
         # Кулдаун стоп-темы обращения не глушит (A3): проверяем только не-обращения.
+        # followup — не явное обращение, а «вероятно, мне»: ему кулдаун по-прежнему
+        # мешает, иначе он ушёл бы следом за сообщением со стоп-темой.
         if (
-            row.trigger not in _ADDRESS_TRIGGER_VALUES
+            (row.trigger not in _ADDRESS_TRIGGER_VALUES or row.trigger == Trigger.FOLLOWUP.value)
             and state.topic_cooldown_until is not None
             and state.topic_cooldown_until > now
         ):
@@ -806,6 +808,7 @@ class Responder:
         """
         if pending_id is not None:
             await self.db.mark_pending_done(pending_id, done_at)
+            self._llm_retried.discard(pending_id)
 
     async def _respond(
         self,
@@ -877,6 +880,11 @@ class Responder:
             return False
         self._llm_retried.add(pending_id)
         due = now + self.rng.randint(*_LLM_RETRY_DELAY_SEC)
+        # Пока шёл вызов модели, к этому pending могло схлопнуться новое обращение:
+        # оно уже сдвинуло due_at ближе и дописало себя в _pending_info. Не затираем
+        # ни то, ни другое.
+        if now < row.due_at < due:
+            due = row.due_at
         await self.db.insert_filter_log(
             trigger_tg_message_id=trigger_msg_id,
             candidate_text=None,
@@ -887,8 +895,10 @@ class Responder:
             created_at=now,
         )
         await self.db.update_pending_due(pending_id, due)
-        if addressed_items:
-            self._pending_info[pending_id] = list(addressed_items)
+        merged = list(addressed_items or [])
+        merged.extend(item for item in self._pending_info.get(pending_id, []) if item not in merged)
+        if merged:
+            self._pending_info[pending_id] = merged
         logger.info("llm failure: pending %s retried at %s", pending_id, due)
         self._schedule_pending_timer(row, due)
         return True

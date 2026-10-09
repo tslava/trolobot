@@ -4318,6 +4318,47 @@ async def test_recheck_ignores_topic_cooldown_for_direct_address(
         await llm.aclose()
 
 
+async def test_recheck_keeps_topic_cooldown_for_followup(db: Database) -> None:
+    """followup — «вероятно, мне», не явное обращение: кулдаун стоп-темы его режет."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Да ну."))
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        await db.set_state("topic_cooldown_until", str(DAY_NOW + 600))
+        row = _pending_row(1, "followup", DAY_NOW)
+        assert await responder._recheck(row, DAY_NOW, cfg) == "send:recheck_topic"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_llm_retry_keeps_collapsed_address_and_earlier_due(db: Database) -> None:
+    """A6: пока шёл вызов модели, к pending схлопнулось новое обращение — перенос не
+    затирает ни его, ни более ранний due_at."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Да ну."))
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        pid = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW + 30,
+            created_at=DAY_NOW - 60,
+        )
+        responder._pending_info[pid] = [("Петя", "а ты что думаешь?")]
+        assert await responder._retry_pending_later(pid, 50, [("Вася", "@bot привет")], DAY_NOW)
+        pending = await db.load_pending()
+        assert pending[0].due_at == DAY_NOW + 30
+        assert responder._pending_info[pid] == [
+            ("Вася", "@bot привет"),
+            ("Петя", "а ты что думаешь?"),
+        ]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 async def test_llm_http_failure_retries_address_pending_once(db: Database) -> None:
     """A6: llm:http у обращения -> перенос на 120-300 с, второй сбой -> молчание."""
     cfg = _config()

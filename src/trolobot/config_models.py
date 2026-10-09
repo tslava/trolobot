@@ -245,6 +245,10 @@ class ReactionsConfig(BaseModel):
     def _validate_non_empty(cls, value: list[str]) -> list[str]:
         if not value:
             raise ValueError("reactions.emoji must not be empty")
+        # Клавиатура телефона дописывает вариационный селектор U+FE0F («❤️»), а в наборе
+        # реакций Telegram эмодзи без него («❤») — срезаем, чтобы /set не отвергал
+        # правильную реакцию и в Telegram уходила ровно та форма, что в наборе.
+        value = [e.replace("\ufe0f", "") for e in value]
         return value
 
     @field_validator("delay_sec")
@@ -1087,7 +1091,14 @@ _MOTIFS_DEFAULT: dict[str, list[str]] = {
     "участок": [r"\bучасток", r"\bучастк"],
     "машина": [r"\bмашин"],
     "зато": [r"\bзато\b"],
-    "завод": [r"\bзавод", r"\bлини(я|и|ю|ей)\b", r"\bцех", r"\bсмен[аеуы]\b", r"\bналадчик"],
+    "завод": [
+        r"\bзавод(а|у|ом|е|ы|ов|ах|ам|ами)?\b",
+        r"\bзаводск",
+        r"\bлини(я|и|ю|ей)\b",
+        r"\bцех",
+        r"\bсмен[аеуы]\b",
+        r"\bналадчик",
+    ],
 }
 
 # Маркеры байки (CLAUDE.md, мера 5) — по ним считается квота историй в окне
