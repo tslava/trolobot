@@ -57,6 +57,7 @@ from trolobot.db import Database, LifeEventRow, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
 from trolobot.filters import FilterContext
 from trolobot.followup import FollowupChecker
+from trolobot.gate import PRESENCE_EXEMPT
 from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
@@ -118,6 +119,11 @@ _ADDRESS_TRIGGER_VALUES = (
     Trigger.NAME.value,
     Trigger.FOLLOWUP.value,
 )
+
+# Сбои провайдера, после которых обращение переносится (один раз), а не молчит (A6),
+# и диапазон переноса в секундах.
+_LLM_RETRY_REASONS = frozenset({"llm:http", "llm:timeout"})
+_LLM_RETRY_DELAY_SEC = (120, 300)
 
 # Потолок на число обращений, из которых строится situation_addressed (и на сколько
 # восстанавливает _collect_addressed_items после рестарта) — не больше последних 5.
@@ -338,6 +344,9 @@ class Responder:
         # pending, поставленных в этом процессе; после рестарта список пуст и
         # _fire_pending_inner восстанавливает его из БД (_collect_addressed_items).
         self._pending_info: dict[int, list[tuple[str, str]]] = {}
+        # pending_id, которые уже переносили после сбоя провайдера (A6): перенос один,
+        # в памяти — после рестарта не повторяется.
+        self._llm_retried: set[int] = set()
         # Сериализует генерацию+отправку+счётчики одного Responder: без этого два PASS,
         # ждущих LLM параллельно, могли бы оба проскочить одну и ту же проверку бюджета.
         self._respond_lock = asyncio.Lock()
@@ -748,12 +757,19 @@ class Responder:
             return "send:recheck_stop"
         if row.user_id in state.muted_user_ids:
             return "send:recheck_muted"
-        if state.topic_cooldown_until is not None and state.topic_cooldown_until > now:
+        # Кулдаун стоп-темы обращения не глушит (A3): проверяем только не-обращения.
+        if (
+            row.trigger not in _ADDRESS_TRIGGER_VALUES
+            and state.topic_cooldown_until is not None
+            and state.topic_cooldown_until > now
+        ):
             return "send:recheck_topic"
-        # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1): реплай на
-        # сообщение бота проходит под потолком всегда, как и в гейте; остальные поводы
-        # (имя, @, followup) к моменту отправки могли исчерпать суточную долю.
-        if row.trigger != Trigger.REPLY.value and cfg.behaviour.presence.over_cap(
+        # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1): реплай и @
+        # проходят под потолком всегда, как и в гейте (PRESENCE_EXEMPT); остальные поводы
+        # (имя, followup) к моменту отправки могли исчерпать суточную долю.
+        if row.trigger not in {
+            t.value for t in PRESENCE_EXEMPT
+        } and cfg.behaviour.presence.over_cap(
             human_messages_today=state.human_messages_today,
             bot_replies_today=state.bot_replies_today,
         ):
@@ -811,6 +827,16 @@ class Responder:
             )
         except LLMError as exc:
             now = self._clock()
+            if (
+                pending_id is not None
+                and _trigger_value(trigger) in _ADDRESS_TRIGGER_VALUES
+                and exc.reason in _LLM_RETRY_REASONS
+                and pending_id not in self._llm_retried
+                and await self._retry_pending_later(
+                    pending_id, trigger_msg_id, addressed_items, now
+                )
+            ):
+                return
             await self.db.insert_filter_log(
                 trigger_tg_message_id=trigger_msg_id,
                 candidate_text=None,
@@ -829,6 +855,36 @@ class Responder:
             # обрыв во время SIGTERM, любой сбой внутри _generate_and_send) не должно
             # "хоронить" pending — restore_pending на следующем старте подхватит его
             # заново (см. _finish_pending).
+
+    async def _retry_pending_later(
+        self,
+        pending_id: int,
+        trigger_msg_id: int | None,
+        addressed_items: list[tuple[str, str]] | None,
+        now: int,
+    ) -> bool:
+        """Сбой провайдера не хоронит обращение (A6): один раз переносим pending на
+        2-5 минут вместо молчания. False — pending не найден, действуем как раньше."""
+        row = next((r for r in await self.db.load_pending() if r.id == pending_id), None)
+        if row is None:
+            return False
+        self._llm_retried.add(pending_id)
+        due = now + self.rng.randint(*_LLM_RETRY_DELAY_SEC)
+        await self.db.insert_filter_log(
+            trigger_tg_message_id=trigger_msg_id,
+            candidate_text=None,
+            verdict="cut",
+            stage="send",
+            reason="send:llm_retry",
+            shadow=False,
+            created_at=now,
+        )
+        await self.db.update_pending_due(pending_id, due)
+        if addressed_items:
+            self._pending_info[pending_id] = list(addressed_items)
+        logger.info("llm failure: pending %s retried at %s", pending_id, due)
+        self._schedule_pending_timer(row, due)
+        return True
 
     async def _respond_inner(
         self,

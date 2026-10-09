@@ -9,11 +9,10 @@
 2.  ``panic`` / ``stop_until > now``         -> DROP ``gate:panic`` / ``gate:stop``
 3.  автор в ``muted_user_ids``               -> DROP ``gate:muted``
 4.  стоп-лист тем                            -> DROP ``gate:topic`` (+ topic_cooldown_until)
-5.  ``topic_cooldown_until > now``           -> DROP ``gate:topic_cooldown``
 5a. маркеры команд (инъекция)                -> DROP ``gate:injection``
 6.  прямое обращение (reply > mention > name):
     ночь                                     -> QUEUE_NIGHT ``gate:night_queued``
-    потолок присутствия (кроме REPLY)        -> DROP ``gate:presence_cap``
+    потолок присутствия (кроме REPLY/MENTION) -> DROP ``gate:presence_cap``
     дневной лимит обращений                  -> DROP ``gate:mention_cap``
     иначе                                    -> PASS ``pass:<trigger>``
 
@@ -22,15 +21,19 @@
     здесь не проверяется вовсе — гейт всегда пропускает обращение дальше, а
     сам кулдаун превращается в задержку ответа на этапе 3 (``responder.py``,
     ``earliest`` в постановке/схлопывании pending).
+    Кулдаун стоп-темы (``topic_cooldown_until``) обращения не глушит: он
+    проверяется только ниже, в ambient-ветке.
 7.  ночь (без обращения)                     -> DROP ``gate:night``
 8.  логистика                                -> DROP ``gate:logistics``
+7a. ``topic_cooldown_until > now``           -> DROP ``gate:topic_cooldown`` (только ambient)
 8a. потолок присутствия                      -> DROP ``gate:presence_cap``
 
     Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): за локальные сутки
     бот не говорит больше, чем ``presence.max_share`` от числа сообщений людей плюс
-    ``presence.free_replies``. Реплай на самого бота (``Trigger.REPLY``) проходит
-    под потолком всегда — человек написал именно ему и ждёт ответа; всё остальное
-    (имя, ``@``, ambient) под потолком молчит. Реакции на ``gate:presence_cap`` не
+    ``presence.free_replies``. Реплай на самого бота (``Trigger.REPLY``) и ``@``
+    (``Trigger.MENTION``) проходят под потолком всегда — человек написал именно ему
+    и ждёт ответа; всё остальное (имя — о нём часто говорят в третьем лице, —
+    ambient) под потолком молчит. Реакции на ``gate:presence_cap`` не
     ставятся: ``reactions.REACT_REASONS`` не меняется.
 
     Горячее окно после ``/life``/``/say`` (``state.hot_until``, CLAUDE.md,
@@ -61,6 +64,11 @@ from trolobot.gate_types import (
     Verdict,
 )
 from trolobot.timeutil import in_window
+
+# Триггеры, которые проходят под потолком присутствия (решение владельца): реплай на
+# бота и @. Имя — нет: им часто говорят о нём в третьем лице. responder._recheck
+# использует ту же константу.
+PRESENCE_EXEMPT: frozenset[Trigger] = frozenset({Trigger.REPLY, Trigger.MENTION})
 
 
 def _drop(reason: str) -> Decision:
@@ -113,9 +121,9 @@ def _direct_address_decision(
     behaviour = cfg.behaviour
     if in_window(now, cfg.persona.timezone, behaviour.quiet_window):
         return Decision(verdict=Verdict.QUEUE_NIGHT, trigger=trigger, reason="gate:night_queued")
-    # Потолок присутствия: реплай на сообщение бота проходит всегда (человек ответил
-    # именно ему), обращение по имени или через @ — нет.
-    if trigger is not Trigger.REPLY and _over_presence_cap(state, cfg):
+    # Потолок присутствия: реплай на бота и @ проходят всегда (человек написал
+    # именно ему), обращение по имени — нет.
+    if trigger not in PRESENCE_EXEMPT and _over_presence_cap(state, cfg):
         return _drop("gate:presence_cap")
     if state.mention_count_today >= behaviour.mention_daily_cap:
         return _drop("gate:mention_cap")
@@ -158,10 +166,6 @@ def should_consider(
             state_changes=(StateChange("topic_cooldown_until", str(cooldown_until)),),
         )
 
-    # 5. кулдаун после стоп-листа
-    if state.topic_cooldown_until is not None and state.topic_cooldown_until > now:
-        return _drop("gate:topic_cooldown")
-
     # 5a. маркеры команд — молчание без кулдауна
     if patterns.injection(msg.text) is not None:
         return _drop("gate:injection")
@@ -174,6 +178,10 @@ def should_consider(
     # 7. ночное окно для ambient
     if in_window(now, tz, behaviour.quiet_window):
         return _drop("gate:night")
+
+    # 7a. кулдаун после стоп-листа — только для ambient: обращения его не проверяют
+    if state.topic_cooldown_until is not None and state.topic_cooldown_until > now:
+        return _drop("gate:topic_cooldown")
 
     # 8. логистический фильтр
     if patterns.logistics(msg.text) is not None:

@@ -271,11 +271,39 @@ def test_topic_stop_drops_with_state_change() -> None:
     assert change.value == str(DAY + 45 * 60)
 
 
-def test_topic_cooldown_active_drops() -> None:
-    decision = default_call(state=make_state(topic_cooldown_until=DAY + 10))
+def test_topic_cooldown_active_drops_ambient() -> None:
+    decision = default_call(state=make_state(topic_cooldown_until=DAY + 10, recent=LIVE_RECENT))
     assert decision.verdict == Verdict.DROP
     assert decision.reason == "gate:topic_cooldown"
     assert decision.state_changes == ()
+
+
+@pytest.mark.parametrize(
+    ("text", "reply_to_bot", "trigger"),
+    [
+        ("да ну", True, Trigger.REPLY),
+        ("@trolobot ты тут", False, Trigger.MENTION),
+        ("фёдор, ты как", False, Trigger.NAME),
+    ],
+)
+def test_topic_cooldown_does_not_block_direct_address(
+    text: str, reply_to_bot: bool, trigger: Trigger
+) -> None:
+    """A3: кулдаун стоп-темы глушит только ambient, обращения проходят."""
+    decision = default_call(
+        msg=make_msg(text=text, reply_to_bot=reply_to_bot),
+        state=make_state(topic_cooldown_until=DAY + 10),
+    )
+    assert decision.verdict == Verdict.PASS
+    assert decision.trigger is trigger
+
+
+def test_topic_stop_in_direct_address_still_drops_with_cooldown() -> None:
+    """Сообщение со стоп-темой — DROP gate:topic, даже если это обращение."""
+    decision = default_call(msg=make_msg(text="фёдор, опять эта война"))
+    assert decision.verdict == Verdict.DROP
+    assert decision.reason == "gate:topic"
+    assert decision.state_changes[0].key == "topic_cooldown_until"
 
 
 def test_topic_cooldown_expired_does_not_drop() -> None:
@@ -787,13 +815,15 @@ def test_presence_cap_drops_name_address() -> None:
     assert decision.reason == "gate:presence_cap"
 
 
-def test_presence_cap_drops_mention() -> None:
+def test_presence_cap_lets_mention_through() -> None:
+    """@ проходит под потолком (A2), в отличие от обращения по имени."""
     state = make_state(**OVER_CAP)
     decision = should_consider(
         make_msg(text="@trolobot ты тут"), state, make_cfg(), FakePatterns(), DAY, FixedRandom(0.0)
     )
-    assert decision.verdict is Verdict.DROP
-    assert decision.reason == "gate:presence_cap"
+    assert decision.verdict is Verdict.PASS
+    assert decision.trigger is Trigger.MENTION
+    assert decision.reason == "pass:mention"
 
 
 def test_presence_cap_lets_reply_to_bot_through() -> None:

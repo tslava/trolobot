@@ -4227,6 +4227,151 @@ async def test_recheck_presence_lets_reply_to_bot_through(db: Database) -> None:
         await llm.aclose()
 
 
+def _pending_row(pending_id: int, trigger: str, due_at: int) -> PendingRow:
+    return PendingRow(
+        id=pending_id,
+        trigger_tg_message_id=50,
+        user_id=5,
+        trigger=trigger,
+        due_at=due_at,
+        created_at=DAY_NOW - 60,
+        done_at=None,
+    )
+
+
+async def test_recheck_presence_lets_mention_through(db: Database) -> None:
+    """A2: @ проходит под потолком и в момент отправки."""
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Да ну."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _fill_presence(db, humans=20, bot_replies=5, now=DAY_NOW)
+        pid = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        await _drive(clock, responder._fire_pending(_pending_row(pid, "mention", DAY_NOW)))
+        assert len(calls) == 1
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+@pytest.mark.parametrize("trigger", ["reply", "mention", "name"])
+async def test_recheck_ignores_topic_cooldown_for_direct_address(
+    db: Database, trigger: str
+) -> None:
+    """A3: кулдаун стоп-темы не режет обращение в момент отправки."""
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Да ну."))
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, FakeBot(), clock)
+    try:
+        await db.set_state("topic_cooldown_until", str(DAY_NOW + 600))
+        row = _pending_row(1, trigger, DAY_NOW)
+        assert await responder._recheck(row, DAY_NOW, cfg) is None
+        ambient = _pending_row(2, "ambient", DAY_NOW)
+        assert await responder._recheck(ambient, DAY_NOW, cfg) == "send:recheck_topic"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_llm_http_failure_retries_address_pending_once(db: Database) -> None:
+    """A6: llm:http у обращения -> перенос на 120-300 с, второй сбой -> молчание."""
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, lambda _req: httpx.Response(500, text="boom"))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        pid = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        responder._pending_info[pid] = [("Вася", "@bot привет")]
+        await responder._fire_pending(_pending_row(pid, "mention", DAY_NOW))
+
+        pending = await db.load_pending()
+        assert [p.id for p in pending] == [pid]
+        assert DAY_NOW + 120 <= pending[0].due_at <= DAY_NOW + 300
+        assert responder._pending_info[pid] == [("Вася", "@bot привет")]
+        assert pid in responder._pending_tasks
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:llm_retry") == 1
+        assert "llm:http" not in summary
+
+        # Таймер отменяем (иначе он сработает сам), второй сбой гоним вручную.
+        responder._pending_tasks.pop(pid).cancel()
+        await responder._fire_pending(_pending_row(pid, "mention", pending[0].due_at))
+
+        assert await db.load_pending() == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("send:llm_retry") == 1
+        assert summary.get("llm:http") == 1
+        assert bot.sent == []
+        assert len(calls) == 2
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_llm_http_failure_does_not_retry_ambient(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, _calls = _make_llm(cfg, db, lambda _req: httpx.Response(500, text="boom"))
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, FakeBot(), clock)
+    try:
+        await responder._respond(
+            trigger=Trigger.AMBIENT, trigger_msg_id=None, user_id=None, situation="", delay_sec=0
+        )
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("llm:http") == 1
+        assert "send:llm_retry" not in summary
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_llm_circuit_open_does_not_retry_address_pending(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.min_gap_sec = 0
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, FakeBot(), clock)
+    try:
+        await db.set_state("llm_circuit_until", str(DAY_NOW + 600))
+        pid = await db.insert_pending(
+            trigger_tg_message_id=50,
+            user_id=5,
+            trigger="mention",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 60,
+        )
+        await responder._fire_pending(_pending_row(pid, "mention", DAY_NOW))
+        assert await db.load_pending() == []
+        summary = dict(await db.filter_log_summary(0))
+        assert summary.get("llm:circuit_open") == 1
+        assert "send:llm_retry" not in summary
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 async def test_min_gap_delays_pending_instead_of_dropping_it(db: Database) -> None:
     """Обращение не отбрасывается паузой — pending переносится на last + min_gap."""
     cfg = _config()
