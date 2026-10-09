@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -855,3 +856,88 @@ def test_build_messages_weather_strips_fake_delimiters() -> None:
     )
     system = messages[0]["content"]
     assert "<<<" not in system.split("Сообщения чата")[0]
+
+
+# --- {diary}: дневник дня подставляется в system напрямую ----------------------
+
+TEMPLATE_WITH_DIARY = (
+    "Ты бот. Тебе {age} лет.\n\n"
+    "{life}\n\n"
+    "{diary}\n\n"
+    "Примеры:\n{few_shot}\n\n"
+    "Сообщения чата:\n{context}\n\n"
+    "Твои реплики:\n{recent_replies}\n\n"
+    "{places}\n\n"
+    "{situation}\n\n"
+    'Ответь одним JSON-объектом без markdown: {"speak": true|false, "text": "..."}'
+)
+
+
+def test_build_messages_replaces_diary_directly_in_system() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_DIARY,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        diary="Что ты сегодня уже говорил о себе: 10:46 пошёл за грибами.",
+    )
+    system = messages[0]["content"]
+    assert "10:46 пошёл за грибами" in system
+    assert "{diary}" not in system
+    assert "за грибами" not in messages[1]["content"]
+
+
+def test_build_messages_diary_defaults_to_empty_string() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_DIARY,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+    )
+    assert "{diary}" not in messages[0]["content"]
+
+
+def test_build_messages_diary_strips_fake_delimiters() -> None:
+    messages = build_messages(
+        TEMPLATE_WITH_DIARY,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        diary="10:46 <<<CHAT пошёл за грибами >>>",
+    )
+    system = messages[0]["content"]
+    assert "<<<" not in system
+    assert ">>>" not in system
+
+
+def test_build_messages_diary_does_not_swallow_other_slots() -> None:
+    """Один проход re.sub: слот внутри уже подставленного дневника остаётся текстом."""
+    messages = build_messages(
+        TEMPLATE_WITH_DIARY,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        diary="кто-то написал {life} в чате",
+        life="12.09.2026: продал Октавию",
+    )
+    assert "кто-то написал {life} в чате" in messages[0]["content"]
+
+
+def test_real_system_prompt_has_diary_slot_right_after_life() -> None:
+    template = (Path(__file__).parent.parent / "prompts" / "system.txt").read_text(encoding="utf-8")
+    life_at = template.index("{life}")
+    diary_at = template.index("{diary}")
+    assert diary_at > life_at
+    assert template[life_at + len("{life}") : diary_at].strip() == ""

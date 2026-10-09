@@ -508,6 +508,37 @@ class ChatMemoryConfig(BaseModel):
         return value
 
 
+class DiaryConfig(BaseModel):
+    """Дневник дня (CLAUDE.md, "дневник дня"): после каждой своей реплики дешёвая модель
+    достаёт из неё факт о собственных делах персонажа («пошёл за грибами»), и факты дня
+    идут в системный промпт слотом {diary} — чтобы он не противоречил сам себе.
+    """
+
+    enabled: bool = Field(default=True, description="Включает дневник дня: факты о себе из реплик")
+    model: str = Field(default="", description="Модель извлечения факта; пусто -> llm.judge_model")
+    max_tokens: int = Field(
+        default=80, ge=20, le=300, description="Лимит токенов ответа модели на извлечение факта"
+    )
+    daily_cap: int = Field(
+        default=30, ge=0, le=500, description="Вызовов извлечения в сутки, счётчик diary_calls"
+    )
+    week_days: int = Field(
+        default=6, ge=0, le=30, description="Сколько прошлых суток показывать строкой «на неделе»"
+    )
+    keep_days: int = Field(default=14, ge=1, le=90, description="Сколько суток хранить факты в БД")
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
+
+
 class VisionConfig(BaseModel):
     """Зрение на фото (CLAUDE.md, "Интерфейсы: зрение на фото"). Снимок из чата
     описывается моделью со зрением одной-двумя фразами, и описание становится
@@ -656,6 +687,10 @@ class BehaviourConfig(BaseModel):
     chat_memory: ChatMemoryConfig = Field(
         default_factory=ChatMemoryConfig,
         description="Долгая память чата: пересказы прошедших разговоров по неделям",
+    )
+    diary: DiaryConfig = Field(
+        default_factory=DiaryConfig,
+        description="Дневник дня: факты о себе из своих реплик, слот {diary} в промпте",
     )
     vision: VisionConfig = Field(
         default_factory=VisionConfig,

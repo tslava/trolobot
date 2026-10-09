@@ -55,6 +55,7 @@ from trolobot.chat_memory import render_chat_memory
 from trolobot.config_models import Config, HotWindowConfig
 from trolobot.db import Database, LifeEventRow, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
+from trolobot.diary import DiaryExtractor, render_diary
 from trolobot.filters import FilterContext
 from trolobot.followup import FollowupChecker
 from trolobot.gate import PRESENCE_EXEMPT
@@ -304,6 +305,7 @@ class Responder:
         followup: FollowupChecker | None = None,
         weather: WeatherClient | None = None,
         weather_places: WeatherPlaceExtractor | None = None,
+        diary: DiaryExtractor | None = None,
         patterns_getter: Callable[[], Patterns],
         prompt_store: _PromptStoreLike,
         rng: random.Random,
@@ -328,6 +330,11 @@ class Responder:
         # из вопроса дешёвой моделью; None -> погода всегда только домашняя.
         self.weather = weather
         self.weather_places = weather_places
+        # Дневник дня (CLAUDE.md, "дневник дня"): после успешной текстовой отправки
+        # дешёвая модель достаёт из реплики факт о делах персонажа. None -> факты не
+        # извлекаются (слот {diary} при этом всё равно заполняется уже записанным).
+        self.diary = diary
+        self._diary_tasks: set[asyncio.Task[None]] = set()
         self.patterns_getter = patterns_getter
         self.prompt_store = prompt_store
         self.rng = rng
@@ -1197,6 +1204,22 @@ class Responder:
         # жизни") — это память персонажа, а не данные, ограниченные обращением.
         life_block = render_life(await self.db.life_events(), tz)
 
+        # Слот {diary} (CLAUDE.md, "дневник дня") — тоже всегда и для любого
+        # триггера: факты, которые персонаж сегодня уже сообщил о своих делах.
+        midnight = day_start(now, tz)
+        today_facts = await self.db.self_facts_since(midnight)
+        week_days = cfg.behaviour.diary.week_days
+        week_facts = (
+            [
+                fact
+                for fact in await self.db.self_facts_since(midnight - week_days * 86400)
+                if fact.created_at < midnight
+            ]
+            if week_days > 0
+            else []
+        )
+        diary_block = render_diary(today_facts, week_facts, tz)
+
         # Слот {chat_memory} (CLAUDE.md, "долгая память чата") — тоже всегда и для
         # любого триггера: пересказы прошедших недель живут дольше самих сообщений
         # и заменяют персонажу то, что уже вычистил ретеншн.
@@ -1241,6 +1264,7 @@ class Responder:
             situation=situation,
             avoid=avoid_block,
             life=life_block,
+            diary=diary_block,
             chat_memory=chat_memory_block,
             weather=weather_block,
             **build_messages_kwargs,
@@ -1510,6 +1534,8 @@ class Responder:
             created_at=now,
         )
         await self._finish_pending(pending_id, now)
+        if sticker is None:
+            self._spawn_diary(sent_text, sent_message_id)
         # Горячее окно из ОБЩЕГО хвоста — только если владелец включил
         # hot_window.open_on_any_reply (CLAUDE.md, "меньше и разнообразнее", мера 2).
         # По умолчанию окно открывают лишь /life и /say: «после каждой своей реплики
@@ -1553,6 +1579,34 @@ class Responder:
             return
         await self.db.set_state("hot_until", str(now + hot_window.minutes * 60))
         await self.db.set_state("hot_ambient_count", "0")
+
+    def _spawn_diary(self, text: str, tg_message_id: int) -> None:
+        """Запускает фоновое извлечение факта из ушедшей в чат реплики (CLAUDE.md,
+        "дневник дня"). Задача живёт вне ``_respond_lock`` и не задерживает ответ;
+        хранится в множестве (иначе event loop может собрать её сборщиком мусора) и
+        отменяется в ``shutdown``. Стикеры сюда не попадают — вызывающий их не передаёт."""
+        if self.diary is None or not self.cfg_getter().behaviour.diary.enabled:
+            return
+        task = asyncio.ensure_future(self._extract_diary(text, tg_message_id))
+        self._diary_tasks.add(task)
+        task.add_done_callback(self._diary_tasks.discard)
+
+    async def _extract_diary(self, text: str, tg_message_id: int) -> None:
+        """Тело фоновой задачи: ни одно исключение (кроме отмены) не выходит наружу."""
+        if self.diary is None:
+            return
+        try:
+            now = self._clock()
+            fact = await self.diary.extract(text, now=now)
+            if fact is None:
+                return
+            await self.db.insert_self_fact(
+                text=fact, bot_reply_tg_message_id=tg_message_id, created_at=now
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("diary: фоновое извлечение факта упало")
 
     async def announce_life(self, event: LifeEventRow) -> SendOutcome:
         """Публикует событие жизни (``/life``/``/life post``, CLAUDE.md, "события
@@ -1667,6 +1721,7 @@ class Responder:
                 shadow=False,
                 created_at=now,
             )
+            self._spawn_diary(text, sent_message.message_id)
             await self._maybe_open_hot_window(cfg, now)
             return SendOutcome(
                 sent=True, text=text, reason="send:say", tg_message_id=sent_message.message_id
@@ -2073,6 +2128,10 @@ class Responder:
                 self._respond_lock.release()
 
         tasks: list[asyncio.Task[None]] = []
+        for diary_task in list(self._diary_tasks):
+            if not diary_task.done():
+                diary_task.cancel()
+            tasks.append(diary_task)
         if self._debounce_task is not None and not self._debounce_task.done():
             self._debounce_task.cancel()
             tasks.append(self._debounce_task)
@@ -2084,3 +2143,4 @@ class Responder:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._pending_tasks.clear()
+        self._diary_tasks.clear()

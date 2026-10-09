@@ -143,7 +143,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(
-    r"\{(age|few_shot|life|chat_memory|weather|context|recent_replies|places|avoid|situation)\}"
+    r"\{(age|few_shot|life|diary|chat_memory|weather|context|recent_replies|places|avoid|situation)\}"
 )
 
 
@@ -306,6 +306,7 @@ def build_messages(
     situation: str,
     avoid: str = "",
     life: str = "",
+    diary: str = "",
     chat_memory: str = "",
     weather: str = "",
     json_reminder: str = _JSON_REMINDER,
@@ -323,6 +324,8 @@ def build_messages(
     context и recent_replies — внутри разделителей <<<CHAT ... >>>. {life} —
     исключение: это память владельца о персонаже (как few_shot), а не ввод
     участников чата, поэтому подставляется в system напрямую, реальным значением.
+    {diary} (CLAUDE.md, "дневник дня") — тоже в system: факты о собственных делах
+    персонажа, достанные из его же реплик (diary.render_diary), а не ввод участников.
     {chat_memory} — такое же исключение: это уже сжатый моделью пересказ прошедших
     недель (chat_memory.py), память персонажа, а не сырые сообщения участников.
     {avoid} (CLAUDE.md, "меньше и разнообразнее", мера 5) — тоже в system: это не
@@ -336,6 +339,7 @@ def build_messages(
         "age": str(age),
         "few_shot": few_shot,
         "life": life,
+        "diary": _strip_fake_delimiters(diary).strip(),
         "chat_memory": chat_memory,
         "weather": _strip_fake_delimiters(weather).strip(),
         "context": _CONTEXT_MARKER,

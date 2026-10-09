@@ -20,7 +20,7 @@ from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
 from trolobot.commands import build_commands_router
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import ChatMemoryRow, LifeEventRow
+from trolobot.db import ChatMemoryRow, LifeEventRow, SelfFactRow
 from trolobot.few_shot import FewShot
 from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
@@ -80,6 +80,7 @@ class FakeDb:
     life_events_store: dict[int, LifeEventRow] = field(default_factory=dict)
     _next_life_event_id: int = 1
     chat_memory_store: dict[int, ChatMemoryRow] = field(default_factory=dict)
+    self_facts_store: dict[int, SelfFactRow] = field(default_factory=dict)
     # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): /status считает его по
     # таблицам, здесь — просто два числа.
     messages_today_value: int = 0
@@ -173,6 +174,13 @@ class FakeDb:
         if not self.chat_memory_store:
             return None
         return max(row.period_end for row in self.chat_memory_store.values())
+
+    async def self_facts_since(self, since: int) -> list[SelfFactRow]:
+        rows = [row for row in self.self_facts_store.values() if row.created_at >= since]
+        return sorted(rows, key=lambda r: (r.created_at, r.id))
+
+    async def delete_self_fact(self, fact_id: int) -> bool:
+        return self.self_facts_store.pop(fact_id, None) is not None
 
 
 @dataclass
@@ -2395,3 +2403,115 @@ async def test_status_starts_with_version(
     await handler(message)
 
     assert sent[0].startswith("trolobot v")
+
+
+# --- /diary (CLAUDE.md, "дневник дня") ------------------------------------------
+
+
+def _fact(fact_id: int, text: str, created_at: datetime) -> SelfFactRow:
+    return SelfFactRow(
+        id=fact_id,
+        text=text,
+        bot_reply_tg_message_id=None,
+        created_at=int(created_at.timestamp()),
+    )
+
+
+async def test_diary_list_empty(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/diary")
+    await handler(message)
+
+    assert sent == ["Фактов нет."]
+
+
+async def test_diary_list_shows_week_in_local_time(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.self_facts_store[1] = _fact(1, "пошёл за грибами", datetime(2026, 1, 10, 9, 46, tzinfo=UTC))
+    db.self_facts_store[2] = _fact(2, "давний факт", datetime(2025, 12, 1, 9, 0, tzinfo=UTC))
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/diary")
+    await handler(message)
+
+    assert sent == ["#1 10.01 10:46 пошёл за грибами"]
+
+
+async def test_diary_rm_deletes_and_audits(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.self_facts_store[1] = _fact(1, "пошёл за грибами", NOW)
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/diary rm 1")
+    await handler(message)
+
+    assert sent == ["Факт #1 удалён."]
+    assert db.self_facts_store == {}
+    assert db.audit_stop_calls == [("diary:rm", ADMIN_ID, int(NOW.timestamp()))]
+    assert db.audit_values["diary:rm"] == "пошёл за грибами"
+
+
+async def test_diary_rm_unknown_and_bad_args(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    for text in ("/diary rm 7", "/diary rm", "/diary что-то"):
+        await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text=text))
+
+    usage = "Использование: /diary | /diary rm N"
+    assert sent == ["Нет факта #7.", usage, usage]
+
+
+async def test_diary_command_in_chat_does_nothing(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.self_facts_store[1] = _fact(1, "пошёл за грибами", NOW)
+    handler = _handler(deps)
+
+    await handler(_message(chat=_chat(), from_user=_user(ADMIN_ID), text="/diary"))
+
+    assert sent == []
+
+
+async def test_help_mentions_diary_and_fits_limit(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, _, _, _ = _deps(settings=settings, config=config)
+    handler = _handler(deps)
+
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/help"))
+
+    assert "/diary" in sent[0]
+    assert len(sent[0]) <= 3500
+
+
+async def test_status_shows_diary_line(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    db.self_facts_store[1] = _fact(1, "пошёл за грибами", NOW)
+    db.state[day_key("diary_calls", int(NOW.timestamp()), "Europe/Warsaw")] = "4"
+    handler = _handler(deps)
+
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status"))
+
+    cap = config.behaviour.diary.daily_cap
+    assert f"diary: 1, calls 4/{cap}" in sent[0]

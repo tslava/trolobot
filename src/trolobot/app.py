@@ -18,6 +18,7 @@ from trolobot.bot import Deps, build_router
 from trolobot.chat_memory import ChatMemorizer
 from trolobot.commands import build_commands_router
 from trolobot.db import Database
+from trolobot.diary import DiaryExtractor
 from trolobot.followup import FollowupChecker
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
@@ -211,6 +212,11 @@ async def main() -> None:
             weather_place_prompt = settings.weather_place_prompt_path.read_text(encoding="utf-8")
             weather_places = WeatherPlaceExtractor(llm, config_store.get, weather_place_prompt)
 
+            # Дневник дня (CLAUDE.md, "дневник дня"): дешёвое извлечение факта о себе
+            # из каждой своей текстовой реплики; модель и enabled — на каждом вызове.
+            diary_prompt = settings.diary_prompt_path.read_text(encoding="utf-8")
+            diary = DiaryExtractor(llm, config_store.get, diary_prompt)
+
             responder = Responder(
                 bot=bot,
                 db=db,
@@ -220,6 +226,7 @@ async def main() -> None:
                 sticker_chooser=sticker_chooser,
                 weather=weather,
                 weather_places=weather_places,
+                diary=diary,
                 patterns_getter=config_store.patterns,
                 prompt_store=prompt_store,
                 rng=rng,

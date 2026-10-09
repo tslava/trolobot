@@ -33,7 +33,7 @@ from trolobot.changelog import Release, parse_changelog
 from trolobot.chat_memory import format_period
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import ChatMemoryRow, LifeEventRow
+from trolobot.db import ChatMemoryRow, LifeEventRow, SelfFactRow
 from trolobot.few_shot import FewShot
 from trolobot.sanitize import normalize_text, sanitize_display_name
 from trolobot.settings import Settings
@@ -82,6 +82,7 @@ _HELP_TEXT = (
     "/life list | rm N | post N — события: список, удалить, повторить\n"
     "/say <текст> — сказать в чат дословно\n"
     "/memory [list|rm N|run] — долгая память чата: пересказы по неделям\n"
+    "/diary [rm N] — факты о себе за неделю (дневник дня): список, удалить\n"
     "/changelog [owner|<версия>] — что нового: блок для чата или для владельца\n"
     "/help — эта справка"
 )
@@ -95,6 +96,10 @@ _MEMORY_USAGE = "Использование: /memory [list | rm N | run]"
 _MEMORY_LIST_LIMIT = 20
 # Сколько символов свежесозданных пересказов показать в ответе на /memory run.
 _MEMORY_RUN_PREVIEW_LEN = 1500
+
+# /diary: подсказка при кривом вводе и окно списка (CLAUDE.md, "дневник дня": «за неделю»).
+_DIARY_USAGE = "Использование: /diary | /diary rm N"
+_DIARY_LIST_DAYS = 7
 
 
 class _MessageRowLike(Protocol):
@@ -183,6 +188,9 @@ class _DbLike(Protocol):
     async def chat_memory_count(self) -> int: ...
     async def delete_chat_memory(self, memory_id: int) -> bool: ...
     async def last_chat_memory_end(self) -> int | None: ...
+    # -- дневник дня (/diary, CLAUDE.md "дневник дня") -----------------------
+    async def self_facts_since(self, since: int) -> Sequence[SelfFactRow]: ...
+    async def delete_self_fact(self, fact_id: int) -> bool: ...
 
 
 class _ResponderLike(Protocol):
@@ -458,6 +466,9 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"presence: {bot_today}/{presence_cfg.allowance(human_today)} (people {human_today})"
     )
 
+    diary_calls = int(await deps.db.get_state(day_key("diary_calls", now, tz)) or "0")
+    diary_today = len(await deps.db.self_facts_since(midnight))
+
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
 
@@ -533,6 +544,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         hot_line,
         f"followup calls: {followup_calls}/{cfg.behaviour.followup.daily_cap}",
         f"vision: {vision_count}/{cfg.behaviour.vision.daily_cap}",
+        f"diary: {diary_today}, calls {diary_calls}/{cfg.behaviour.diary.daily_cap}",
         checkin_line,
         presence_line,
         weather_line,
@@ -876,6 +888,43 @@ async def _cmd_memory_rm(
     await _reply(message, f"Пересказ #{memory_id} удалён.")
 
 
+async def _cmd_diary(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    """/diary [rm N] — факты о себе, достанные из реплик (CLAUDE.md, "дневник дня").
+
+    Голое /diary — список за неделю «#N dd.mm HH:MM текст»; /diary rm N удаляет факт
+    (если модель вытащила не то, он перестаёт попадать в слот {diary})."""
+    if not args:
+        tz = deps.config_store.get().persona.timezone
+        rows = await deps.db.self_facts_since(now - _DIARY_LIST_DAYS * 86400)
+        if not rows:
+            await _reply(message, "Фактов нет.")
+            return
+        lines = [
+            f"#{row.id} {local_dt(row.created_at, tz).strftime('%d.%m %H:%M')} {row.text}"
+            for row in rows
+        ]
+        await _reply(message, "\n".join(lines))
+        return
+    if args[0].lower() != "rm":
+        await _reply(message, _DIARY_USAGE)
+        return
+    fact_id = _parse_int(args[1]) if len(args) > 1 else None
+    if fact_id is None:
+        await _reply(message, _DIARY_USAGE)
+        return
+    rows = await deps.db.self_facts_since(0)
+    fact = next((row for row in rows if row.id == fact_id), None)
+    if fact is None:
+        await _reply(message, f"Нет факта #{fact_id}.")
+        return
+    await deps.db.delete_self_fact(fact_id)
+    await deps.db.audit_stop("diary:rm", admin_user_id, now, fact.text)
+    logger.info("diary rm: #%s", fact_id)
+    await _reply(message, f"Факт #{fact_id} удалён.")
+
+
 async def _cmd_memory_run(
     message: Message, deps: _CommandsDeps, now: int, admin_user_id: int
 ) -> None:
@@ -1045,6 +1094,8 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_say(message, deps, now, admin_user_id, text, tokens)
                 elif cmd == "memory":
                     await _cmd_memory(message, deps, now, admin_user_id, args)
+                elif cmd == "diary":
+                    await _cmd_diary(message, deps, now, admin_user_id, args)
                 elif cmd == "changelog":
                     await _cmd_changelog(message, deps, args)
                 elif cmd == "help":

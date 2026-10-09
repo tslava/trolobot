@@ -17,9 +17,15 @@ class _ChatMemory:
 
 
 @dataclass
+class _Diary:
+    keep_days: int = 14
+
+
+@dataclass
 class _Behaviour:
     message_retention_days: int
     chat_memory: _ChatMemory = field(default_factory=_ChatMemory)
+    diary: _Diary = field(default_factory=_Diary)
 
 
 @dataclass
@@ -227,5 +233,61 @@ async def test_retention_loop_passes_chat_memory_keep_days(tmp_path: Path) -> No
             await task
 
         assert await db.chat_memory(memory_id) is None
+    finally:
+        await db.close()
+
+
+async def test_run_retention_purges_self_facts_by_diary_keep_days(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        now = 1_768_003_200
+        cutoff = now - 14 * 86400
+        for text, created_at in (("старое", cutoff - 1), ("свежее", cutoff + 1)):
+            await db.insert_self_fact(
+                text=text, bot_reply_tg_message_id=None, created_at=created_at
+            )
+
+        stats = await run_retention(db, 30, "UTC", now, None, 14)
+
+        assert stats.self_facts_deleted == 1
+        assert [f.text for f in await db.self_facts_since(0)] == ["свежее"]
+    finally:
+        await db.close()
+
+
+async def test_run_retention_leaves_self_facts_alone_without_keep_days(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_self_fact(text="давнее", bot_reply_tg_message_id=None, created_at=5)
+
+        stats = await run_retention(db, 30, "UTC", 1_768_003_200)
+
+        assert stats.self_facts_deleted == 0
+        assert len(await db.self_facts_since(0)) == 1
+    finally:
+        await db.close()
+
+
+async def test_retention_loop_passes_diary_keep_days(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_self_fact(text="давнее", bot_reply_tg_message_id=None, created_at=5)
+
+        def cfg_getter() -> _Config:
+            return _Config(
+                behaviour=_Behaviour(message_retention_days=30, diary=_Diary(keep_days=3)),
+                persona=_Persona(timezone="UTC"),
+            )
+
+        task = asyncio.create_task(retention_loop(db, cfg_getter, interval_sec=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert await db.self_facts_since(0) == []
     finally:
         await db.close()

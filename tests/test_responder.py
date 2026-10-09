@@ -486,6 +486,37 @@ class FakeWeatherPlaces:
         return self.place
 
 
+class FakeDiary:
+    """Подделка DiaryExtractor (CLAUDE.md, "дневник дня"): возвращает заготовленный
+    факт, пишет вызовы; ``error`` — бросить исключение, ``gate`` — ждать события
+    (проверить, что ответ в чат не ждёт извлечения)."""
+
+    def __init__(
+        self,
+        fact: str | None = "пошёл за грибами",
+        *,
+        error: Exception | None = None,
+        gate: asyncio.Event | None = None,
+    ) -> None:
+        self.fact = fact
+        self.error = error
+        self.gate = gate
+        self.calls: list[str] = []
+
+    async def extract(self, reply_text: str, *, now: int) -> str | None:
+        self.calls.append(reply_text)
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.error is not None:
+            raise self.error
+        return self.fact
+
+
+async def _drain_diary(responder: Responder) -> None:
+    """Дожидается фоновых задач дневника (в проде их никто не ждёт)."""
+    await asyncio.gather(*list(responder._diary_tasks))
+
+
 def _weather_snapshot(fetched_at: int = DAY_NOW) -> Weather:
     return Weather(
         temp_now=9.4,
@@ -515,6 +546,7 @@ def _make_responder(
     followup: FakeFollowup | None = None,
     weather: FakeWeatherClient | None = None,
     weather_places: FakeWeatherPlaces | None = None,
+    diary: FakeDiary | None = None,
 ) -> Responder:
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
     return Responder(
@@ -527,6 +559,7 @@ def _make_responder(
         followup=followup,  # type: ignore[arg-type]  # FakeFollowup: узкий протокол check/check_batch
         weather=weather,  # type: ignore[arg-type]  # FakeWeatherClient: get/geocode/home_name
         weather_places=weather_places,  # type: ignore[arg-type]  # FakeWeatherPlaces: extract
+        diary=diary,  # type: ignore[arg-type]  # FakeDiary: узкий протокол extract
         patterns_getter=lambda: patterns,
         prompt_store=prompt_store if prompt_store is not None else FakePromptStore(),
         rng=rng if rng is not None else random.Random(seed),  # type: ignore[arg-type]
@@ -5359,6 +5392,302 @@ async def test_weather_place_lookup_disabled_by_config(db: Database) -> None:
         assert places.calls == []
         system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
         assert "Спрашивают про" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- дневник дня (CLAUDE.md, "дневник дня") -----------------------------------
+
+PROMPT_TEMPLATE_WITH_DIARY = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "{life}\n"
+    "{diary}\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{situation}"
+)
+
+
+async def _ambient(clock: FakeClock, responder: Responder) -> None:
+    await _drive(
+        clock,
+        responder._respond(
+            trigger=Trigger.AMBIENT, trigger_msg_id=50, user_id=None, situation="", delay_sec=0
+        ),
+    )
+
+
+async def test_diary_slot_filled_with_today_and_week_facts(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    await db.insert_self_fact(
+        text="чинил движок", bot_reply_tg_message_id=None, created_at=DAY_NOW - 2 * 86400
+    )
+    await db.insert_self_fact(
+        text="пошёл за грибами", bot_reply_tg_message_id=None, created_at=DAY_NOW - 3600
+    )
+    responder = _make_responder(
+        db, cfg, llm, bot, clock, prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_DIARY)
+    )
+    try:
+        await _ambient(clock, responder)
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Что ты сегодня уже говорил о себе (держись этого, не противоречь): " in system
+        assert "14:00 пошёл за грибами" in system
+        assert "На этой неделе: чт чинил движок." in system
+        assert "{diary}" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_slot_empty_without_facts(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db, cfg, llm, bot, clock, prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_DIARY)
+    )
+    try:
+        await _ambient(clock, responder)
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "{diary}" not in system
+        assert "говорил о себе" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_week_days_zero_hides_week_line(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.diary.week_days = 0
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    await db.insert_self_fact(
+        text="чинил движок", bot_reply_tg_message_id=None, created_at=DAY_NOW - 2 * 86400
+    )
+    responder = _make_responder(
+        db, cfg, llm, bot, clock, prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_DIARY)
+    )
+    try:
+        await _ambient(clock, responder)
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "На этой неделе" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_extracts_fact_from_sent_text_and_stores_it(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Иду за грибами."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    diary = FakeDiary("пошёл за грибами")
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        await _ambient(clock, responder)
+        await _drain_diary(responder)
+
+        assert diary.calls == ["Иду за грибами."]
+        facts = await db.self_facts_since(0)
+        assert [f.text for f in facts] == ["пошёл за грибами"]
+        assert facts[0].bot_reply_tg_message_id == bot._next_id
+        assert facts[0].created_at == clock.now()
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_extracts_from_final_postprocessed_text(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Иду — за грибами."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    diary = FakeDiary(None)
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        await _ambient(clock, responder)
+        await _drain_diary(responder)
+
+        assert bot.sent[0][1] == "Иду - за грибами."
+        assert diary.calls == ["Иду - за грибами."]
+        assert await db.self_facts_since(0) == []  # null -> ничего не записано
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_not_extracted_from_sticker(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("И тебе привет."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    chooser = FakeStickerChooser(
+        sticker=Sticker(
+            id=3, file_id="FILE3", emoji="😂", text="Ну ты даёшь", when="", enabled=True
+        )
+    )
+    diary = FakeDiary()
+    responder = _make_responder(db, cfg, llm, bot, clock, sticker_chooser=chooser, diary=diary)
+    try:
+        await _ambient(clock, responder)
+        await _drain_diary(responder)
+
+        assert len(bot.sent_stickers) == 1
+        assert diary.calls == []
+        assert await db.self_facts_since(0) == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_not_extracted_when_model_stays_silent(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _silent_response())
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    diary = FakeDiary()
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        await _ambient(clock, responder)
+        await _drain_diary(responder)
+
+        assert bot.sent == []
+        assert diary.calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_none_behaves_as_before(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Иду за грибами."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        await _ambient(clock, responder)
+
+        assert len(bot.sent) == 1
+        assert responder._diary_tasks == set()
+        assert await db.self_facts_since(0) == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_disabled_in_config_skips_extraction(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.diary.enabled = False
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Иду за грибами."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    diary = FakeDiary()
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        await _ambient(clock, responder)
+
+        assert len(bot.sent) == 1
+        assert diary.calls == []
+        assert responder._diary_tasks == set()
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_extraction_error_is_logged_and_does_not_break_reply(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Иду за грибами."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    diary = FakeDiary(error=RuntimeError("boom"))
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        with caplog.at_level(logging.ERROR, logger="trolobot.responder"):
+            await _ambient(clock, responder)
+            await _drain_diary(responder)
+
+        assert len(bot.sent) == 1
+        assert await db.self_facts_since(0) == []
+        assert any("diary" in record.message for record in caplog.records)
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_extraction_does_not_delay_reply_and_is_cancelled_on_shutdown(
+    db: Database,
+) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, lambda _req: _ok_response("Иду за грибами."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    gate = asyncio.Event()  # никогда не выставляется: извлечение «висит»
+    diary = FakeDiary(gate=gate)
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        await _ambient(clock, responder)
+
+        # Ответ ушёл и _respond завершился, хотя извлечение ещё висит.
+        assert len(bot.sent) == 1
+        assert not responder._respond_lock.locked()
+        pending = list(responder._diary_tasks)
+        assert len(pending) == 1
+        assert not pending[0].done()
+
+        await responder.shutdown()
+
+        assert pending[0].cancelled()
+        assert responder._diary_tasks == set()
+        assert await db.self_facts_since(0) == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_extracts_from_say(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    diary = FakeDiary("пошёл за грибами")
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        await _drive(clock, responder.say("Я за грибами."))
+        await _drain_diary(responder)
+
+        assert diary.calls == ["Я за грибами."]
+        facts = await db.self_facts_since(0)
+        assert [f.text for f in facts] == ["пошёл за грибами"]
+        assert facts[0].bot_reply_tg_message_id == bot._next_id
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_diary_say_blocked_by_panic_does_not_extract(db: Database) -> None:
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    await db.set_state("panic", "1")
+    diary = FakeDiary()
+    responder = _make_responder(db, cfg, llm, bot, clock, diary=diary)
+    try:
+        await _drive(clock, responder.say("Я за грибами."))
+        await _drain_diary(responder)
+
+        assert diary.calls == []
     finally:
         await responder.shutdown()
         await llm.aclose()
