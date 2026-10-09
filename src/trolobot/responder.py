@@ -710,20 +710,23 @@ class Responder:
 
         # Обращения, у которых свой pending (пришли, пока по этому шла генерация, —
         # см. _in_flight), сюда не берём: иначе после рестарта на них ответили бы
-        # дважды. Граница — постановка следующего открытого pending и его триггер.
-        later = [
-            other
+        # дважды. Граница — триггер следующего открытого pending: «следующий» — по
+        # порядку вставки (id), граница — по tg_message_id (в чате растёт монотонно),
+        # не по секундам: в одну секунду их может уложиться несколько (ревью Codex).
+        later_trigger_ids = [
+            other.trigger_tg_message_id
             for other in await self.db.load_pending()
-            if other.id != row.id and other.created_at >= row.created_at
+            if other.id > row.id
         ]
-        until = min((other.created_at for other in later), default=None)
-        foreign_ids = {other.trigger_tg_message_id for other in later}
+        until_id = min(later_trigger_ids, default=None)
 
         candidates = await self.db.messages_since(self.chat_id, row.created_at)
         for candidate in candidates:
-            if candidate.tg_message_id in foreign_ids:
-                continue
-            if until is not None and (candidate.created_at or 0) >= until:
+            if (
+                until_id is not None
+                and candidate.tg_message_id is not None
+                and candidate.tg_message_id >= until_id
+            ):
                 continue
             text = candidate.text or ""
             addressed = False

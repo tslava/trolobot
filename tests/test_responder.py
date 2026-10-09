@@ -1565,6 +1565,56 @@ async def test_collect_addressed_items_skips_messages_of_later_pending(db: Datab
         await llm.aclose()
 
 
+async def test_collect_addressed_items_same_second_boundary_by_message_id(
+    db: Database,
+) -> None:
+    """Граница между pending — по id сообщения, а не по секундам: обращение в ту же
+    секунду, что и постановка следующего pending, но раньше его триггера, остаётся."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        for tg_id, name, at in ((610, "Дима", DAY_NOW - 100), (611, "Оля", DAY_NOW - 50)):
+            await _insert_message(
+                db,
+                tg_message_id=tg_id,
+                user_id=tg_id,
+                display_name=name,
+                text="федя, привет",
+                created_at=at,
+            )
+        await _insert_message(
+            db,
+            tg_message_id=612,
+            user_id=612,
+            display_name="Илья",
+            text="федя, и мне",
+            created_at=DAY_NOW - 50,
+        )
+        a_id = await db.insert_pending(
+            trigger_tg_message_id=610,
+            user_id=610,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 100,
+        )
+        await db.insert_pending(
+            trigger_tg_message_id=612,
+            user_id=612,
+            trigger="name",
+            due_at=DAY_NOW + 60,
+            created_at=DAY_NOW - 50,
+        )
+        row_a = next(p for p in await db.load_pending() if p.id == a_id)
+
+        items = await responder._collect_addressed_items(row_a)
+
+        assert [name for name, _ in items] == ["Дима", "Оля"]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 async def test_collect_addressed_items_caps_at_five(db: Database) -> None:
     cfg = _config()
     llm, _calls = _make_llm(cfg, db, _fail_handler)
