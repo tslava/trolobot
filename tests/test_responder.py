@@ -1510,6 +1510,61 @@ async def test_restored_pending_collects_multiple_addresses_from_messages(db: Da
         await llm.aclose()
 
 
+async def test_collect_addressed_items_skips_messages_of_later_pending(db: Database) -> None:
+    """После рестарта pending A не подбирает обращение, у которого свой pending B
+    (B появился, пока по A шла генерация) — иначе на него ответили бы дважды."""
+    cfg = _config()
+    llm, _calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        await _insert_message(
+            db,
+            tg_message_id=600,
+            user_id=5,
+            display_name="Дима",
+            text="федя, ты тут?",
+            created_at=DAY_NOW - 100,
+        )
+        await _insert_message(
+            db,
+            tg_message_id=601,
+            user_id=6,
+            display_name="Оля",
+            text="федя, и мне ответь",
+            created_at=DAY_NOW - 90,
+        )
+        await _insert_message(
+            db,
+            tg_message_id=602,
+            user_id=7,
+            display_name="Илья",
+            text="федя, а потом мне",
+            created_at=DAY_NOW - 50,
+        )
+        a_id = await db.insert_pending(
+            trigger_tg_message_id=600,
+            user_id=5,
+            trigger="name",
+            due_at=DAY_NOW,
+            created_at=DAY_NOW - 100,
+        )
+        await db.insert_pending(
+            trigger_tg_message_id=602,
+            user_id=7,
+            trigger="name",
+            due_at=DAY_NOW + 60,
+            created_at=DAY_NOW - 50,
+        )
+        row_a = next(p for p in await db.load_pending() if p.id == a_id)
+
+        items = await responder._collect_addressed_items(row_a)
+
+        assert [name for name, _ in items] == ["Дима", "Оля"]
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 async def test_collect_addressed_items_caps_at_five(db: Database) -> None:
     cfg = _config()
     llm, _calls = _make_llm(cfg, db, _fail_handler)
