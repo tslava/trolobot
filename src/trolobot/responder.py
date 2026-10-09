@@ -362,6 +362,10 @@ class Responder:
         # pending_id, которые уже переносили после сбоя провайдера (A6): перенос один,
         # в памяти — после рестарта не повторяется.
         self._llm_retried: set[int] = set()
+        # pending, по которым прямо сейчас идёт генерация: новое обращение в них не
+        # схлопывается, иначе его таймер сработал бы второй раз уже после ответа и бот
+        # ответил бы дважды (ревью Codex). Новое обращение в это время — свой pending.
+        self._in_flight: set[int] = set()
         # Сериализует генерацию+отправку+счётчики одного Responder: без этого два PASS,
         # ждущих LLM параллельно, могли бы оба проскочить одну и ту же проверку бюджета.
         self._respond_lock = asyncio.Lock()
@@ -446,7 +450,9 @@ class Responder:
         earliest = await self._mention_earliest_due(cfg, msg.user_id, now)
         if hot_until is not None:
             earliest = min(earliest, now + cfg.behaviour.hot_window.mention_max_delay_sec)
-        pending_rows = await self.db.load_pending()
+        pending_rows = [
+            row for row in await self.db.load_pending() if row.id not in self._in_flight
+        ]
         if pending_rows:
             pending = pending_rows[0]
             new_due = now + fast_delay(cfg.behaviour, self.rng)
@@ -579,12 +585,15 @@ class Responder:
             logger.exception("pending wait and fire failed: pending_id=%s", row.id)
 
     async def _fire_pending(self, row: PendingRow) -> None:
+        self._in_flight.add(row.id)
         try:
             await self._fire_pending_inner(row)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("fire pending failed: pending_id=%s", row.id)
+        finally:
+            self._in_flight.discard(row.id)
 
     async def _fire_pending_inner(self, row: PendingRow) -> None:
         self._pending_tasks.pop(row.id, None)

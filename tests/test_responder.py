@@ -812,6 +812,35 @@ async def test_second_mention_collapses_pending_without_duplicate(db: Database) 
         await llm.aclose()
 
 
+async def test_mention_during_in_flight_pending_gets_own_pending(db: Database) -> None:
+    """Пока по pending идёт генерация, новое обращение в него не схлопывается: иначе его
+    таймер сработал бы второй раз уже после ответа (двойной ответ, ревью Codex)."""
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, _fail_handler)
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        msg1 = _gate_message(tg_message_id=20, user_id=5, text="фёдор, ты тут?", created_at=DAY_NOW)
+        await responder._handle_debounced(Trigger.NAME, msg1, "Дима")
+        first_id = (await db.load_pending())[0].id
+        first_items = list(responder._pending_info.get(first_id, []))
+        responder._in_flight.add(first_id)  # как будто _fire_pending уже зовёт модель
+
+        msg2 = _gate_message(
+            tg_message_id=21, user_id=6, text="федя, ты где", created_at=DAY_NOW + 2
+        )
+        await responder._handle_debounced(Trigger.NAME, msg2, "Оля")
+
+        pending = await db.load_pending()
+        assert len(pending) == 2
+        second = next(p for p in pending if p.id != first_id)
+        assert second.trigger_tg_message_id == 21
+        assert responder._pending_info.get(first_id, []) == first_items
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 # --- 3b. Кулдаун обращения (решение владельца) не отбрасывает ответ, а сдвигает ---
 # --- due_at не раньше earliest = max(last_mention_reply_at + chat_cooldown, ---
 # --- last_mention_reply_at:<user> + user_cooldown). ---
