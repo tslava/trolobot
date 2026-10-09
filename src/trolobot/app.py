@@ -210,6 +210,7 @@ async def main() -> None:
                 chat_id=settings.allowed_chat_id,
                 jokes_prompt=jokes_prompt,
                 threads_prompt=threads_prompt,
+                patterns_getter=config_store.patterns,
             )
             deps.memorizer = memorizer
 

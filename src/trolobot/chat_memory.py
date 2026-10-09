@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from trolobot.config_models import Config
 from trolobot.db import ChatMemoryRow, Database
 from trolobot.llm import LLMClient, LLMError
+from trolobot.patterns import Patterns
 from trolobot.sanitize import normalize_text
 from trolobot.timeutil import in_window, local_date
 
@@ -192,6 +193,7 @@ class ChatMemorizer:
         interval_sec: int = _JOB_INTERVAL_SEC,
         jokes_prompt: str = "",
         threads_prompt: str = "",
+        patterns_getter: Callable[[], Patterns] | None = None,
     ) -> None:
         self._llm = llm
         self._db = db
@@ -202,6 +204,17 @@ class ChatMemorizer:
         self._interval_sec = interval_sec
         self._jokes_prompt = jokes_prompt
         self._threads_prompt = threads_prompt
+        # Шутки и истории уходят в системный промпт надолго: команды и разговоры о
+        # модели туда не пускаем (Patterns.unsafe_note). None — без проверки (тесты).
+        self._patterns_getter = patterns_getter
+
+    def _unsafe(self, text: str) -> bool:
+        if self._patterns_getter is None:
+            return False
+        hit = self._patterns_getter().unsafe_note(text)
+        if hit is not None:
+            logger.warning("chat memory: заметка отброшена, сработал маркер %r", hit)
+        return hit is not None
 
     async def summarize_period(self, start: int, end: int, *, now: int) -> ChatMemoryRow | None:
         """Один вызов модели на период ``[start, end)``; строка в БД или None.
@@ -339,7 +352,7 @@ class ChatMemorizer:
         saved = 0
         for raw in raw_items:
             joke = _clean_note(raw, _JOKE_MAX_LEN)
-            if joke is None or joke.casefold() in known:
+            if joke is None or joke.casefold() in known or self._unsafe(joke):
                 continue
             known.add(joke.casefold())
             await self._db.insert_joke(text=joke, created_at=now)
@@ -376,6 +389,9 @@ class ChatMemorizer:
         bot_names = {
             name.casefold() for name in (cfg.persona.name, cfg.persona.display_name) if name
         }
+        # Одна и та же история не должна записаться дважды — ни из одного ответа
+        # модели, ни поверх уже открытой: иначе «ну как там?» прозвучит повторно.
+        known = {(row.user_id, row.text.casefold()) for row in await self._db.open_people_threads()}
         saved = 0
         for item in raw_items[:_THREADS_MAX_PER_PERIOD]:
             if not isinstance(item, dict):
@@ -384,11 +400,18 @@ class ChatMemorizer:
             text = _clean_note(item.get("text"), _THREAD_MAX_LEN)
             if name is None or text is None or name.casefold() in bot_names:
                 continue
-            # Только точное совпадение display_name среди сообщений периода: имя из
-            # ответа модели — не повод привязать историю к чужому человеку.
-            user_id = await self._db.user_id_by_display_name(self._chat_id, name, start)
+            if self._unsafe(text):
+                continue
+            # Только точное совпадение display_name среди сообщений периода и только
+            # если под этим именем писал один человек: имя из ответа модели — не повод
+            # привязать историю к чужому человеку или тёзке.
+            user_id = await self._db.user_id_by_display_name(self._chat_id, name, start, end)
             if user_id is None or user_id in muted:
                 continue
+            key = (user_id, text.casefold())
+            if key in known:
+                continue
+            known.add(key)
             await self._db.insert_people_thread(
                 user_id=user_id, display_name=name, text=text, created_at=now
             )

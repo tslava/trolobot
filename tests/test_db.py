@@ -2066,12 +2066,15 @@ async def test_last_message_at_by_user_and_user_id_by_display_name(tmp_path: Pat
         assert await db.last_message_at_by_user(99, 7) is None
         assert await db.last_message_at_by_user(42, 10) is None  # бот не считается
 
-        assert await db.user_id_by_display_name(42, "Илья", 0) == 7
-        assert await db.user_id_by_display_name(42, "Илья", 2500) == 7
-        assert await db.user_id_by_display_name(42, "Аня", 600) is None  # since отсекает
-        assert await db.user_id_by_display_name(42, "аня", 0) is None  # только точное совпадение
-        assert await db.user_id_by_display_name(42, "Фёдор", 0) is None
-        assert await db.user_id_by_display_name(99, "Илья", 0) is None
+        assert await db.user_id_by_display_name(42, "Илья", 0, 5000) is None  # двое тёзок
+        assert await db.user_id_by_display_name(42, "Илья", 2500, 5000) == 7
+        assert await db.user_id_by_display_name(42, "Илья", 0, 1500) == 7
+        assert await db.user_id_by_display_name(42, "Илья", 1500, 2500) == 8
+        assert await db.user_id_by_display_name(42, "Аня", 600, 5000) is None  # since отсекает
+        assert await db.user_id_by_display_name(42, "Аня", 0, 500) is None  # until исключителен
+        assert await db.user_id_by_display_name(42, "аня", 0, 5000) is None  # только точное
+        assert await db.user_id_by_display_name(42, "Фёдор", 0, 5000) is None
+        assert await db.user_id_by_display_name(99, "Илья", 0, 5000) is None
     finally:
         await db.close()
 

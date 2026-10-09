@@ -1592,20 +1592,23 @@ class Database:
             return None
         return int(row["max_created_at"])
 
-    async def user_id_by_display_name(self, chat_id: int, name: str, since: int) -> int | None:
+    async def user_id_by_display_name(
+        self, chat_id: int, name: str, since: int, until: int
+    ) -> int | None:
         """user_id по ТОЧНОМУ совпадению display_name среди сообщений людей с
-        ``created_at >= since``; при нескольких — автор самого свежего сообщения."""
+        ``since <= created_at < until``. Под этим именем писали двое и больше —
+        None: история о человеке не должна достаться его тёзке (ревью Codex)."""
         conn = self._require_conn()
         cursor = await conn.execute(
-            "SELECT user_id FROM messages WHERE chat_id = ? AND is_bot = 0 "
-            "AND display_name = ? AND created_at >= ? AND user_id IS NOT NULL "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
-            (chat_id, name, since),
+            "SELECT DISTINCT user_id FROM messages WHERE chat_id = ? AND is_bot = 0 "
+            "AND display_name = ? AND created_at >= ? AND created_at < ? "
+            "AND user_id IS NOT NULL LIMIT 2",
+            (chat_id, name, since, until),
         )
-        row = await cursor.fetchone()
-        if row is None or row["user_id"] is None:
+        rows = list(await cursor.fetchall())
+        if len(rows) != 1:
             return None
-        return int(row["user_id"])
+        return int(rows[0]["user_id"])
 
     async def first_message_at(self, chat_id: int) -> int | None:
         """created_at самого раннего сообщения чата — точка отсчёта для догоняющего

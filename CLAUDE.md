@@ -1996,10 +1996,13 @@ CREATE TABLE people_threads (
 );
 # db.py — dataclass'ы JokeRow, PeopleThreadRow; методы:
 # insert_joke, jokes(limit) (новые первыми), delete_joke, mark_joke_used(id, now), purge_jokes_older_than(cutoff)
-# insert_people_thread, open_people_threads() (closed=0, asc), people_threads_all(), close_people_thread(id, now)
+# insert_people_thread (ChatMemorizer дедуплицирует по (user_id, text без регистра) в ответе и среди открытых),
+# open_people_threads() (closed=0, asc), people_threads_all(), close_people_thread(id, now)
 # (asked_at=now, closed=1), delete_people_thread, purge_people_threads_older_than(cutoff) (по created_at),
-# last_message_at_by_user(chat_id, user_id) -> int | None, user_id_by_display_name(chat_id, name, since) -> int | None
-# (точное совпадение display_name среди сообщений с created_at >= since, самое свежее).
+# last_message_at_by_user(chat_id, user_id) -> int | None, user_id_by_display_name(chat_id, name, since, until)
+# -> int | None (точное совпадение display_name среди сообщений since <= created_at < until; двое тёзок -> None).
+# Patterns.unsafe_note(text) (injection | model_talk | assistant_marker) — шутки, истории и факты дневника с
+# срабатыванием не сохраняются: они живут в системном промпте. ChatMemorizer(patterns_getter=...) в app.py.
 # Retention: jokes — chat_memory.keep_days; threads — callback.max_age_days. PurgeStats += jokes_deleted, threads_deleted.
 
 # config_models.py
@@ -2042,8 +2045,8 @@ def joke_used(text: str, joke: str) -> bool   # 3+ общих нормализо
 # -> не над потолком присутствия -> min_gap -> open_people_threads(): первый (самый старый) тред, моложе
 # max_age_days, автор не замьючен и last_message_at_by_user за author_active_days -> _respond(trigger="callback",
 # trigger_msg_id=None, user_id=thread.user_id, situation=situation_callback(name, text), delay_sec=0).
-# Любой исход генерации (отправлено/молчание/срез) -> close_people_thread, set callback_last_at=now — второй
-# раз про то же не спрашиваем. Нет подходящего треда -> ничего. Старше max_age_days -> close.
+# close_people_thread и set callback_last_at=now — ДО _respond (любой исход, включая отмену посреди отправки, не
+# должен привести к повтору). Нет подходящего треда -> ничего. Старше max_age_days -> delete_people_thread.
 # prompt.py: SITUATION_CALLBACK_TEMPLATE = «Несколько дней назад {name} говорил, что {text}. Спроси у {name},
 # чем кончилось, одной короткой фразой, по-свойски, обратившись по имени. Если спрашивать неуместно — промолчи.»
 # situation_callback(name, text) — обрезка 300, разделители вырезаются.

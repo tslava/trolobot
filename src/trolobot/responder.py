@@ -1574,7 +1574,7 @@ class Responder:
         )
         await self._finish_pending(pending_id, now)
         if sticker is None:
-            self._spawn_diary(sent_text, sent_message_id)
+            self._spawn_diary(sent_text, sent_message_id, now)
             # Шутка, которую персонаж вернул в чат, отдыхает cooldown_days суток.
             for joke in joke_rows:
                 if joke_used(sent_text, joke.text):
@@ -1624,28 +1624,36 @@ class Responder:
         await self.db.set_state("hot_until", str(now + hot_window.minutes * 60))
         await self.db.set_state("hot_ambient_count", "0")
 
-    def _spawn_diary(self, text: str, tg_message_id: int) -> None:
+    def _spawn_diary(self, text: str, tg_message_id: int, sent_at: int) -> None:
         """Запускает фоновое извлечение факта из ушедшей в чат реплики (CLAUDE.md,
         "дневник дня"). Задача живёт вне ``_respond_lock`` и не задерживает ответ;
         хранится в множестве (иначе event loop может собрать её сборщиком мусора) и
         отменяется в ``shutdown``. Стикеры сюда не попадают — вызывающий их не передаёт."""
         if self.diary is None or not self.cfg_getter().behaviour.diary.enabled:
             return
-        task = asyncio.ensure_future(self._extract_diary(text, tg_message_id))
+        task = asyncio.ensure_future(self._extract_diary(text, tg_message_id, sent_at))
         self._diary_tasks.add(task)
         task.add_done_callback(self._diary_tasks.discard)
 
-    async def _extract_diary(self, text: str, tg_message_id: int) -> None:
-        """Тело фоновой задачи: ни одно исключение (кроме отмены) не выходит наружу."""
+    async def _extract_diary(self, text: str, tg_message_id: int, sent_at: int) -> None:
+        """Тело фоновой задачи: ни одно исключение (кроме отмены) не выходит наружу.
+
+        Факт датируется временем реплики (``sent_at``), а не моментом, когда задача
+        успела отработать: иначе реплика без минуты полночь легла бы в завтрашний день.
+        Факт уходит в системный промпт на неделю — команды и разговоры о модели туда
+        не пускаем (``Patterns.unsafe_note``)."""
         if self.diary is None:
             return
         try:
-            now = self._clock()
-            fact = await self.diary.extract(text, now=now)
+            fact = await self.diary.extract(text, now=self._clock())
             if fact is None:
                 return
+            hit = self.patterns_getter().unsafe_note(fact)
+            if hit is not None:
+                logger.warning("diary: факт отброшен, сработал маркер %r", hit)
+                return
             await self.db.insert_self_fact(
-                text=fact, bot_reply_tg_message_id=tg_message_id, created_at=now
+                text=fact, bot_reply_tg_message_id=tg_message_id, created_at=sent_at
             )
         except asyncio.CancelledError:
             raise
@@ -1765,7 +1773,7 @@ class Responder:
                 shadow=False,
                 created_at=now,
             )
-            self._spawn_diary(text, sent_message.message_id)
+            self._spawn_diary(text, sent_message.message_id, now)
             await self._maybe_open_hot_window(cfg, now)
             return SendOutcome(
                 sent=True, text=text, reason="send:say", tg_message_id=sent_message.message_id
@@ -2211,7 +2219,9 @@ class Responder:
         chosen = None
         for thread in await self.db.open_people_threads():
             if now - thread.created_at > callback_cfg.max_age_days * 86400:
-                await self.db.close_people_thread(thread.id, now)
+                # Не «спросил», а устарело: удаляем, а не закрываем, чтобы /people не
+                # показывал вопрос, которого не было (retention всё равно удалил бы).
+                await self.db.delete_people_thread(thread.id)
                 continue
             if thread.user_id in muted:
                 continue
@@ -2223,6 +2233,12 @@ class Responder:
         if chosen is None:
             return
 
+        # Тред закрывается ДО попытки (ревью Codex): любой исход — отправка, молчание,
+        # срез, сбой, отмена посреди отправки — не должен привести к тому, что про то
+        # же спросят второй раз. Цена — редкий вопрос, потерянный из-за SIGTERM до
+        # отправки; повтор чужой личной истории хуже.
+        await self.db.close_people_thread(chosen.id, now)
+        await self.db.set_state(_CALLBACK_LAST_AT_KEY, str(now))
         await self._respond(
             trigger=_CALLBACK_TRIGGER,
             trigger_msg_id=None,
@@ -2230,10 +2246,6 @@ class Responder:
             situation=situation_callback(chosen.display_name, chosen.text),
             delay_sec=0,
         )
-        # Не в finally: при отмене (SIGTERM) тред остаётся открытым и спросится позже.
-        after_now = self._clock()
-        await self.db.close_people_thread(chosen.id, after_now)
-        await self.db.set_state(_CALLBACK_LAST_AT_KEY, str(after_now))
 
     async def shutdown(self) -> None:
         """Отменяет дебаунс- и pending-таймеры. Сами pending остаются в БД —
