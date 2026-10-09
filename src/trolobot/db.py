@@ -45,6 +45,33 @@ MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX IF NOT EXISTS idx_chat_memory_period_end ON chat_memory (period_end);
     """,
+    4: """
+    CREATE TABLE IF NOT EXISTS self_facts (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        bot_reply_tg_message_id INTEGER,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_self_facts_created ON self_facts (created_at);
+    """,
+    5: """
+    CREATE TABLE IF NOT EXISTS chat_jokes (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        uses INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS people_threads (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        asked_at INTEGER,
+        closed INTEGER NOT NULL DEFAULT 0
+    );
+    """,
 }
 
 
@@ -75,6 +102,40 @@ class ChatMemoryRow:
 
 
 @dataclass(frozen=True, slots=True)
+class SelfFactRow:
+    """Факт о собственных делах персонажа, достанный из его реплики (CLAUDE.md, "дневник дня")."""
+
+    id: int
+    text: str
+    bot_reply_tg_message_id: int | None
+    created_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class JokeRow:
+    """Шутка чата, достанная недельным пересказом (CLAUDE.md, "шутки чата и истории людей")."""
+
+    id: int
+    text: str
+    created_at: int
+    last_used_at: int | None
+    uses: int
+
+
+@dataclass(frozen=True, slots=True)
+class PeopleThreadRow:
+    """Незакрытая история человека для «ну как там?» (CLAUDE.md, "шутки чата и истории людей")."""
+
+    id: int
+    user_id: int
+    display_name: str
+    text: str
+    created_at: int
+    asked_at: int | None
+    closed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class MessageRow:
     id: int
     tg_message_id: int | None
@@ -99,6 +160,13 @@ class PurgeStats:
     # у поля есть дефолт, чтобы уже существующий код, собирающий PurgeStats позиционно,
     # не ломался (CLAUDE.md, "долгая память чата").
     chat_memory_deleted: int = 0
+    # Факты дневника дня (CLAUDE.md, "дневник дня") — тоже свой срок (diary.keep_days),
+    # чистятся отдельным вызовом из run_retention.
+    self_facts_deleted: int = 0
+    # Шутки чата и истории людей (CLAUDE.md, "шутки чата и истории людей"): шутки —
+    # по chat_memory.keep_days, истории — по callback.max_age_days.
+    jokes_deleted: int = 0
+    threads_deleted: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1339,6 +1407,208 @@ class Database:
             cursor = await conn.execute("DELETE FROM chat_memory WHERE period_end < ?", (cutoff,))
             await conn.commit()
             return int(cursor.rowcount)
+
+    # -- дневник дня (CLAUDE.md, "дневник дня") ------------------------------
+
+    async def insert_self_fact(
+        self, *, text: str, bot_reply_tg_message_id: int | None, created_at: int
+    ) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO self_facts (text, bot_reply_tg_message_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (text, bot_reply_tg_message_id, created_at),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_self_fact: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def self_facts_since(self, since: int) -> list[SelfFactRow]:
+        """Факты с ``created_at >= since``, по возрастанию времени."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, text, bot_reply_tg_message_id, created_at FROM self_facts "
+            "WHERE created_at >= ? ORDER BY created_at ASC, id ASC",
+            (since,),
+        )
+        return [
+            SelfFactRow(
+                id=row["id"],
+                text=row["text"],
+                bot_reply_tg_message_id=row["bot_reply_tg_message_id"],
+                created_at=row["created_at"],
+            )
+            for row in await cursor.fetchall()
+        ]
+
+    async def delete_self_fact(self, fact_id: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM self_facts WHERE id = ?", (fact_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def purge_self_facts_older_than(self, cutoff: int) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM self_facts WHERE created_at < ?", (cutoff,))
+            await conn.commit()
+            return int(cursor.rowcount)
+
+    # -- шутки чата и истории людей (CLAUDE.md, "шутки чата и истории людей") ----
+
+    async def insert_joke(self, *, text: str, created_at: int) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO chat_jokes (text, created_at) VALUES (?, ?)", (text, created_at)
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_joke: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def jokes(self, limit: int) -> list[JokeRow]:
+        """Последние ``limit`` шуток, новые первыми."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, text, created_at, last_used_at, uses FROM chat_jokes "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            JokeRow(
+                id=row["id"],
+                text=row["text"],
+                created_at=row["created_at"],
+                last_used_at=row["last_used_at"],
+                uses=row["uses"],
+            )
+            for row in await cursor.fetchall()
+        ]
+
+    async def delete_joke(self, joke_id: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM chat_jokes WHERE id = ?", (joke_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def mark_joke_used(self, joke_id: int, now: int) -> None:
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "UPDATE chat_jokes SET last_used_at = ?, uses = uses + 1 WHERE id = ?",
+                (now, joke_id),
+            )
+            await conn.commit()
+
+    async def purge_jokes_older_than(self, cutoff: int) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM chat_jokes WHERE created_at < ?", (cutoff,))
+            await conn.commit()
+            return int(cursor.rowcount)
+
+    async def insert_people_thread(
+        self, *, user_id: int, display_name: str, text: str, created_at: int
+    ) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "INSERT INTO people_threads (user_id, display_name, text, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, display_name, text, created_at),
+            )
+            await conn.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError("insert_people_thread: INSERT did not return a rowid")
+            return cursor.lastrowid
+
+    async def _people_threads(self, where: str) -> list[PeopleThreadRow]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id, user_id, display_name, text, created_at, asked_at, closed "
+            f"FROM people_threads {where} ORDER BY created_at ASC, id ASC"
+        )
+        return [
+            PeopleThreadRow(
+                id=row["id"],
+                user_id=row["user_id"],
+                display_name=row["display_name"],
+                text=row["text"],
+                created_at=row["created_at"],
+                asked_at=row["asked_at"],
+                closed=bool(row["closed"]),
+            )
+            for row in await cursor.fetchall()
+        ]
+
+    async def open_people_threads(self) -> list[PeopleThreadRow]:
+        """Незакрытые истории, самые старые первыми."""
+        return await self._people_threads("WHERE closed = 0")
+
+    async def people_threads_all(self) -> list[PeopleThreadRow]:
+        return await self._people_threads("")
+
+    async def close_people_thread(self, thread_id: int, now: int) -> None:
+        """Закрывает историю: ``asked_at = now``, ``closed = 1``."""
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "UPDATE people_threads SET asked_at = ?, closed = 1 WHERE id = ?",
+                (now, thread_id),
+            )
+            await conn.commit()
+
+    async def delete_people_thread(self, thread_id: int) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM people_threads WHERE id = ?", (thread_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def purge_people_threads_older_than(self, cutoff: int) -> int:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "DELETE FROM people_threads WHERE created_at < ?", (cutoff,)
+            )
+            await conn.commit()
+            return int(cursor.rowcount)
+
+    async def last_message_at_by_user(self, chat_id: int, user_id: int) -> int | None:
+        """Когда этот человек писал в чат в последний раз (None — никогда)."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT MAX(created_at) AS max_created_at FROM messages "
+            "WHERE chat_id = ? AND user_id = ? AND is_bot = 0",
+            (chat_id, user_id),
+        )
+        row = await cursor.fetchone()
+        if row is None or row["max_created_at"] is None:
+            return None
+        return int(row["max_created_at"])
+
+    async def user_id_by_display_name(
+        self, chat_id: int, name: str, since: int, until: int
+    ) -> int | None:
+        """user_id по ТОЧНОМУ совпадению display_name среди сообщений людей с
+        ``since <= created_at < until``. Под этим именем писали двое и больше —
+        None: история о человеке не должна достаться его тёзке (ревью Codex)."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT DISTINCT user_id FROM messages WHERE chat_id = ? AND is_bot = 0 "
+            "AND display_name = ? AND created_at >= ? AND created_at < ? "
+            "AND user_id IS NOT NULL LIMIT 2",
+            (chat_id, name, since, until),
+        )
+        rows = list(await cursor.fetchall())
+        if len(rows) != 1:
+            return None
+        return int(rows[0]["user_id"])
 
     async def first_message_at(self, chat_id: int) -> int | None:
         """created_at самого раннего сообщения чата — точка отсчёта для догоняющего

@@ -26,6 +26,9 @@ EXPECTED_TABLES = {
     "few_shot_versions",
     "life_events",
     "chat_memory",
+    "self_facts",
+    "chat_jokes",
+    "people_threads",
 }
 
 
@@ -38,7 +41,7 @@ async def test_connect_creates_all_tables_and_bumps_user_version(tmp_path: Path)
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 3
+        assert row[0] == 5
 
         cursor = await conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
@@ -75,7 +78,7 @@ async def test_reconnect_is_idempotent(tmp_path: Path) -> None:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 3
+        assert row[0] == 5
         messages = await db2.recent_messages(42, 10)
         assert len(messages) == 1
         assert messages[0].text == "привет"
@@ -1703,8 +1706,8 @@ def _schema_sql_v1() -> str:
     )
     assert life_events_block in schema_sql
     old_schema_sql = schema_sql.replace(life_events_block, "")
-    old_schema_sql = _strip_chat_memory(old_schema_sql)
-    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 1;")
+    old_schema_sql = _strip_self_facts(_strip_chat_memory(old_schema_sql))
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 1;")
     assert "life_events" not in old_schema_sql
     return old_schema_sql
 
@@ -1713,10 +1716,42 @@ def _schema_sql_v2() -> str:
     """schema.sql, но как будто ещё нет chat_memory (user_version == 2) — для
     теста миграции 2 -> 3 (CLAUDE.md, "долгая память чата")."""
     schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
-    old_schema_sql = _strip_chat_memory(schema_sql)
-    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 3;", "PRAGMA user_version = 2;")
+    old_schema_sql = _strip_self_facts(_strip_chat_memory(schema_sql))
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 2;")
     assert "chat_memory" not in old_schema_sql
     return old_schema_sql
+
+
+def _schema_sql_v3() -> str:
+    """schema.sql, но как будто ещё нет self_facts (user_version == 3) — для теста
+    миграции 3 -> 4 (CLAUDE.md, "дневник дня")."""
+    schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
+    old_schema_sql = _strip_self_facts(schema_sql)
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 3;")
+    assert "self_facts" not in old_schema_sql
+    return old_schema_sql
+
+
+def _schema_sql_v4() -> str:
+    """schema.sql, но как будто ещё нет chat_jokes/people_threads (user_version == 4) —
+    для теста миграции 4 -> 5 (CLAUDE.md, "шутки чата и истории людей")."""
+    schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
+    start = schema_sql.index("-- Шутки чата и истории людей")
+    end = schema_sql.index("CREATE INDEX idx_messages_chat_created")
+    old_schema_sql = schema_sql[:start] + schema_sql[end:]
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 4;")
+    assert "chat_jokes" not in old_schema_sql
+    assert "people_threads" not in old_schema_sql
+    assert "self_facts" in old_schema_sql
+    return old_schema_sql
+
+
+def _strip_self_facts(schema_sql: str) -> str:
+    start = schema_sql.index("-- Дневник дня")
+    end = schema_sql.index("CREATE INDEX idx_messages_chat_created")
+    index_line = "CREATE INDEX idx_self_facts_created ON self_facts (created_at);\n"
+    assert index_line in schema_sql
+    return (schema_sql[:start] + schema_sql[end:]).replace(index_line, "")
 
 
 def _strip_chat_memory(schema_sql: str) -> str:
@@ -1763,7 +1798,7 @@ async def test_migrate_v1_to_v3_adds_new_tables_and_keeps_existing_data(
         cursor = await raw_conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 3
+        assert row[0] == 5
 
         cursor = await raw_conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
@@ -1813,7 +1848,7 @@ async def test_migrate_v2_to_v3_adds_chat_memory_and_keeps_existing_data(
         cursor = await raw_conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 3
+        assert row[0] == 5
 
         messages = await db.recent_messages(42, 10)
         assert [m.text for m in messages] == ["привет со схемы v2"]
@@ -1822,6 +1857,267 @@ async def test_migrate_v2_to_v3_adds_chat_memory_and_keeps_existing_data(
             period_start=1000, period_end=2000, text="говорили о гараже", created_at=2000
         )
         assert await db.chat_memory(memory_id) is not None
+    finally:
+        await db.close()
+
+
+async def test_migrate_v3_to_v4_adds_self_facts_and_keeps_existing_data(
+    tmp_path: Path,
+) -> None:
+    """Реальная БД на сервере стоит на user_version == 3: миграция 4 добавляет
+    self_facts (CLAUDE.md, "дневник дня") и не трогает данные."""
+    path = tmp_path / "bot.db"
+    conn = await aiosqlite.connect(path)
+    try:
+        await conn.executescript(_schema_sql_v3())
+        await conn.execute(
+            "INSERT INTO messages (tg_message_id, chat_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, is_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 42, 1, "A", "привет со схемы v3", None, 0, 1000),
+        )
+        await conn.execute(
+            "INSERT INTO chat_memory (period_start, period_end, text, created_at) "
+            "VALUES (1, 2, 'старый пересказ', 2)"
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    db = Database(path)
+    await db.connect()
+    try:
+        raw_conn = db._conn
+        assert raw_conn is not None
+
+        cursor = await raw_conn.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 5
+
+        assert [m.text for m in await db.recent_messages(42, 10)] == ["привет со схемы v3"]
+        assert await db.chat_memory_count() == 1
+
+        fact_id = await db.insert_self_fact(
+            text="пошёл за грибами", bot_reply_tg_message_id=7, created_at=2000
+        )
+        assert [f.id for f in await db.self_facts_since(0)] == [fact_id]
+    finally:
+        await db.close()
+
+
+async def test_migrate_v4_to_v5_adds_jokes_and_threads_and_keeps_existing_data(
+    tmp_path: Path,
+) -> None:
+    """Реальная БД на сервере стоит на user_version == 4: миграция 5 добавляет
+    chat_jokes и people_threads и не трогает данные."""
+    path = tmp_path / "bot.db"
+    conn = await aiosqlite.connect(path)
+    try:
+        await conn.executescript(_schema_sql_v4())
+        await conn.execute(
+            "INSERT INTO messages (tg_message_id, chat_id, user_id, display_name, text, "
+            "reply_to_tg_message_id, is_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 42, 1, "A", "привет со схемы v4", None, 0, 1000),
+        )
+        await conn.execute(
+            "INSERT INTO self_facts (text, bot_reply_tg_message_id, created_at) "
+            "VALUES ('старый факт', NULL, 5)"
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    db = Database(path)
+    await db.connect()
+    try:
+        raw_conn = db._conn
+        assert raw_conn is not None
+
+        cursor = await raw_conn.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 5
+
+        assert [m.text for m in await db.recent_messages(42, 10)] == ["привет со схемы v4"]
+        assert len(await db.self_facts_since(0)) == 1
+
+        joke_id = await db.insert_joke(text="опять гвозди", created_at=2000)
+        assert [j.id for j in await db.jokes(10)] == [joke_id]
+        thread_id = await db.insert_people_thread(
+            user_id=1, display_name="A", text="ждёт ответа", created_at=2000
+        )
+        assert [t.id for t in await db.open_people_threads()] == [thread_id]
+    finally:
+        await db.close()
+
+
+async def test_jokes_crud_and_mark_used(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        old = await db.insert_joke(text="старая", created_at=1000)
+        new = await db.insert_joke(text="новая", created_at=2000)
+
+        rows = await db.jokes(10)
+        assert [r.id for r in rows] == [new, old]  # новые первыми
+        assert rows[0].last_used_at is None
+        assert rows[0].uses == 0
+        assert [r.id for r in await db.jokes(1)] == [new]
+
+        await db.mark_joke_used(new, 3000)
+        await db.mark_joke_used(new, 4000)
+        used = (await db.jokes(10))[0]
+        assert used.last_used_at == 4000
+        assert used.uses == 2
+
+        assert await db.delete_joke(old) is True
+        assert await db.delete_joke(old) is False
+        assert [r.id for r in await db.jokes(10)] == [new]
+    finally:
+        await db.close()
+
+
+async def test_purge_jokes_older_than(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_joke(text="старая", created_at=999)
+        fresh = await db.insert_joke(text="свежая", created_at=1000)
+
+        assert await db.purge_jokes_older_than(1000) == 1
+        assert [r.id for r in await db.jokes(10)] == [fresh]
+    finally:
+        await db.close()
+
+
+async def test_people_threads_lifecycle(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        second = await db.insert_people_thread(
+            user_id=2, display_name="Аня", text="ищет машину", created_at=2000
+        )
+        first = await db.insert_people_thread(
+            user_id=1, display_name="Илья", text="ждёт собеседования", created_at=1000
+        )
+
+        open_rows = await db.open_people_threads()
+        assert [r.id for r in open_rows] == [first, second]  # самые старые первыми
+        assert open_rows[0].user_id == 1
+        assert open_rows[0].display_name == "Илья"
+        assert open_rows[0].asked_at is None
+        assert open_rows[0].closed is False
+
+        await db.close_people_thread(first, 5000)
+        assert [r.id for r in await db.open_people_threads()] == [second]
+        everything = await db.people_threads_all()
+        assert [r.id for r in everything] == [first, second]
+        assert everything[0].asked_at == 5000
+        assert everything[0].closed is True
+
+        assert await db.delete_people_thread(second) is True
+        assert await db.delete_people_thread(second) is False
+        assert [r.id for r in await db.people_threads_all()] == [first]
+    finally:
+        await db.close()
+
+
+async def test_purge_people_threads_older_than_by_created_at(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.insert_people_thread(user_id=1, display_name="A", text="старая", created_at=999)
+        fresh = await db.insert_people_thread(
+            user_id=1, display_name="A", text="свежая", created_at=1000
+        )
+
+        assert await db.purge_people_threads_older_than(1000) == 1
+        assert [r.id for r in await db.people_threads_all()] == [fresh]
+    finally:
+        await db.close()
+
+
+async def test_last_message_at_by_user_and_user_id_by_display_name(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+
+        async def add(tg_id: int, user_id: int, name: str, at: int, is_bot: bool = False) -> None:
+            await db.insert_message(
+                tg_message_id=tg_id,
+                chat_id=42,
+                user_id=user_id,
+                display_name=name,
+                text="x",
+                reply_to_tg_message_id=None,
+                is_bot=is_bot,
+                created_at=at,
+            )
+
+        await add(1, 7, "Илья", 1000)
+        await add(2, 7, "Илья", 3000)
+        await add(3, 8, "Илья", 2000)  # однофамилец: самое свежее у user 7
+        await add(4, 9, "Аня", 500)
+        await add(5, 10, "Фёдор", 4000, is_bot=True)
+
+        assert await db.last_message_at_by_user(42, 7) == 3000
+        assert await db.last_message_at_by_user(42, 9) == 500
+        assert await db.last_message_at_by_user(42, 123) is None
+        assert await db.last_message_at_by_user(99, 7) is None
+        assert await db.last_message_at_by_user(42, 10) is None  # бот не считается
+
+        assert await db.user_id_by_display_name(42, "Илья", 0, 5000) is None  # двое тёзок
+        assert await db.user_id_by_display_name(42, "Илья", 2500, 5000) == 7
+        assert await db.user_id_by_display_name(42, "Илья", 0, 1500) == 7
+        assert await db.user_id_by_display_name(42, "Илья", 1500, 2500) == 8
+        assert await db.user_id_by_display_name(42, "Аня", 600, 5000) is None  # since отсекает
+        assert await db.user_id_by_display_name(42, "Аня", 0, 500) is None  # until исключителен
+        assert await db.user_id_by_display_name(42, "аня", 0, 5000) is None  # только точное
+        assert await db.user_id_by_display_name(42, "Фёдор", 0, 5000) is None
+        assert await db.user_id_by_display_name(99, "Илья", 0, 5000) is None
+    finally:
+        await db.close()
+
+
+async def test_self_facts_crud(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        second = await db.insert_self_fact(
+            text="возится с машиной", bot_reply_tg_message_id=None, created_at=2000
+        )
+        first = await db.insert_self_fact(
+            text="пошёл за грибами", bot_reply_tg_message_id=11, created_at=1000
+        )
+
+        rows = await db.self_facts_since(0)
+        assert [r.id for r in rows] == [first, second]
+        assert rows[0].text == "пошёл за грибами"
+        assert rows[0].bot_reply_tg_message_id == 11
+        assert rows[1].bot_reply_tg_message_id is None
+        assert rows[0].created_at == 1000
+
+        assert [r.id for r in await db.self_facts_since(1500)] == [second]
+
+        assert await db.delete_self_fact(first) is True
+        assert await db.delete_self_fact(first) is False
+        assert [r.id for r in await db.self_facts_since(0)] == [second]
+    finally:
+        await db.close()
+
+
+async def test_purge_self_facts_older_than(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        old = await db.insert_self_fact(text="старое", bot_reply_tg_message_id=None, created_at=999)
+        fresh = await db.insert_self_fact(
+            text="свежее", bot_reply_tg_message_id=None, created_at=1000
+        )
+
+        assert await db.purge_self_facts_older_than(1000) == 1
+        assert [r.id for r in await db.self_facts_since(0)] == [fresh]
+        assert old != fresh
     finally:
         await db.close()
 

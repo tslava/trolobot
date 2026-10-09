@@ -15,6 +15,88 @@ _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _MODEL_ID_RE = re.compile(r"^[\w.-]+/[\w.:-]+$")
 
 
+# Стандартный набор реакций Telegram Bot API (ReactionTypeEmoji.emoji). Всё остальное
+# (например 😂) Telegram отвергает с REACTION_INVALID. Это не filters.allowed_emoji: тот
+# список — для эмодзи в тексте реплик.
+TELEGRAM_REACTIONS: frozenset[str] = frozenset(
+    {
+        "👍",
+        "👎",
+        "❤",
+        "🔥",
+        "🥰",
+        "👏",
+        "😁",
+        "🤔",
+        "🤯",
+        "😱",
+        "🤬",
+        "😢",
+        "🎉",
+        "🤩",
+        "🤮",
+        "💩",
+        "🙏",
+        "👌",
+        "🕊",
+        "🤡",
+        "🥱",
+        "🥴",
+        "😍",
+        "🐳",
+        "❤‍🔥",
+        "🌚",
+        "🌭",
+        "💯",
+        "🤣",
+        "⚡",
+        "🍌",
+        "🏆",
+        "💔",
+        "🤨",
+        "😐",
+        "🍓",
+        "🍾",
+        "💋",
+        "🖕",
+        "😈",
+        "😴",
+        "😭",
+        "🤓",
+        "👻",
+        "👨‍💻",
+        "👀",
+        "🎃",
+        "🙈",
+        "😇",
+        "😨",
+        "🤝",
+        "✍",
+        "🤗",
+        "🫡",
+        "🎅",
+        "🎄",
+        "☃",
+        "💅",
+        "🤪",
+        "🗿",
+        "🆒",
+        "💘",
+        "🙉",
+        "🦄",
+        "😘",
+        "💊",
+        "🙊",
+        "😎",
+        "👾",
+        "🤷‍♂",
+        "🤷",
+        "🤷‍♀",
+        "😡",
+    }
+)
+
+
 def _validate_hhmm(value: str) -> str:
     if not _HHMM_RE.match(value):
         raise ValueError(f"invalid time {value!r}, expected HH:MM")
@@ -65,13 +147,13 @@ class LiveTalkConfig(BaseModel):
     """Что считается «живым разговором» для ambient-реплик."""
 
     min_messages: int = Field(
-        default=3, ge=1, le=50, description="Минимум сообщений в окне для живого разговора"
+        default=2, ge=1, le=50, description="Минимум сообщений в окне для живого разговора"
     )
     min_people: int = Field(
         default=2, ge=1, le=50, description="Минимум разных людей в окне для живого разговора"
     )
     window_min: int = Field(
-        default=10, ge=1, le=1440, description="Окно в минутах, за которое считается разговор"
+        default=20, ge=1, le=1440, description="Окно в минутах, за которое считается разговор"
     )
 
 
@@ -121,9 +203,9 @@ class ReactionsConfig(BaseModel):
     с задержкой и смыслом"): сначала пауза ``delay_sec`` — человек сперва читает, —
     потом при ``semantic`` дешёвая модель решает, уместна ли реакция и какая.
     ``probability`` остаётся только для ``semantic: false`` (прежнее поведение).
-    ``emoji`` валидируется на уровне ``Config`` (см. ``Config._check_reactions_emoji_allowed``):
-    каждый элемент обязан входить в ``filters.allowed_emoji``, иначе ``/set
-    behaviour.reactions.emoji`` падает с понятной ошибкой.
+    ``emoji`` валидируется на уровне ``Config`` (см. ``Config._check_reactions_emoji_telegram``):
+    каждый элемент обязан входить в ``TELEGRAM_REACTIONS`` (набор реакций Bot API),
+    иначе ``/set behaviour.reactions.emoji`` падает с понятной ошибкой.
     """
 
     enabled: bool = Field(default=True, description="Включает реакции-эмодзи вместо молчания")
@@ -137,8 +219,8 @@ class ReactionsConfig(BaseModel):
         default=8, ge=0, le=100, description="Потолок реакций в сутки, отдельно от ambient/mention"
     )
     emoji: list[str] = Field(
-        default_factory=lambda: ["👍", "💩", "😂"],
-        description="Из чего выбирается реакция; каждый элемент — из filters.allowed_emoji",
+        default_factory=lambda: ["👍", "💩", "🤣"],
+        description="Из чего выбирается реакция; только из набора реакций Telegram (не 😂)",
     )
     delay_sec: tuple[int, int] = Field(
         default=(20, 120),
@@ -149,7 +231,7 @@ class ReactionsConfig(BaseModel):
     )
     model: str = Field(default="", description="Модель выбора реакции; пусто -> llm.judge_model")
     max_tokens: int = Field(
-        default=40, ge=10, le=200, description="Потолок ответа модели выбора реакции, токенов"
+        default=120, ge=10, le=200, description="Потолок ответа модели выбора реакции, токенов"
     )
     semantic_daily_cap: int = Field(
         default=40, ge=0, le=1000, description="Потолок вызовов модели на реакции в сутки"
@@ -163,6 +245,10 @@ class ReactionsConfig(BaseModel):
     def _validate_non_empty(cls, value: list[str]) -> list[str]:
         if not value:
             raise ValueError("reactions.emoji must not be empty")
+        # Клавиатура телефона дописывает вариационный селектор U+FE0F («❤️»), а в наборе
+        # реакций Telegram эмодзи без него («❤») — срезаем, чтобы /set не отвергал
+        # правильную реакцию и в Telegram уходила ровно та форма, что в наборе.
+        value = [e.replace("\ufe0f", "") for e in value]
         return value
 
     @field_validator("delay_sec")
@@ -184,7 +270,7 @@ class StickersConfig(BaseModel):
 
     enabled: bool = Field(default=True, description="Включает отправку стикеров вместо текста")
     min_replies_between: int = Field(
-        default=4,
+        default=2,
         ge=0,
         le=50,
         description="Текстовых реплик должно пройти после стикера до следующего",
@@ -426,6 +512,79 @@ class ChatMemoryConfig(BaseModel):
         return value
 
 
+class DiaryConfig(BaseModel):
+    """Дневник дня (CLAUDE.md, "дневник дня"): после каждой своей реплики дешёвая модель
+    достаёт из неё факт о собственных делах персонажа («пошёл за грибами»), и факты дня
+    идут в системный промпт слотом {diary} — чтобы он не противоречил сам себе.
+    """
+
+    enabled: bool = Field(default=True, description="Включает дневник дня: факты о себе из реплик")
+    model: str = Field(default="", description="Модель извлечения факта; пусто -> llm.judge_model")
+    max_tokens: int = Field(
+        default=80, ge=20, le=300, description="Лимит токенов ответа модели на извлечение факта"
+    )
+    daily_cap: int = Field(
+        default=30, ge=0, le=500, description="Вызовов извлечения в сутки, счётчик diary_calls"
+    )
+    week_days: int = Field(
+        default=6, ge=0, le=30, description="Сколько прошлых суток показывать строкой «на неделе»"
+    )
+    keep_days: int = Field(default=14, ge=1, le=90, description="Сколько суток хранить факты в БД")
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if not _MODEL_ID_RE.match(value):
+            raise ValueError(
+                f"invalid model id {value!r}: expected empty string or 'provider/model'"
+            )
+        return value
+
+
+class JokesConfig(BaseModel):
+    """Шутки чата (CLAUDE.md, "шутки чата и истории людей"): недельный пересказ
+    достаёт словечки, которые чат подхватил, и они идут в системный промпт слотом {jokes}.
+    """
+
+    enabled: bool = Field(default=True, description="Включает память о общих шутках чата")
+    per_period: int = Field(
+        default=3, ge=0, le=10, description="Сколько шуток доставать из одного недельного периода"
+    )
+    in_prompt: int = Field(
+        default=6, ge=0, le=30, description="Сколько шуток класть в системный промпт"
+    )
+    cooldown_days: int = Field(
+        default=5, ge=0, le=60, description="Сколько суток не показывать уже использованную шутку"
+    )
+
+
+class CallbackConfig(BaseModel):
+    """«Ну как там?» (CLAUDE.md, "шутки чата и истории людей"): через несколько дней
+    персонаж сам спрашивает человека, чем кончилась история, о которой тот говорил.
+    """
+
+    enabled: bool = Field(default=True, description="Включает вопросы «ну как там?» людям")
+    min_days: int = Field(
+        default=3, ge=1, le=30, description="Не чаще одного вопроса «ну как там?» в столько суток"
+    )
+    max_age_days: int = Field(
+        default=14, ge=1, le=90, description="История старше этого срока в сутках не спрашивается"
+    )
+    author_active_days: int = Field(
+        default=7, ge=1, le=60, description="Автор истории должен писать в чат за столько суток"
+    )
+    window: tuple[str, str] = Field(
+        default=("11:00", "20:00"), description="Окно локального времени HH:MM для вопроса"
+    )
+
+    @field_validator("window")
+    @classmethod
+    def _validate_window(cls, value: tuple[str, str]) -> tuple[str, str]:
+        return (_validate_hhmm(value[0]), _validate_hhmm(value[1]))
+
+
 class VisionConfig(BaseModel):
     """Зрение на фото (CLAUDE.md, "Интерфейсы: зрение на фото"). Снимок из чата
     описывается моделью со зрением одной-двумя фразами, и описание становится
@@ -536,7 +695,7 @@ class BehaviourConfig(BaseModel):
         default_factory=LiveTalkConfig, description="Что считается живым разговором для ambient"
     )
     ambient_probability: float = Field(
-        default=0.15, ge=0.0, le=1.0, description="Шанс ambient-реплики внутри живого разговора"
+        default=0.25, ge=0.0, le=1.0, description="Шанс ambient-реплики внутри живого разговора"
     )
     chat_cooldown_min: int = Field(
         default=25, ge=0, le=1440, description="Минимум минут между ambient-репликами"
@@ -574,6 +733,18 @@ class BehaviourConfig(BaseModel):
     chat_memory: ChatMemoryConfig = Field(
         default_factory=ChatMemoryConfig,
         description="Долгая память чата: пересказы прошедших разговоров по неделям",
+    )
+    diary: DiaryConfig = Field(
+        default_factory=DiaryConfig,
+        description="Дневник дня: факты о себе из своих реплик, слот {diary} в промпте",
+    )
+    jokes: JokesConfig = Field(
+        default_factory=JokesConfig,
+        description="Общие шутки чата: недельный пересказ достаёт, слот {jokes} в промпте",
+    )
+    callback: CallbackConfig = Field(
+        default_factory=CallbackConfig,
+        description="«Ну как там?»: вопрос человеку про его незакрытую историю",
     )
     vision: VisionConfig = Field(
         default_factory=VisionConfig,
@@ -970,6 +1141,12 @@ _MOTIFS_DEFAULT: dict[str, list[str]] = {
     "участок": [r"\bучасток", r"\bучастк"],
     "машина": [r"\bмашин"],
     "зато": [r"\bзато\b"],
+    "завод": [
+        r"\bзавод(а|у|ом|е|ы|ов|ах|ам|ами)?\b",
+        r"\bзаводск",
+        r"\bцех",
+        r"\bналадчик",
+    ],
 }
 
 # Маркеры байки (CLAUDE.md, мера 5) — по ним считается квота историй в окне
@@ -1163,19 +1340,17 @@ class Config(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _check_reactions_emoji_allowed(self) -> "Config":
-        """behaviour.reactions.emoji — подмножество filters.allowed_emoji.
+    def _check_reactions_emoji_telegram(self) -> "Config":
+        """behaviour.reactions.emoji — подмножество TELEGRAM_REACTIONS.
 
-        Проверка живёт здесь, а не на ReactionsConfig: только Config видит оба
-        поля одновременно. /set behaviour.reactions.emoji с мусором (не входящим
-        в allowed_emoji) должен падать с понятной ошибкой, а не тихо позволять
-        боту реагировать эмодзи, которого нет в голосе персонажа.
+        Telegram принимает в реакциях только свой стандартный набор; всё прочее
+        (😂 и т.п.) даёт REACTION_INVALID, и реакция молча не ставится. Поэтому
+        проверяем по набору Bot API, а не по filters.allowed_emoji (тот — для текста).
         """
-        allowed = set(self.filters.allowed_emoji)
-        bad = [e for e in self.behaviour.reactions.emoji if e not in allowed]
+        bad = [e for e in self.behaviour.reactions.emoji if e not in TELEGRAM_REACTIONS]
         if bad:
             raise ValueError(
-                f"behaviour.reactions.emoji: {bad!r} not in "
-                f"filters.allowed_emoji {sorted(allowed)!r}"
+                f"behaviour.reactions.emoji: {bad!r} не входит в набор реакций Telegram "
+                "(например, вместо 😂 нужен 🤣)"
             )
         return self

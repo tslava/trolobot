@@ -96,6 +96,12 @@ class Patterns:
     def assistant_marker(self, text: str) -> str | None:
         return _first_match(self._assistant_markers, text)
 
+    def unsafe_note(self, text: str) -> str | None:
+        """Заметка, извлечённая моделью (факт дневника, шутка чата, история
+        человека), уходит в системный промпт надолго — команды и разговоры о
+        модели/ассистенте туда не пускаем (ревью Codex)."""
+        return self.injection(text) or self.model_talk(text) or self.assistant_marker(text)
+
     def grumpy(self, text: str) -> str | None:
         return _first_match(self._grumpy_markers, text)
 

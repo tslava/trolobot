@@ -374,6 +374,24 @@ async def test_batch_returns_numbers_from_response() -> None:
     assert result == [1, 3]
 
 
+async def test_batch_prompt_lists_bot_names() -> None:
+    """Предфильтр знает все имена бота, а не только «Фёдор»: иначе «отец, ты где?»
+    отсеивается до основной модели."""
+    cfg = _cfg()
+    store = FakeStore()
+    handler, calls = _counting_handler(lambda _req: _batch_verdict_response([1]))
+    checker, llm = _checker(handler, cfg, store, batch_prompt_template=BATCH_PROMPT_TEMPLATE)
+    try:
+        await checker.check_batch(rows=_rows("отец, ты где?"), recent_replies=[], now=NOW)
+    finally:
+        await llm.aclose()
+
+    system = json.loads(calls[0].content)["messages"][0]["content"]
+    assert "{names}" not in system
+    for name in cfg.persona.name_triggers:
+        assert name in system
+
+
 async def test_batch_filters_out_of_range_numbers() -> None:
     cfg = _cfg()
     store = FakeStore()

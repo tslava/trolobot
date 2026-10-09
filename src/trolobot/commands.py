@@ -33,7 +33,7 @@ from trolobot.changelog import Release, parse_changelog
 from trolobot.chat_memory import format_period
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import ChatMemoryRow, LifeEventRow
+from trolobot.db import ChatMemoryRow, JokeRow, LifeEventRow, PeopleThreadRow, SelfFactRow
 from trolobot.few_shot import FewShot
 from trolobot.sanitize import normalize_text, sanitize_display_name
 from trolobot.settings import Settings
@@ -82,6 +82,9 @@ _HELP_TEXT = (
     "/life list | rm N | post N — события: список, удалить, повторить\n"
     "/say <текст> — сказать в чат дословно\n"
     "/memory [list|rm N|run] — долгая память чата: пересказы по неделям\n"
+    "/diary [rm N] — факты о себе за неделю (дневник дня): список, удалить\n"
+    "/jokes [rm N] — шутки чата, которые он помнит: список, удалить\n"
+    "/people [rm N] — незакрытые истории людей для «ну как там?»: список, удалить\n"
     "/changelog [owner|<версия>] — что нового: блок для чата или для владельца\n"
     "/help — эта справка"
 )
@@ -95,6 +98,16 @@ _MEMORY_USAGE = "Использование: /memory [list | rm N | run]"
 _MEMORY_LIST_LIMIT = 20
 # Сколько символов свежесозданных пересказов показать в ответе на /memory run.
 _MEMORY_RUN_PREVIEW_LEN = 1500
+
+# /diary: подсказка при кривом вводе и окно списка (CLAUDE.md, "дневник дня": «за неделю»).
+_DIARY_USAGE = "Использование: /diary | /diary rm N"
+_DIARY_LIST_DAYS = 7
+
+# /jokes и /people (CLAUDE.md, "шутки чата и истории людей"): подсказки и потолок списка
+# шуток (ответ всё равно режется до 3500 символов).
+_JOKES_USAGE = "Использование: /jokes | /jokes rm N"
+_PEOPLE_USAGE = "Использование: /people | /people rm N"
+_JOKES_LIST_LIMIT = 1000
 
 
 class _MessageRowLike(Protocol):
@@ -183,6 +196,14 @@ class _DbLike(Protocol):
     async def chat_memory_count(self) -> int: ...
     async def delete_chat_memory(self, memory_id: int) -> bool: ...
     async def last_chat_memory_end(self) -> int | None: ...
+    # -- дневник дня (/diary, CLAUDE.md "дневник дня") -----------------------
+    async def self_facts_since(self, since: int) -> Sequence[SelfFactRow]: ...
+    async def delete_self_fact(self, fact_id: int) -> bool: ...
+    # -- шутки чата и истории людей (/jokes, /people) ------------------------
+    async def jokes(self, limit: int) -> Sequence[JokeRow]: ...
+    async def delete_joke(self, joke_id: int) -> bool: ...
+    async def people_threads_all(self) -> Sequence[PeopleThreadRow]: ...
+    async def delete_people_thread(self, thread_id: int) -> bool: ...
 
 
 class _ResponderLike(Protocol):
@@ -458,6 +479,22 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"presence: {bot_today}/{presence_cfg.allowance(human_today)} (people {human_today})"
     )
 
+    diary_calls = int(await deps.db.get_state(day_key("diary_calls", now, tz)) or "0")
+    diary_today = len(await deps.db.self_facts_since(midnight))
+
+    jokes_total = len(await deps.db.jokes(_JOKES_LIST_LIMIT))
+    people_open = sum(1 for thread in await deps.db.people_threads_all() if not thread.closed)
+    callback_last_raw = await deps.db.get_state("callback_last_at")
+    try:
+        callback_last = int(callback_last_raw) if callback_last_raw is not None else None
+    except ValueError:
+        callback_last = None
+    callback_text = (
+        f"последний {local_dt(callback_last, tz).strftime('%d.%m')}"
+        if callback_last is not None
+        else "нет"
+    )
+
     pending = len(await deps.db.load_pending())
     night_queue = len(await deps.db.night_unanswered())
 
@@ -533,6 +570,8 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         hot_line,
         f"followup calls: {followup_calls}/{cfg.behaviour.followup.daily_cap}",
         f"vision: {vision_count}/{cfg.behaviour.vision.daily_cap}",
+        f"diary: {diary_today}, calls {diary_calls}/{cfg.behaviour.diary.daily_cap}",
+        f"jokes: {jokes_total}, people: {people_open}, callback: {callback_text}",
         checkin_line,
         presence_line,
         weather_line,
@@ -876,6 +915,113 @@ async def _cmd_memory_rm(
     await _reply(message, f"Пересказ #{memory_id} удалён.")
 
 
+async def _cmd_diary(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    """/diary [rm N] — факты о себе, достанные из реплик (CLAUDE.md, "дневник дня").
+
+    Голое /diary — список за неделю «#N dd.mm HH:MM текст»; /diary rm N удаляет факт
+    (если модель вытащила не то, он перестаёт попадать в слот {diary})."""
+    if not args:
+        tz = deps.config_store.get().persona.timezone
+        rows = await deps.db.self_facts_since(now - _DIARY_LIST_DAYS * 86400)
+        if not rows:
+            await _reply(message, "Фактов нет.")
+            return
+        lines = [
+            f"#{row.id} {local_dt(row.created_at, tz).strftime('%d.%m %H:%M')} {row.text}"
+            for row in rows
+        ]
+        await _reply(message, "\n".join(lines))
+        return
+    if args[0].lower() != "rm":
+        await _reply(message, _DIARY_USAGE)
+        return
+    fact_id = _parse_int(args[1]) if len(args) > 1 else None
+    if fact_id is None:
+        await _reply(message, _DIARY_USAGE)
+        return
+    rows = await deps.db.self_facts_since(0)
+    fact = next((row for row in rows if row.id == fact_id), None)
+    if fact is None:
+        await _reply(message, f"Нет факта #{fact_id}.")
+        return
+    await deps.db.delete_self_fact(fact_id)
+    await deps.db.audit_stop("diary:rm", admin_user_id, now, fact.text)
+    logger.info("diary rm: #%s", fact_id)
+    await _reply(message, f"Факт #{fact_id} удалён.")
+
+
+async def _cmd_jokes(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    """/jokes [rm N] — шутки чата, которые он помнит (CLAUDE.md, "шутки чата и истории
+    людей"). /jokes rm N удаляет шутку из слота {jokes}."""
+    rows = await deps.db.jokes(_JOKES_LIST_LIMIT)
+    if not args:
+        if not rows:
+            await _reply(message, "Шуток пока нет.")
+            return
+        tz = deps.config_store.get().persona.timezone
+        lines = [
+            f"#{row.id} {row.text} (использована "
+            f"{local_dt(row.last_used_at, tz).strftime('%d.%m') if row.last_used_at else '—'})"
+            for row in rows
+        ]
+        await _reply(message, "\n".join(lines))
+        return
+    joke_id = _parse_int(args[1]) if args[0].lower() == "rm" and len(args) > 1 else None
+    if joke_id is None:
+        await _reply(message, _JOKES_USAGE)
+        return
+    joke = next((row for row in rows if row.id == joke_id), None)
+    if joke is None:
+        await _reply(message, f"Нет шутки #{joke_id}.")
+        return
+    await deps.db.delete_joke(joke_id)
+    await deps.db.audit_stop("jokes:rm", admin_user_id, now, joke.text)
+    logger.info("jokes rm: #%s", joke_id)
+    await _reply(message, f"Шутка #{joke_id} удалена.")
+
+
+async def _cmd_people(
+    message: Message, deps: _CommandsDeps, now: int, admin_user_id: int, args: list[str]
+) -> None:
+    """/people [rm N] — незакрытые истории людей для «ну как там?» (CLAUDE.md, "шутки
+    чата и истории людей"). Это заметки о конкретных людях: владелец видит их все и
+    может удалить любую."""
+    rows = await deps.db.people_threads_all()
+    if not args:
+        if not rows:
+            await _reply(message, "Историй пока нет.")
+            return
+        tz = deps.config_store.get().persona.timezone
+        lines = [
+            f"#{row.id} {row.display_name}: {row.text} ("
+            + (
+                f"спросил {local_dt(row.asked_at, tz).strftime('%d.%m')}"
+                if row.asked_at is not None
+                else "открыт"
+            )
+            + ")"
+            for row in rows
+        ]
+        await _reply(message, "\n".join(lines))
+        return
+    thread_id = _parse_int(args[1]) if args[0].lower() == "rm" and len(args) > 1 else None
+    if thread_id is None:
+        await _reply(message, _PEOPLE_USAGE)
+        return
+    thread = next((row for row in rows if row.id == thread_id), None)
+    if thread is None:
+        await _reply(message, f"Нет истории #{thread_id}.")
+        return
+    await deps.db.delete_people_thread(thread_id)
+    await deps.db.audit_stop("people:rm", admin_user_id, now, thread.text)
+    logger.info("people rm: #%s", thread_id)
+    await _reply(message, f"История #{thread_id} удалена.")
+
+
 async def _cmd_memory_run(
     message: Message, deps: _CommandsDeps, now: int, admin_user_id: int
 ) -> None:
@@ -1045,6 +1191,12 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_say(message, deps, now, admin_user_id, text, tokens)
                 elif cmd == "memory":
                     await _cmd_memory(message, deps, now, admin_user_id, args)
+                elif cmd == "diary":
+                    await _cmd_diary(message, deps, now, admin_user_id, args)
+                elif cmd == "jokes":
+                    await _cmd_jokes(message, deps, now, admin_user_id, args)
+                elif cmd == "people":
+                    await _cmd_people(message, deps, now, admin_user_id, args)
                 elif cmd == "changelog":
                     await _cmd_changelog(message, deps, args)
                 elif cmd == "help":

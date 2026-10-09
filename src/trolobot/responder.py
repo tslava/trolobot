@@ -55,10 +55,13 @@ from trolobot.chat_memory import render_chat_memory
 from trolobot.config_models import Config, HotWindowConfig
 from trolobot.db import Database, LifeEventRow, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
+from trolobot.diary import DiaryExtractor, render_diary
 from trolobot.filters import FilterContext
 from trolobot.followup import FollowupChecker
+from trolobot.gate import PRESENCE_EXEMPT
 from trolobot.gate_state import load_gate_state
 from trolobot.gate_types import GateMessage, Trigger
+from trolobot.jokes import joke_used, render_jokes
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
 from trolobot.motifs import render_avoid, story_count, used_motifs
@@ -75,6 +78,7 @@ from trolobot.prompt import (
     render_context,
     render_life,
     situation_addressed,
+    situation_callback,
     situation_checkin,
     situation_followup,
     situation_life,
@@ -118,6 +122,11 @@ _ADDRESS_TRIGGER_VALUES = (
     Trigger.NAME.value,
     Trigger.FOLLOWUP.value,
 )
+
+# Сбои провайдера, после которых обращение переносится (один раз), а не молчит (A6),
+# и диапазон переноса в секундах.
+_LLM_RETRY_REASONS = frozenset({"llm:http", "llm:timeout"})
+_LLM_RETRY_DELAY_SEC = (120, 300)
 
 # Потолок на число обращений, из которых строится situation_addressed (и на сколько
 # восстанавливает _collect_addressed_items после рестарта) — не больше последних 5.
@@ -194,6 +203,12 @@ _CHECKIN_TRIGGER = "checkin"
 _CHECKIN_DUE_KEY = "checkin_due"
 _CHECKIN_DUE_REF_KEY = "checkin_due_hot_until"
 _CHECKIN_LAST_AT_KEY = "checkin_last_at"
+
+# «Ну как там?» (CLAUDE.md, "шутки чата и истории людей") — тоже строка, как "checkin":
+# фоновый джоб, не обращение (НЕ в _ADDRESS_TRIGGER_VALUES), без заведений, стикеров,
+# реплая и счётчиков бюджета. Свой state-ключ: когда последний раз спрашивал.
+_CALLBACK_TRIGGER = "callback"
+_CALLBACK_LAST_AT_KEY = "callback_last_at"
 
 # Сколько последних реплик персонажа отдаётся дешёвой проверке "это мне?" при разборе
 # выбранного checkin-сообщения (CLAUDE.md, "меньше и разнообразнее", мера 3).
@@ -298,6 +313,7 @@ class Responder:
         followup: FollowupChecker | None = None,
         weather: WeatherClient | None = None,
         weather_places: WeatherPlaceExtractor | None = None,
+        diary: DiaryExtractor | None = None,
         patterns_getter: Callable[[], Patterns],
         prompt_store: _PromptStoreLike,
         rng: random.Random,
@@ -322,6 +338,11 @@ class Responder:
         # из вопроса дешёвой моделью; None -> погода всегда только домашняя.
         self.weather = weather
         self.weather_places = weather_places
+        # Дневник дня (CLAUDE.md, "дневник дня"): после успешной текстовой отправки
+        # дешёвая модель достаёт из реплики факт о делах персонажа. None -> факты не
+        # извлекаются (слот {diary} при этом всё равно заполняется уже записанным).
+        self.diary = diary
+        self._diary_tasks: set[asyncio.Task[None]] = set()
         self.patterns_getter = patterns_getter
         self.prompt_store = prompt_store
         self.rng = rng
@@ -338,6 +359,13 @@ class Responder:
         # pending, поставленных в этом процессе; после рестарта список пуст и
         # _fire_pending_inner восстанавливает его из БД (_collect_addressed_items).
         self._pending_info: dict[int, list[tuple[str, str]]] = {}
+        # pending_id, которые уже переносили после сбоя провайдера (A6): перенос один,
+        # в памяти — после рестарта не повторяется.
+        self._llm_retried: set[int] = set()
+        # pending, по которым прямо сейчас идёт генерация: новое обращение в них не
+        # схлопывается, иначе его таймер сработал бы второй раз уже после ответа и бот
+        # ответил бы дважды (ревью Codex). Новое обращение в это время — свой pending.
+        self._in_flight: set[int] = set()
         # Сериализует генерацию+отправку+счётчики одного Responder: без этого два PASS,
         # ждущих LLM параллельно, могли бы оба проскочить одну и ту же проверку бюджета.
         self._respond_lock = asyncio.Lock()
@@ -422,7 +450,9 @@ class Responder:
         earliest = await self._mention_earliest_due(cfg, msg.user_id, now)
         if hot_until is not None:
             earliest = min(earliest, now + cfg.behaviour.hot_window.mention_max_delay_sec)
-        pending_rows = await self.db.load_pending()
+        pending_rows = [
+            row for row in await self.db.load_pending() if row.id not in self._in_flight
+        ]
         if pending_rows:
             pending = pending_rows[0]
             new_due = now + fast_delay(cfg.behaviour, self.rng)
@@ -555,12 +585,15 @@ class Responder:
             logger.exception("pending wait and fire failed: pending_id=%s", row.id)
 
     async def _fire_pending(self, row: PendingRow) -> None:
+        self._in_flight.add(row.id)
         try:
             await self._fire_pending_inner(row)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("fire pending failed: pending_id=%s", row.id)
+        finally:
+            self._in_flight.discard(row.id)
 
     async def _fire_pending_inner(self, row: PendingRow) -> None:
         self._pending_tasks.pop(row.id, None)
@@ -675,8 +708,26 @@ class Responder:
         if trigger_msg is not None:
             _add(trigger_msg)
 
+        # Обращения, у которых свой pending (пришли, пока по этому шла генерация, —
+        # см. _in_flight), сюда не берём: иначе после рестарта на них ответили бы
+        # дважды. Граница — триггер следующего открытого pending: «следующий» — по
+        # порядку вставки (id), граница — по tg_message_id (в чате растёт монотонно),
+        # не по секундам: в одну секунду их может уложиться несколько (ревью Codex).
+        later_trigger_ids = [
+            other.trigger_tg_message_id
+            for other in await self.db.load_pending()
+            if other.id > row.id
+        ]
+        until_id = min(later_trigger_ids, default=None)
+
         candidates = await self.db.messages_since(self.chat_id, row.created_at)
         for candidate in candidates:
+            if (
+                until_id is not None
+                and candidate.tg_message_id is not None
+                and candidate.tg_message_id >= until_id
+            ):
+                continue
             text = candidate.text or ""
             addressed = False
             if candidate.reply_to_tg_message_id is not None:
@@ -748,12 +799,21 @@ class Responder:
             return "send:recheck_stop"
         if row.user_id in state.muted_user_ids:
             return "send:recheck_muted"
-        if state.topic_cooldown_until is not None and state.topic_cooldown_until > now:
+        # Кулдаун стоп-темы обращения не глушит (A3): проверяем только не-обращения.
+        # followup — не явное обращение, а «вероятно, мне»: ему кулдаун по-прежнему
+        # мешает, иначе он ушёл бы следом за сообщением со стоп-темой.
+        if (
+            (row.trigger not in _ADDRESS_TRIGGER_VALUES or row.trigger == Trigger.FOLLOWUP.value)
+            and state.topic_cooldown_until is not None
+            and state.topic_cooldown_until > now
+        ):
             return "send:recheck_topic"
-        # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1): реплай на
-        # сообщение бота проходит под потолком всегда, как и в гейте; остальные поводы
-        # (имя, @, followup) к моменту отправки могли исчерпать суточную долю.
-        if row.trigger != Trigger.REPLY.value and cfg.behaviour.presence.over_cap(
+        # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1): реплай и @
+        # проходят под потолком всегда, как и в гейте (PRESENCE_EXEMPT); остальные поводы
+        # (имя, followup) к моменту отправки могли исчерпать суточную долю.
+        if row.trigger not in {
+            t.value for t in PRESENCE_EXEMPT
+        } and cfg.behaviour.presence.over_cap(
             human_messages_today=state.human_messages_today,
             bot_replies_today=state.bot_replies_today,
         ):
@@ -783,6 +843,7 @@ class Responder:
         """
         if pending_id is not None:
             await self.db.mark_pending_done(pending_id, done_at)
+            self._llm_retried.discard(pending_id)
 
     async def _respond(
         self,
@@ -811,6 +872,16 @@ class Responder:
             )
         except LLMError as exc:
             now = self._clock()
+            if (
+                pending_id is not None
+                and _trigger_value(trigger) in _ADDRESS_TRIGGER_VALUES
+                and exc.reason in _LLM_RETRY_REASONS
+                and pending_id not in self._llm_retried
+                and await self._retry_pending_later(
+                    pending_id, trigger_msg_id, addressed_items, now
+                )
+            ):
+                return
             await self.db.insert_filter_log(
                 trigger_tg_message_id=trigger_msg_id,
                 candidate_text=None,
@@ -829,6 +900,43 @@ class Responder:
             # обрыв во время SIGTERM, любой сбой внутри _generate_and_send) не должно
             # "хоронить" pending — restore_pending на следующем старте подхватит его
             # заново (см. _finish_pending).
+
+    async def _retry_pending_later(
+        self,
+        pending_id: int,
+        trigger_msg_id: int | None,
+        addressed_items: list[tuple[str, str]] | None,
+        now: int,
+    ) -> bool:
+        """Сбой провайдера не хоронит обращение (A6): один раз переносим pending на
+        2-5 минут вместо молчания. False — pending не найден, действуем как раньше."""
+        row = next((r for r in await self.db.load_pending() if r.id == pending_id), None)
+        if row is None:
+            return False
+        self._llm_retried.add(pending_id)
+        due = now + self.rng.randint(*_LLM_RETRY_DELAY_SEC)
+        # Пока шёл вызов модели, к этому pending могло схлопнуться новое обращение:
+        # оно уже сдвинуло due_at ближе и дописало себя в _pending_info. Не затираем
+        # ни то, ни другое.
+        if now < row.due_at < due:
+            due = row.due_at
+        await self.db.insert_filter_log(
+            trigger_tg_message_id=trigger_msg_id,
+            candidate_text=None,
+            verdict="cut",
+            stage="send",
+            reason="send:llm_retry",
+            shadow=False,
+            created_at=now,
+        )
+        await self.db.update_pending_due(pending_id, due)
+        merged = list(addressed_items or [])
+        merged.extend(item for item in self._pending_info.get(pending_id, []) if item not in merged)
+        if merged:
+            self._pending_info[pending_id] = merged
+        logger.info("llm failure: pending %s retried at %s", pending_id, due)
+        self._schedule_pending_timer(row, due)
+        return True
 
     async def _respond_inner(
         self,
@@ -1141,12 +1249,39 @@ class Responder:
         # жизни") — это память персонажа, а не данные, ограниченные обращением.
         life_block = render_life(await self.db.life_events(), tz)
 
+        # Слот {diary} (CLAUDE.md, "дневник дня") — тоже всегда и для любого
+        # триггера: факты, которые персонаж сегодня уже сообщил о своих делах.
+        midnight = day_start(now, tz)
+        today_facts = await self.db.self_facts_since(midnight)
+        week_days = cfg.behaviour.diary.week_days
+        week_facts = (
+            [
+                fact
+                for fact in await self.db.self_facts_since(midnight - week_days * 86400)
+                if fact.created_at < midnight
+            ]
+            if week_days > 0
+            else []
+        )
+        diary_block = render_diary(today_facts, week_facts, tz)
+
         # Слот {chat_memory} (CLAUDE.md, "долгая память чата") — тоже всегда и для
         # любого триггера: пересказы прошедших недель живут дольше самих сообщений
         # и заменяют персонажу то, что уже вычистил ретеншн.
         chat_memory_block = render_chat_memory(
             await self.db.chat_memories(cfg.behaviour.chat_memory.in_prompt), tz
         )
+
+        # Слот {jokes} (CLAUDE.md, "шутки чата и истории людей") — тоже всегда и для
+        # любого триггера. Строки читаются один раз: после отправки по ним же
+        # проверяется, какая шутка прозвучала.
+        jokes_cfg = cfg.behaviour.jokes
+        joke_rows = (
+            await self.db.jokes(jokes_cfg.in_prompt)
+            if jokes_cfg.enabled and jokes_cfg.in_prompt > 0
+            else []
+        )
+        jokes_block = render_jokes(joke_rows, now=now, cooldown_days=jokes_cfg.cooldown_days)
 
         # Погода (CLAUDE.md, "Интерфейсы: погода") — фон для ЛЮБОГО триггера: она
         # нужна и ambient'у, и обращению. Клиент сам глотает свои ошибки и сам
@@ -1185,7 +1320,9 @@ class Responder:
             situation=situation,
             avoid=avoid_block,
             life=life_block,
+            diary=diary_block,
             chat_memory=chat_memory_block,
+            jokes=jokes_block,
             weather=weather_block,
             **build_messages_kwargs,
         )
@@ -1454,12 +1591,19 @@ class Responder:
             created_at=now,
         )
         await self._finish_pending(pending_id, now)
+        if sticker is None:
+            self._spawn_diary(sent_text, sent_message_id, now)
+            # Шутка, которую персонаж вернул в чат, отдыхает cooldown_days суток.
+            for joke in joke_rows:
+                if joke_used(sent_text, joke.text):
+                    await self.db.mark_joke_used(joke.id, now)
         # Горячее окно из ОБЩЕГО хвоста — только если владелец включил
         # hot_window.open_on_any_reply (CLAUDE.md, "меньше и разнообразнее", мера 2).
         # По умолчанию окно открывают лишь /life и /say: «после каждой своей реплики
         # быть внимательнее» на практике означало, что бот сам себе продлевал
         # присутствие в чате бесконечно.
-        if cfg.behaviour.hot_window.open_on_any_reply:
+        # «Ну как там?» окно не открывает (CLAUDE.md, "шутки чата и истории людей").
+        if cfg.behaviour.hot_window.open_on_any_reply and trigger_value != _CALLBACK_TRIGGER:
             await self._maybe_open_hot_window(cfg, now)
         return SendOutcome(
             sent=True, text=sent_text, reason=send_reason, tg_message_id=sent_message_id
@@ -1497,6 +1641,42 @@ class Responder:
             return
         await self.db.set_state("hot_until", str(now + hot_window.minutes * 60))
         await self.db.set_state("hot_ambient_count", "0")
+
+    def _spawn_diary(self, text: str, tg_message_id: int, sent_at: int) -> None:
+        """Запускает фоновое извлечение факта из ушедшей в чат реплики (CLAUDE.md,
+        "дневник дня"). Задача живёт вне ``_respond_lock`` и не задерживает ответ;
+        хранится в множестве (иначе event loop может собрать её сборщиком мусора) и
+        отменяется в ``shutdown``. Стикеры сюда не попадают — вызывающий их не передаёт."""
+        if self.diary is None or not self.cfg_getter().behaviour.diary.enabled:
+            return
+        task = asyncio.ensure_future(self._extract_diary(text, tg_message_id, sent_at))
+        self._diary_tasks.add(task)
+        task.add_done_callback(self._diary_tasks.discard)
+
+    async def _extract_diary(self, text: str, tg_message_id: int, sent_at: int) -> None:
+        """Тело фоновой задачи: ни одно исключение (кроме отмены) не выходит наружу.
+
+        Факт датируется временем реплики (``sent_at``), а не моментом, когда задача
+        успела отработать: иначе реплика без минуты полночь легла бы в завтрашний день.
+        Факт уходит в системный промпт на неделю — команды и разговоры о модели туда
+        не пускаем (``Patterns.unsafe_note``)."""
+        if self.diary is None:
+            return
+        try:
+            fact = await self.diary.extract(text, now=self._clock())
+            if fact is None:
+                return
+            hit = self.patterns_getter().unsafe_note(fact)
+            if hit is not None:
+                logger.warning("diary: факт отброшен, сработал маркер %r", hit)
+                return
+            await self.db.insert_self_fact(
+                text=fact, bot_reply_tg_message_id=tg_message_id, created_at=sent_at
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("diary: фоновое извлечение факта упало")
 
     async def announce_life(self, event: LifeEventRow) -> SendOutcome:
         """Публикует событие жизни (``/life``/``/life post``, CLAUDE.md, "события
@@ -1611,6 +1791,7 @@ class Responder:
                 shadow=False,
                 created_at=now,
             )
+            self._spawn_diary(text, sent_message.message_id, now)
             await self._maybe_open_hot_window(cfg, now)
             return SendOutcome(
                 sent=True, text=text, reason="send:say", tg_message_id=sent_message.message_id
@@ -1994,6 +2175,96 @@ class Responder:
             _CHECKIN_DUE_KEY, str(after_now + self.rng.randint(*checkin_cfg.after_min) * 60)
         )
 
+    # ------------------------------------------------------------------ #
+    # «Ну как там?» (CLAUDE.md, "шутки чата и истории людей").
+    # ------------------------------------------------------------------ #
+
+    async def callback_job(self) -> None:
+        """Бесконечный цикл по образцу ``checkin_job``: раз в
+        ``cfg.behaviour.checkin.poll_sec`` смотрит, не пора ли спросить человека,
+        чем кончилась его история. Падение итерации логируется, цикл живёт дальше."""
+        while True:
+            try:
+                poll_sec = self.cfg_getter().behaviour.checkin.poll_sec
+                await self.sleep(float(poll_sec))
+                await self._maybe_callback()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("callback_job: iteration failed")
+                await self.sleep(_ERROR_RETRY_SEC)
+
+    async def _maybe_callback(self) -> None:
+        """Один заход: enabled -> не panic/stop/ночь/topic_cooldown -> окно
+        ``callback.window`` -> прошло ``min_days`` суток с прошлого вопроса -> в чате
+        тихо (``checkin.quiet_min``) -> не над потолком присутствия -> пауза между
+        репликами выдержана -> самый старый открытый тред: старше ``max_age_days``
+        закрывается, замьюченный автор и автор, давно не писавший в чат, пропускаются.
+        Любой исход генерации (отправлено, молчание, срез) закрывает тред и ставит
+        ``callback_last_at``: про одно и то же второй раз не спрашиваем."""
+        cfg = self.cfg_getter()
+        callback_cfg = cfg.behaviour.callback
+        if not callback_cfg.enabled:
+            return
+
+        tz = cfg.persona.timezone
+        now = self._clock()
+        if await self._spontaneous_gate_blocked(cfg, now):
+            return
+        if not in_window(now, tz, callback_cfg.window):
+            return
+
+        last_raw = await self.db.get_state(_CALLBACK_LAST_AT_KEY)
+        if last_raw is not None:
+            try:
+                if now - int(last_raw) < callback_cfg.min_days * 86400:
+                    return
+            except ValueError:
+                pass
+
+        quiet_sec = cfg.behaviour.checkin.quiet_min * 60
+        if quiet_sec > 0:
+            last_human_at = await self.db.last_message_at(self.chat_id)
+            if last_human_at is not None and now - last_human_at < quiet_sec:
+                return
+
+        if await self._presence_over_cap(cfg, now):
+            return
+        if await self._min_gap_due(cfg, now) is not None:
+            return
+
+        muted = await self.db.muted_user_ids()
+        chosen = None
+        for thread in await self.db.open_people_threads():
+            if now - thread.created_at > callback_cfg.max_age_days * 86400:
+                # Не «спросил», а устарело: удаляем, а не закрываем, чтобы /people не
+                # показывал вопрос, которого не было (retention всё равно удалил бы).
+                await self.db.delete_people_thread(thread.id)
+                continue
+            if thread.user_id in muted:
+                continue
+            author_last = await self.db.last_message_at_by_user(self.chat_id, thread.user_id)
+            if author_last is None or now - author_last > callback_cfg.author_active_days * 86400:
+                continue
+            chosen = thread
+            break
+        if chosen is None:
+            return
+
+        # Тред закрывается ДО попытки (ревью Codex): любой исход — отправка, молчание,
+        # срез, сбой, отмена посреди отправки — не должен привести к тому, что про то
+        # же спросят второй раз. Цена — редкий вопрос, потерянный из-за SIGTERM до
+        # отправки; повтор чужой личной истории хуже.
+        await self.db.close_people_thread(chosen.id, now)
+        await self.db.set_state(_CALLBACK_LAST_AT_KEY, str(now))
+        await self._respond(
+            trigger=_CALLBACK_TRIGGER,
+            trigger_msg_id=None,
+            user_id=chosen.user_id,
+            situation=situation_callback(chosen.display_name, chosen.text),
+            delay_sec=0,
+        )
+
     async def shutdown(self) -> None:
         """Отменяет дебаунс- и pending-таймеры. Сами pending остаются в БД —
         следующий restore_pending (после рестарта) подхватит их заново.
@@ -2017,6 +2288,10 @@ class Responder:
                 self._respond_lock.release()
 
         tasks: list[asyncio.Task[None]] = []
+        for diary_task in list(self._diary_tasks):
+            if not diary_task.done():
+                diary_task.cancel()
+            tasks.append(diary_task)
         if self._debounce_task is not None and not self._debounce_task.done():
             self._debounce_task.cancel()
             tasks.append(self._debounce_task)
@@ -2028,3 +2303,4 @@ class Responder:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._pending_tasks.clear()
+        self._diary_tasks.clear()

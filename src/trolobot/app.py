@@ -18,6 +18,7 @@ from trolobot.bot import Deps, build_router
 from trolobot.chat_memory import ChatMemorizer
 from trolobot.commands import build_commands_router
 from trolobot.db import Database
+from trolobot.diary import DiaryExtractor
 from trolobot.followup import FollowupChecker
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
@@ -52,6 +53,7 @@ async def main() -> None:
     morning_task: asyncio.Task[None] | None = None
     spontaneous_task: asyncio.Task[None] | None = None
     checkin_task: asyncio.Task[None] | None = None
+    callback_task: asyncio.Task[None] | None = None
     memory_task: asyncio.Task[None] | None = None
     llm: LLMClient | None = None
     responder: Responder | None = None
@@ -196,12 +198,19 @@ async def main() -> None:
             # пересказывает завершённые периоды. enabled проверяется на каждом
             # заходе, а не один раз при старте — /set включает без рестарта.
             memory_prompt = settings.memory_prompt_path.read_text(encoding="utf-8")
+            # Два дополнительных вызова недельного пересказа: шутки чата и незакрытые
+            # истории людей (CLAUDE.md, "шутки чата и истории людей").
+            jokes_prompt = settings.jokes_prompt_path.read_text(encoding="utf-8")
+            threads_prompt = settings.threads_prompt_path.read_text(encoding="utf-8")
             memorizer = ChatMemorizer(
                 llm,
                 db,
                 config_store.get,
                 memory_prompt,
                 chat_id=settings.allowed_chat_id,
+                jokes_prompt=jokes_prompt,
+                threads_prompt=threads_prompt,
+                patterns_getter=config_store.patterns,
             )
             deps.memorizer = memorizer
 
@@ -210,6 +219,11 @@ async def main() -> None:
             # наличии ключа; модель и place_lookup проверяются на каждом вызове.
             weather_place_prompt = settings.weather_place_prompt_path.read_text(encoding="utf-8")
             weather_places = WeatherPlaceExtractor(llm, config_store.get, weather_place_prompt)
+
+            # Дневник дня (CLAUDE.md, "дневник дня"): дешёвое извлечение факта о себе
+            # из каждой своей текстовой реплики; модель и enabled — на каждом вызове.
+            diary_prompt = settings.diary_prompt_path.read_text(encoding="utf-8")
+            diary = DiaryExtractor(llm, config_store.get, diary_prompt)
 
             responder = Responder(
                 bot=bot,
@@ -220,6 +234,7 @@ async def main() -> None:
                 sticker_chooser=sticker_chooser,
                 weather=weather,
                 weather_places=weather_places,
+                diary=diary,
                 patterns_getter=config_store.patterns,
                 prompt_store=prompt_store,
                 rng=rng,
@@ -252,6 +267,7 @@ async def main() -> None:
             morning_task = asyncio.create_task(responder.morning_job())
             spontaneous_task = asyncio.create_task(responder.spontaneous_job())
             checkin_task = asyncio.create_task(responder.checkin_job())
+            callback_task = asyncio.create_task(responder.callback_job())
         if deps.memorizer is not None:
             memory_task = asyncio.create_task(deps.memorizer.job())
 
@@ -264,7 +280,14 @@ async def main() -> None:
 
         await dispatcher.start_polling(bot, allowed_updates=["message", "edited_message"])
     finally:
-        for task in (memory_task, checkin_task, spontaneous_task, morning_task, retention_task):
+        for task in (
+            memory_task,
+            callback_task,
+            checkin_task,
+            spontaneous_task,
+            morning_task,
+            retention_task,
+        ):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

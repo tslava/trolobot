@@ -10,8 +10,10 @@ from pydantic import ValidationError
 from trolobot.config import describe_key, flatten_config, load_config
 from trolobot.config_models import (
     BehaviourConfig,
+    CallbackConfig,
     Config,
     FiltersConfig,
+    JokesConfig,
     LlmConfig,
     PlacesConfig,
     ReplyDelayBucket,
@@ -115,7 +117,7 @@ def test_config_builds_with_defaults_without_yaml() -> None:
     cfg = Config()
 
     assert cfg.persona.birth_date == date(1974, 4, 12)
-    assert cfg.behaviour.ambient_probability == 0.15
+    assert cfg.behaviour.ambient_probability == 0.25
 
 
 def test_override_changes_value_and_coerces_int() -> None:
@@ -374,6 +376,37 @@ def test_describe_key_overridden_default_differs_from_value() -> None:
     assert info.value != info.default
 
 
+def test_jokes_and_callback_defaults_and_real_config() -> None:
+    cfg = load_config(CONFIG_PATH)
+
+    assert cfg.behaviour.jokes.enabled is True
+    assert cfg.behaviour.jokes.per_period == 3
+    assert cfg.behaviour.jokes.in_prompt == 6
+    assert cfg.behaviour.jokes.cooldown_days == 5
+    callback = cfg.behaviour.callback
+    assert (callback.min_days, callback.max_age_days, callback.author_active_days) == (3, 14, 7)
+    assert callback.window == ("11:00", "20:00")
+
+
+def test_callback_window_validated_like_quiet_window() -> None:
+    with pytest.raises(ValidationError):
+        CallbackConfig(window=("25:00", "20:00"))
+    with pytest.raises(ValidationError):
+        CallbackConfig(window=("11-00", "20:00"))
+    assert CallbackConfig(window=("09:30", "18:00")).window == ("09:30", "18:00")
+
+
+def test_jokes_and_callback_bounds() -> None:
+    with pytest.raises(ValidationError):
+        JokesConfig(per_period=11)
+    with pytest.raises(ValidationError):
+        JokesConfig(in_prompt=-1)
+    with pytest.raises(ValidationError):
+        CallbackConfig(min_days=0)
+    with pytest.raises(ValidationError):
+        CallbackConfig(max_age_days=91)
+
+
 def test_describe_key_all_leaf_keys_have_short_description() -> None:
     cfg = Config()
     flat = flatten_config(cfg)
@@ -383,3 +416,23 @@ def test_describe_key_all_leaf_keys_have_short_description() -> None:
         assert info is not None, key
         assert info.description, f"{key}: empty description"
         assert len(info.description) <= 90, f"{key}: description too long ({len(info.description)})"
+
+
+def test_reactions_emoji_laugh_not_in_telegram_set_rejected() -> None:
+    """😂 есть в allowed_emoji, но не в наборе реакций Telegram (REACTION_INVALID)."""
+    with pytest.raises(ValidationError, match="набор"):
+        Config.model_validate(
+            {"behaviour": {"reactions": {"emoji": ["👍", "😂"]}}},
+        )
+
+
+def test_reactions_emoji_rofl_accepted_without_allowed_emoji() -> None:
+    cfg = Config.model_validate({"behaviour": {"reactions": {"emoji": ["👍", "🤣"]}}})
+    assert "🤣" in cfg.behaviour.reactions.emoji
+    assert "🤣" not in cfg.filters.allowed_emoji
+
+
+def test_reactions_emoji_variation_selector_is_stripped() -> None:
+    """С клавиатуры приходит «❤️» (с U+FE0F), в наборе Telegram — «❤»."""
+    cfg = Config.model_validate({"behaviour": {"reactions": {"emoji": ["👍", "❤\ufe0f"]}}})
+    assert cfg.behaviour.reactions.emoji == ["👍", "❤"]

@@ -31,7 +31,7 @@ async def _make_config_store(tmp_path: Path) -> tuple[ConfigStore, Database]:
 async def test_set_valid_key_changes_get(tmp_path: Path) -> None:
     store, db = await _make_config_store(tmp_path)
     try:
-        assert store.get().behaviour.ambient_probability == 0.15
+        assert store.get().behaviour.ambient_probability == 0.25
 
         old, new = await store.set("behaviour.ambient_probability", "0.9", changed_by=1, now=1000)
 

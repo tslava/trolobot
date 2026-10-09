@@ -104,6 +104,14 @@ SITUATION_CHECKIN_FOOTER = (
     "встраивайся."
 )
 
+# «Ну как там?» (CLAUDE.md, "шутки чата и истории людей"): через несколько дней
+# Фёдор сам спрашивает человека, чем кончилась история, о которой тот говорил.
+SITUATION_CALLBACK_TEMPLATE = (
+    "Несколько дней назад {name} говорил, что {text}. Спроси у {name}, чем кончилось, "
+    "одной короткой фразой, по-свойски, обратившись по имени. Если спрашивать "
+    "неуместно — промолчи."
+)
+
 _ADDRESSED_TEXT_MAX_LEN = 300
 _ADDRESSED_ITEMS_MAX = 5
 
@@ -143,7 +151,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(
-    r"\{(age|few_shot|life|chat_memory|weather|context|recent_replies|places|avoid|situation)\}"
+    r"\{(age|few_shot|life|diary|chat_memory|jokes|weather|context|recent_replies|places|avoid|situation)\}"
 )
 
 
@@ -295,6 +303,17 @@ def situation_life(text: str) -> str:
     return SITUATION_LIFE_TEMPLATE.replace("{text}", cleaned)
 
 
+def situation_callback(name: str, text: str) -> str:
+    """Ситуация для триггера ``callback``: подстановка в SITUATION_CALLBACK_TEMPLATE.
+
+    Имя и текст чистятся от поддельных разделителей и режутся до 300 символов
+    (``_clean_addressed_text``); подстановка за один проход ``re.sub``, чтобы
+    ``{name}``/``{text}`` внутри чужих данных повторно не заменялись.
+    """
+    values = {"name": _clean_addressed_text(name), "text": _clean_addressed_text(text)}
+    return re.sub(r"\{(name|text)\}", lambda m: values[m.group(1)], SITUATION_CALLBACK_TEMPLATE)
+
+
 def build_messages(
     template: str,
     *,
@@ -306,7 +325,9 @@ def build_messages(
     situation: str,
     avoid: str = "",
     life: str = "",
+    diary: str = "",
     chat_memory: str = "",
+    jokes: str = "",
     weather: str = "",
     json_reminder: str = _JSON_REMINDER,
 ) -> list[dict[str, str]]:
@@ -323,8 +344,12 @@ def build_messages(
     context и recent_replies — внутри разделителей <<<CHAT ... >>>. {life} —
     исключение: это память владельца о персонаже (как few_shot), а не ввод
     участников чата, поэтому подставляется в system напрямую, реальным значением.
+    {diary} (CLAUDE.md, "дневник дня") — тоже в system: факты о собственных делах
+    персонажа, достанные из его же реплик (diary.render_diary), а не ввод участников.
     {chat_memory} — такое же исключение: это уже сжатый моделью пересказ прошедших
     недель (chat_memory.py), память персонажа, а не сырые сообщения участников.
+    {jokes} (CLAUDE.md, "шутки чата и истории людей") — тоже в system: общие шутки
+    чата, достанные недельным ChatMemorizer (jokes.render_jokes), память персонажа.
     {avoid} (CLAUDE.md, "меньше и разнообразнее", мера 5) — тоже в system: это не
     данные участников, а инструкция, собранная motifs.render_avoid из того, что
     персонаж сам уже наговорил («жену и гараж ты уже поминал, сейчас без них»).
@@ -336,7 +361,9 @@ def build_messages(
         "age": str(age),
         "few_shot": few_shot,
         "life": life,
+        "diary": _strip_fake_delimiters(diary).strip(),
         "chat_memory": chat_memory,
+        "jokes": _strip_fake_delimiters(jokes).strip(),
         "weather": _strip_fake_delimiters(weather).strip(),
         "context": _CONTEXT_MARKER,
         "recent_replies": _RECENT_REPLIES_MARKER,

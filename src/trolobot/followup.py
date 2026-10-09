@@ -53,7 +53,7 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(r"\{(context|recent_replies|name|text)\}")
-_BATCH_SLOT_RE = re.compile(r"\{(messages|recent_replies)\}")
+_BATCH_SLOT_RE = re.compile(r"\{(messages|recent_replies|names)\}")
 
 
 def _strip_fake_delimiters(text: str) -> str:
@@ -308,9 +308,14 @@ class FollowupChecker:
         messages_block = _strip_fake_delimiters(render_numbered_messages(rows)).strip()
         recent = _strip_fake_delimiters("\n".join(recent_replies)).strip()
 
+        # Как его зовут в чате: без этого дешёвая модель знает только «Фёдор» и
+        # отсеивает обращения «отец»/«Федя», до основной модели они не доходят.
+        persona = cfg.persona
+        names = list(dict.fromkeys([persona.name, persona.display_name, *persona.name_triggers]))
         slot_values = {
             "messages": messages_block or _MESSAGES_EMPTY,
             "recent_replies": recent or _RECENT_REPLIES_EMPTY,
+            "names": ", ".join(name for name in names if name),
         }
         system = _BATCH_SLOT_RE.sub(lambda m: slot_values[m.group(1)], self._batch_prompt_template)
         messages = [{"role": "system", "content": system}]
