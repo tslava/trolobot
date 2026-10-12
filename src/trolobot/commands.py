@@ -33,8 +33,16 @@ from trolobot.changelog import Release, parse_changelog
 from trolobot.chat_memory import format_period
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import ChatMemoryRow, JokeRow, LifeEventRow, PeopleThreadRow, SelfFactRow
+from trolobot.db import (
+    ChatMemoryRow,
+    JokeRow,
+    LifeEventRow,
+    PeopleThreadRow,
+    SelfFactRow,
+)
 from trolobot.few_shot import FewShot
+from trolobot.motifs import render_self_share, self_share
+from trolobot.patterns import Patterns
 from trolobot.sanitize import normalize_text, sanitize_display_name
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, day_start, local_dt
@@ -98,6 +106,9 @@ _MEMORY_USAGE = "Использование: /memory [list | rm N | run]"
 _MEMORY_LIST_LIMIT = 20
 # Сколько символов свежесозданных пересказов показать в ответе на /memory run.
 _MEMORY_RUN_PREVIEW_LEN = 1500
+
+# /status: окно метрики «про себя» в сутках (CLAUDE.md, "про себя через раз").
+_SELF_SHARE_DAYS = 3
 
 # /diary: подсказка при кривом вводе и окно списка (CLAUDE.md, "дневник дня": «за неделю»).
 _DIARY_USAGE = "Использование: /diary | /diary rm N"
@@ -198,6 +209,7 @@ class _DbLike(Protocol):
     async def last_chat_memory_end(self) -> int | None: ...
     # -- дневник дня (/diary, CLAUDE.md "дневник дня") -----------------------
     async def self_facts_since(self, since: int) -> Sequence[SelfFactRow]: ...
+    async def bot_replies_between(self, start: int, end: int) -> Sequence[_BotReplyRowLike]: ...
     async def delete_self_fact(self, fact_id: int) -> bool: ...
     # -- шутки чата и истории людей (/jokes, /people) ------------------------
     async def jokes(self, limit: int) -> Sequence[JokeRow]: ...
@@ -237,6 +249,7 @@ class _ConfigStoreLike(Protocol):
     async def unset(self, key: str, changed_by: int, now: int) -> str | None: ...
     def flat(self) -> list[tuple[str, str, bool]]: ...
     def describe(self, key: str) -> KeyInfo | None: ...
+    def patterns(self) -> Patterns: ...
 
 
 class _PromptStoreLike(Protocol):
@@ -479,6 +492,16 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"presence: {bot_today}/{presence_cfg.allowance(human_today)} (people {human_today})"
     )
 
+    # Метрика «про себя» (CLAUDE.md, "про себя через раз") — только смотреть, ничего не режет.
+    self_rows = await deps.db.bot_replies_between(now - _SELF_SHARE_DAYS * 86400, now + 1)
+    self_line = render_self_share(
+        self_share(
+            ((row.trigger, row.text) for row in self_rows),
+            deps.config_store.patterns().self_markers,
+        ),
+        _SELF_SHARE_DAYS,
+    )
+
     diary_calls = int(await deps.db.get_state(day_key("diary_calls", now, tz)) or "0")
     diary_today = len(await deps.db.self_facts_since(midnight))
 
@@ -574,6 +597,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"jokes: {jokes_total}, people: {people_open}, callback: {callback_text}",
         checkin_line,
         presence_line,
+        self_line,
         weather_line,
     ]
     await _reply(message, "\n".join(lines))
