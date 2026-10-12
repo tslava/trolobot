@@ -23,6 +23,7 @@ from trolobot.config import KeyInfo
 from trolobot.config_models import Config
 from trolobot.db import ChatMemoryRow, JokeRow, LifeEventRow, PeopleThreadRow, SelfFactRow
 from trolobot.few_shot import FewShot
+from trolobot.patterns import Patterns
 from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, local_dt
@@ -82,6 +83,7 @@ class FakeDb:
     _next_life_event_id: int = 1
     chat_memory_store: dict[int, ChatMemoryRow] = field(default_factory=dict)
     self_facts_store: dict[int, SelfFactRow] = field(default_factory=dict)
+    bot_replies_store: list[FakeBotReplyRow] = field(default_factory=list)
     jokes_store: dict[int, JokeRow] = field(default_factory=dict)
     threads_store: dict[int, PeopleThreadRow] = field(default_factory=dict)
     # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее"): /status считает его по
@@ -178,6 +180,9 @@ class FakeDb:
             return None
         return max(row.period_end for row in self.chat_memory_store.values())
 
+    async def bot_replies_between(self, start: int, end: int) -> list[FakeBotReplyRow]:
+        return [row for row in self.bot_replies_store if start <= row.created_at < end]
+
     async def self_facts_since(self, since: int) -> list[SelfFactRow]:
         rows = [row for row in self.self_facts_store.values() if row.created_at >= since]
         return sorted(rows, key=lambda r: (r.created_at, r.id))
@@ -221,6 +226,9 @@ class FakeConfigStore:
 
     def describe(self, key: str) -> KeyInfo | None:
         return self.describe_value.get(key)
+
+    def patterns(self) -> Patterns:
+        return Patterns(self.cfg.filters, name_triggers=[], bot_username="")
 
     async def set(
         self, key: str, raw_value: str, changed_by: int, now: int
@@ -2531,6 +2539,40 @@ async def test_status_shows_diary_line(
 
     cap = config.behaviour.diary.daily_cap
     assert f"diary: 1, calls 4/{cap}" in sent[0]
+
+
+async def test_status_shows_self_share_line(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+
+    def row(trigger: str, text: str, created_at: int) -> FakeBotReplyRow:
+        return FakeBotReplyRow(
+            trigger=trigger,
+            trigger_tg_message_id=None,
+            text=text,
+            prompt_version=1,
+            few_shot_version=1,
+            delay_sec=0,
+            created_at=created_at,
+        )
+
+    db.bot_replies_store = [
+        row("ambient", "У нас в НИИ так же спорили", now - 3600),
+        row("ambient", "Третий раз это уже традиция", now - 3500),
+        row("name", "Внук чеснок не ест", now - 3400),
+        row("morning", "Доброе утро всем", now - 3300),
+        row("say", "я за грибами", now - 3200),
+        row("ambient", "[стикер #3] Ну ты даёшь", now - 3100),
+        row("ambient", "У меня такие в банке", now - 4 * 86400),  # вне окна
+    ]
+    handler = _handler(deps)
+
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status"))
+
+    assert "о себе за 3 сут: ambient 1/2, обращения 1/1, прочее 0/1" in sent[0]
 
 
 # --- /jokes и /people (CLAUDE.md, "шутки чата и истории людей") -----------------

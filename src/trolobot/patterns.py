@@ -49,6 +49,8 @@ class Patterns:
             label: _compile_regex_list(patterns) for label, patterns in filters.motifs.items()
         }
         self._story_markers = _compile_regex_list(filters.story_markers)
+        # Метрика «про себя» (CLAUDE.md, "про себя через раз") — только /status.
+        self._self_markers = _compile_regex_list(filters.self_markers)
         # Имя ищется во всех падежах единственного числа (CLAUDE.md, "имя в
         # падежах"): «внуком Федора» и «спроси у отца» — то же обращение, что
         # «Федор» и «отец». Формы даёт morph.name_pattern закрытым списком
@@ -114,3 +116,8 @@ class Patterns:
     def story_markers(self) -> list[re.Pattern[str]]:
         """Скомпилированные маркеры байки (для motifs.story_count)."""
         return self._story_markers
+
+    @property
+    def self_markers(self) -> list[re.Pattern[str]]:
+        """Скомпилированные маркеры «говорит о себе» (для motifs.self_share)."""
+        return self._self_markers

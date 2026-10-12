@@ -70,6 +70,7 @@ from trolobot.places import render_places_menu
 from trolobot.postprocess import soften
 from trolobot.prompt import (
     JSON_REMINDER_CHECKIN,
+    SITUATION_AMBIENT,
     SITUATION_LATE,
     SITUATION_MORNING,
     SITUATION_SPONTANEOUS,
@@ -438,7 +439,7 @@ class Responder:
                 trigger=Trigger.AMBIENT,
                 trigger_msg_id=msg.tg_message_id,
                 user_id=msg.user_id,
-                situation="",
+                situation=SITUATION_AMBIENT,
                 delay_sec=0,
                 trigger_text="",
             )

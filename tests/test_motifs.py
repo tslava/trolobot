@@ -4,8 +4,19 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from trolobot.config_models import FiltersConfig
-from trolobot.motifs import motifs_in, render_avoid, story_count, used_motifs
+from trolobot.motifs import (
+    SelfShare,
+    motifs_in,
+    render_avoid,
+    render_self_share,
+    self_share,
+    speaks_about_self,
+    story_count,
+    used_motifs,
+)
 from trolobot.patterns import Patterns
 
 
@@ -159,3 +170,72 @@ def test_render_avoid_has_no_typographic_dash() -> None:
 
     assert "—" not in text
     assert "–" not in text
+
+
+# --- метрика «про себя» (CLAUDE.md, "про себя через раз") ---------------------------
+
+
+def _self_markers() -> list[re.Pattern[str]]:
+    return [re.compile(p, re.IGNORECASE) for p in FiltersConfig().self_markers]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "У нас в НИИ так же спорили, только про премию",
+        "Крысы у нас на участке зимой в теплице жили",
+        "Болтик этот теперь живёт отдельной жизнью, у меня такие в банке",
+        "Внук чеснок не ест, зато банку за вечер может уполовинить",
+        "Мои в этой дискуссии не участвуют",
+        "Мне-то всё равно, я одну бутылку беру",
+        "Мы у себя яйца из деревни брали",
+        "Я час ищу выход в моём гараже",
+        "в нашем гараже такого не было",
+        "Сынок звонил вчера",
+        "Внучка рисует",
+    ],
+)
+def test_speaks_about_self_catches_real_self_replies(text: str) -> None:
+    assert speaks_about_self(text, _self_markers())
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Третий раз это уже традиция. На четвёртый торт заказывайте.",
+        "Мне кажется, кот на что-то намекает",
+        "Нашёл время, конечно",
+        "Рейс из Внуково задержали",
+        "Сынишкин портфель тут ни при чём",
+        "Двадцать четыре злотых, зато пена бесплатно.",
+        "[стикер #3] я тебя",
+        "",
+    ],
+)
+def test_speaks_about_self_ignores_other_replies(text: str) -> None:
+    assert not speaks_about_self(text, _self_markers())
+
+
+def test_self_share_groups_and_skips() -> None:
+    share = self_share(
+        [
+            ("ambient", "У нас в НИИ"),
+            ("ambient", "Плюс девять ещё бодрит"),
+            ("mention", "Я не проверял"),
+            ("followup", "Бывает"),
+            ("places", "Мы там сидели"),
+            ("checkin", "у меня тоже"),
+            ("say", "я за грибами"),
+            ("life", "я продал машину"),
+            ("ambient", "[стикер #1] я"),
+        ],
+        _self_markers(),
+    )
+    assert share == SelfShare(ambient=(1, 2), address=(2, 3), other=(1, 1))
+
+
+def test_render_self_share() -> None:
+    share = SelfShare(ambient=(6, 6), address=(2, 2), other=(0, 1))
+    assert render_self_share(share, 3) == (
+        "о себе за 3 сут: ambient 6/6, обращения 2/2, прочее 0/1"
+    )

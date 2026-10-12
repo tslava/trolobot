@@ -884,7 +884,7 @@ def test_build_messages_replaces_diary_directly_in_system() -> None:
         recent_replies="",
         places="",
         situation="",
-        diary="Что ты сегодня уже говорил о себе: 10:46 пошёл за грибами.",
+        diary="Твои дела сегодня: 10:46 пошёл за грибами.",
     )
     system = messages[0]["content"]
     assert "10:46 пошёл за грибами" in system

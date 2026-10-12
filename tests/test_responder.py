@@ -42,7 +42,7 @@ from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
 from trolobot.patterns import Patterns
-from trolobot.prompt import PLACES_NONE, SITUATION_LATE, SITUATION_MORNING
+from trolobot.prompt import PLACES_NONE, SITUATION_AMBIENT, SITUATION_LATE, SITUATION_MORNING
 from trolobot.responder import Responder
 from trolobot.stickers import Sticker
 from trolobot.timeutil import day_key, in_window
@@ -1326,6 +1326,7 @@ async def test_ambient_reply_has_no_addressed_situation_line(db: Database) -> No
         user_content = payload["messages"][1]["content"]  # type: ignore[index]
         assert "К тебе сейчас обратился" not in user_content
         assert "К тебе обратились:" not in user_content
+        assert SITUATION_AMBIENT in user_content
     finally:
         await responder.shutdown()
         await llm.aclose()
@@ -5610,7 +5611,10 @@ async def test_diary_slot_filled_with_today_and_week_facts(db: Database) -> None
         await _ambient(clock, responder)
 
         system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
-        assert "Что ты сегодня уже говорил о себе (держись этого, не противоречь): " in system
+        assert (
+            "Твои дела сегодня (это только чтобы не противоречить себе, "
+            "сам об этом не заговаривай): "
+        ) in system
         assert "14:00 пошёл за грибами" in system
         assert "На этой неделе: чт чинил движок." in system
         assert "{diary}" not in system
@@ -5632,7 +5636,7 @@ async def test_diary_slot_empty_without_facts(db: Database) -> None:
 
         system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
         assert "{diary}" not in system
-        assert "говорил о себе" not in system
+        assert "Твои дела сегодня" not in system
     finally:
         await responder.shutdown()
         await llm.aclose()

@@ -1947,7 +1947,7 @@ class DiaryExtractor:
     # LLMError / не JSON -> None + WARNING. [стикер #N] реплики не передаются (вызывающий пропускает).
 def render_diary(today: Sequence[SelfFactRow], week: Sequence[SelfFactRow], tz: str) -> str
 # "" если оба пусты. Иначе:
-# «Что ты сегодня уже говорил о себе (держись этого, не противоречь): 10:46 пошёл за грибами; 12:39 возится с машиной.»
+# «Твои дела сегодня (это только чтобы не противоречить себе, сам об этом не заговаривай): 10:46 пошёл за грибами; 12:39 возится с машиной.»
 # + при непустом week: «На этой неделе: пн чинил движок; ср купил полки.» (день недели по-русски сокращённо,
 # локальный по tz). Одной-двумя строками, без «- » в начале (regex:prompt_leak).
 
@@ -2066,6 +2066,54 @@ def joke_used(text: str, joke: str) -> bool   # 3+ общих нормализо
 пустые промпты -> вызовов нет), `test_db.py` (миграция 4->5, CRUD, purge), `test_responder.py` (callback: все
 условия выхода, отправка закрывает тред и ставит callback_last_at, молчание тоже закрывает; слот jokes в system,
 mark_joke_used после отправки), `test_prompt.py`, `test_commands.py`.
+
+## Интерфейсы: про себя через раз
+
+Решение владельца 12.10.2026. После 0.6.0 бот всё равно говорил о себе почти в каждой реплике:
+с 09.10 по 12.10 7 из 7 непрошеных (ambient) реплик были про него самого (НИИ, крысы в теплице,
+банка с болтами, внук). Строка «Не своди разговор к себе» в промпте не помогла. Количество
+вмешательств владельца устраивает — гейт, вероятности и потолки НЕ трогать; меняется только
+содержание. Квоту-фильтр `style:self_quota` НЕ делать: стадия `style` входит в `enforce_stages`
+и резала бы сразу, без пробного периода; сначала смотрим на метрику.
+
+```python
+# 1. prompt.py: SITUATION_AMBIENT — ситуация для ambient вместо пустой строки (responder,
+# _handle_debounced_inner, ветка Trigger.AMBIENT; и в горячем окне тоже). Можно отозваться на
+# последнее сообщение, на тему в целом или повернуть её (решение владельца: «отвечай на последнее»
+# отвергнуто, все три пути равноправны); свой случай не начинать — если тянет только про себя,
+# speak=false. Обращения, morning, checkin, callback, spontaneous, life — без изменений.
+
+# 2. few_shot.yaml: про себя — только в ответах на вопросы про него (завод, стрижка, ошибался,
+# сервер, выходные, переезд, «поехали с нами»); на сказанное не ему — реакция про собеседника
+# (подкол, встречный вопрос). 21 пример, 5 speak=false (CHARACTER.md: 5–7). CHARACTER.md раздел 5 синхронизирован.
+
+# 3. diary.py: _TODAY_HEADER = «Твои дела сегодня (это только чтобы не противоречить себе, сам об
+# этом не заговаривай): » вместо «Что ты сегодня уже говорил о себе…». prompts/diary.txt: факт —
+# только конкретное дело сейчас/сегодня-вчера; воспоминания, «обычно бывает», шутки и
+# преувеличения, при сомнении — null (живые ошибки: «ловит крыс в теплице зимой», «ищет выход
+# из-под верстака»).
+
+# 4. Метрика «про себя» — только смотреть, ничего не режет.
+# config_models.FiltersConfig.self_markers: list[str] — регулярки первого лица и родни
+#   (я, меня/мне — кроме «мне кажется», мой…, мы, у нас, наш…, внук, жена, сын); в _REGEX_LIST_FIELDS.
+# patterns.Patterns.self_markers -> list[re.Pattern[str]]
+# motifs.py:
+@dataclass(frozen=True, slots=True)
+class SelfShare: ambient: tuple[int, int] = (0, 0); address: tuple[int, int] = (0, 0); other: tuple[int, int] = (0, 0)
+def speaks_about_self(text: str, markers: Sequence[re.Pattern[str]]) -> bool   # стикер — False
+def self_share(replies: Iterable[tuple[str, str]], markers) -> SelfShare
+# (trigger, text); группы: ambient | обращения (mention/reply/name/followup/places) | прочее
+# (morning/checkin/callback/spontaneous); say, life и стикеры не считаются.
+def render_self_share(share: SelfShare, days: int) -> str
+# «о себе за 3 сут: ambient 6/6, обращения 2/2, прочее 0/1»
+# commands.py /status: строка render_self_share по db.bot_replies_between(now - 3 сут, now + 1),
+# _SELF_SHARE_DAYS = 3. _ConfigStoreLike += patterns(), _DbLike += bot_replies_between.
+```
+
+Тесты: `test_responder.py` (SITUATION_AMBIENT в user-сообщении ambient), `test_few_shot.py` (21 пример, speak=false 5–7;
+регрессия фильтра по примерам — в `test_filters.py`), `test_diary.py`/`test_responder.py` (новый заголовок),
+`test_motifs.py` (speaks_about_self на живых репликах и ложных: «мне кажется», «нашёл»; self_share группы и
+пропуски; render), `test_commands.py` (строка /status).
 
 ## Конвенции
 
