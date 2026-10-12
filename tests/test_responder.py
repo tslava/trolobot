@@ -42,7 +42,7 @@ from trolobot.gate_types import GateMessage, Trigger
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient
 from trolobot.patterns import Patterns
-from trolobot.prompt import PLACES_NONE, SITUATION_LATE, SITUATION_MORNING
+from trolobot.prompt import PLACES_NONE, SITUATION_AMBIENT, SITUATION_LATE, SITUATION_MORNING
 from trolobot.responder import Responder
 from trolobot.stickers import Sticker
 from trolobot.timeutil import day_key, in_window
@@ -1326,6 +1326,7 @@ async def test_ambient_reply_has_no_addressed_situation_line(db: Database) -> No
         user_content = payload["messages"][1]["content"]  # type: ignore[index]
         assert "К тебе сейчас обратился" not in user_content
         assert "К тебе обратились:" not in user_content
+        assert SITUATION_AMBIENT in user_content
     finally:
         await responder.shutdown()
         await llm.aclose()
