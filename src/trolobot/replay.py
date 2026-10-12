@@ -81,7 +81,7 @@ from trolobot.gate_types import (
 from trolobot.judge import Judge
 from trolobot.llm import LLMClient, LLMError
 from trolobot.patterns import Patterns
-from trolobot.prompt import build_messages, parse_reply, render_context
+from trolobot.prompt import SITUATION_AMBIENT, build_messages, parse_reply, render_context
 from trolobot.sanitize import sanitize_display_name
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, local_date, local_dt
@@ -321,6 +321,16 @@ def _build_generate_context(cfg: Config, use_judge: bool) -> _GenerateContext:
     )
 
 
+def situation_for(trigger: Trigger) -> str:
+    """Ситуация для генерации в реплее — как у Responder для того же триггера.
+
+    Ambient получает ``SITUATION_AMBIENT`` (CLAUDE.md, "про себя через раз"), иначе
+    реплей проверял бы старую форму промпта. Обращения в реплее по-прежнему без
+    ``situation_addressed`` — известное упрощение реплея.
+    """
+    return SITUATION_AMBIENT if trigger is Trigger.AMBIENT else ""
+
+
 async def _generate_one(
     ctx: _GenerateContext,
     cfg: Config,
@@ -356,7 +366,7 @@ async def _generate_one(
         context=render_context(context_rows),
         recent_replies="\n".join(recent_for_prompt),
         places="",
-        situation="",
+        situation=situation_for(trigger),
     )
 
     def _line(reply_text: str, verdict_str: str) -> str:

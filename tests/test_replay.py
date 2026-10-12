@@ -548,3 +548,11 @@ def test_run_replay_from_bot_db_does_not_modify_live_file(tmp_path: Path) -> Non
     stat_after = db_path.stat()
     assert stat_before.st_mtime_ns == stat_after.st_mtime_ns
     assert stat_before.st_size == stat_after.st_size
+
+
+def test_situation_for_ambient_matches_responder() -> None:
+    from trolobot.gate_types import Trigger
+    from trolobot.prompt import SITUATION_AMBIENT
+
+    assert replay_module.situation_for(Trigger.AMBIENT) == SITUATION_AMBIENT
+    assert replay_module.situation_for(Trigger.NAME) == ""
