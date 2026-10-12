@@ -248,7 +248,7 @@ def test_render_diary_today_only_uses_local_time() -> None:
         _fact(2, "возится с машиной.", datetime(2026, 10, 9, 12, 39, tzinfo=WARSAW)),
     ]
     assert render_diary(today, [], TZ) == (
-        "Что ты сегодня уже говорил о себе (держись этого, не противоречь): "
+        "Твои дела сегодня (это только чтобы не противоречить себе, сам об этом не заговаривай): "
         "10:46 пошёл за грибами; 12:39 возится с машиной."
     )
 
@@ -272,7 +272,7 @@ def test_render_diary_today_and_week_are_two_lines() -> None:
     week = [_fact(2, "чинил движок", datetime(2026, 10, 5, 18, 0, tzinfo=WARSAW))]
     lines = render_diary(today, week, TZ).split("\n")
     assert len(lines) == 2
-    assert lines[0].startswith("Что ты сегодня уже говорил о себе")
+    assert lines[0].startswith("Твои дела сегодня")
     assert lines[1].startswith("На этой неделе:")
 
 

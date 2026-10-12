@@ -5611,7 +5611,10 @@ async def test_diary_slot_filled_with_today_and_week_facts(db: Database) -> None
         await _ambient(clock, responder)
 
         system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
-        assert "Что ты сегодня уже говорил о себе (держись этого, не противоречь): " in system
+        assert (
+            "Твои дела сегодня (это только чтобы не противоречить себе, "
+            "сам об этом не заговаривай): "
+        ) in system
         assert "14:00 пошёл за грибами" in system
         assert "На этой неделе: чт чинил движок." in system
         assert "{diary}" not in system
@@ -5633,7 +5636,7 @@ async def test_diary_slot_empty_without_facts(db: Database) -> None:
 
         system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
         assert "{diary}" not in system
-        assert "говорил о себе" not in system
+        assert "Твои дела сегодня" not in system
     finally:
         await responder.shutdown()
         await llm.aclose()
