@@ -14,9 +14,10 @@ FEW_SHOT_PATH = REPO_ROOT / "few_shot.yaml"
 def test_load_real_few_shot_without_errors() -> None:
     items = load_few_shot(FEW_SHOT_PATH)
 
-    assert len(items) == 20
+    assert len(items) == 21
     assert all(isinstance(item, FewShot) for item in items)
-    assert any(item.speak is False for item in items)
+    # CHARACTER.md раздел 5: «обязательно 5-7 штук с speak: false».
+    assert 5 <= sum(1 for item in items if item.speak is False) <= 7
     assert any(item.speak is True for item in items)
 
 

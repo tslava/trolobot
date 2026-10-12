@@ -2085,7 +2085,7 @@ mark_joke_used после отправки), `test_prompt.py`, `test_commands.py
 
 # 2. few_shot.yaml: про себя — только в ответах на вопросы про него (завод, стрижка, ошибался,
 # сервер, выходные, переезд, «поехали с нами»); на сказанное не ему — реакция про собеседника
-# (подкол, встречный вопрос). 20 примеров, 4 speak=false. CHARACTER.md раздел 5 синхронизирован.
+# (подкол, встречный вопрос). 21 пример, 5 speak=false (CHARACTER.md: 5–7). CHARACTER.md раздел 5 синхронизирован.
 
 # 3. diary.py: _TODAY_HEADER = «Твои дела сегодня (это только чтобы не противоречить себе, сам об
 # этом не заговаривай): » вместо «Что ты сегодня уже говорил о себе…». prompts/diary.txt: факт —
@@ -2110,7 +2110,7 @@ def render_self_share(share: SelfShare, days: int) -> str
 # _SELF_SHARE_DAYS = 3. _ConfigStoreLike += patterns(), _DbLike += bot_replies_between.
 ```
 
-Тесты: `test_responder.py` (SITUATION_AMBIENT в user-сообщении ambient), `test_few_shot.py` (20 примеров;
+Тесты: `test_responder.py` (SITUATION_AMBIENT в user-сообщении ambient), `test_few_shot.py` (21 пример, speak=false 5–7;
 регрессия фильтра по примерам — в `test_filters.py`), `test_diary.py`/`test_responder.py` (новый заголовок),
 `test_motifs.py` (speaks_about_self на живых репликах и ложных: «мне кажется», «нашёл»; self_share группы и
 пропуски; render), `test_commands.py` (строка /status).
