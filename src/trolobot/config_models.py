@@ -231,7 +231,10 @@ class ReactionsConfig(BaseModel):
     )
     model: str = Field(default="", description="Модель выбора реакции; пусто -> llm.judge_model")
     max_tokens: int = Field(
-        default=120, ge=10, le=200, description="Потолок ответа модели выбора реакции, токенов"
+        default=600,
+        ge=10,
+        le=1000,
+        description="Потолок ответа модели реакции, токенов (с размышлением модели)",
     )
     semantic_daily_cap: int = Field(
         default=40, ge=0, le=1000, description="Потолок вызовов модели на реакции в сутки"

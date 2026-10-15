@@ -37,7 +37,8 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from enum import Enum
+from typing import Final, Literal, Protocol
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import ReactionTypeEmoji, ReactionTypeUnion
@@ -62,6 +63,26 @@ _REASON_LOG_MAX_LEN = 100
 
 _CONTEXT_EMPTY = "(пока не было)"
 
+# Слот {reply_to}: сообщение, на которое ответил автор. Без него модель читает
+# «А я на халтуре 🌚» вне смысла и ставит 🤣 (живой промах 12.10).
+_REPLY_TO_NONE = "(это не ответ на другое сообщение)"
+_REPLY_TO_UNAVAILABLE = "(ответ на сообщение, которого не видно)"
+_REPLY_TO_MAX_LEN = 300
+
+
+class _ReplyUnavailable(Enum):
+    """Цель реплая есть, но её не видно: вычищена retention, ещё не записана хендлером
+    (фото описывается) или без текста. Отдельно от «не ответ», чтобы модель знала, что
+    ей не хватает контекста, — промпт велит в таком случае null (ревью Codex 15.10)."""
+
+    UNAVAILABLE = "unavailable"
+
+
+REPLY_UNAVAILABLE: Final = _ReplyUnavailable.UNAVAILABLE
+
+# None — не ответ; MessageRow — цель найдена; REPLY_UNAVAILABLE — ответ, цели не видно.
+ReplyTarget = MessageRow | Literal[_ReplyUnavailable.UNAVAILABLE] | None
+
 # Дублирует вырезание разделителей из sanitize.normalize_text/prompt.py/judge.py —
 # на всякий случай ещё раз чистим то, что уходит в промпт выбора реакции.
 _LT_RUN_RE = re.compile(r"<{3,}")
@@ -69,11 +90,22 @@ _GT_RUN_RE = re.compile(r">{3,}")
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
-_SLOT_RE = re.compile(r"\{(context|name|text|emoji)\}")
+_SLOT_RE = re.compile(r"\{(context|name|text|emoji|reply_to)\}")
 
 
 def _strip_fake_delimiters(text: str) -> str:
     return _GT_RUN_RE.sub(" ", _LT_RUN_RE.sub(" ", text))
+
+
+def _render_reply_to(row: ReplyTarget) -> str:
+    if row is None:
+        return _REPLY_TO_NONE
+    if row is REPLY_UNAVAILABLE or not row.text:
+        return _REPLY_TO_UNAVAILABLE
+    text = row.text
+    if len(text) > _REPLY_TO_MAX_LEN:
+        text = text[:_REPLY_TO_MAX_LEN].rstrip() + "…"
+    return _strip_fake_delimiters(f"{row.display_name}: {text}").strip()
 
 
 def _strip_code_fence(text: str) -> str:
@@ -263,6 +295,9 @@ def _parse_choice(raw: str) -> _ChoiceVerdict | None:
         emoji_value = data.get("emoji")
         if emoji_value is not None and not isinstance(emoji_value, str):
             return None
+        # Luna иногда пишет null строкой: это отказ, а не эмодзи вне списка.
+        if isinstance(emoji_value, str) and emoji_value.strip().lower() == "null":
+            emoji_value = None
 
         reason_value = data.get("reason", "")
         if reason_value is None:
@@ -308,7 +343,10 @@ class ReactionChooser:
         context_rows: Sequence[MessageRow],
         allowed: Sequence[str],
         now: int,
+        reply_to: ReplyTarget = None,
     ) -> str | None:
+        """``reply_to`` — сообщение, на которое ответил автор: ``None`` — не ответ,
+        ``REPLY_UNAVAILABLE`` — ответ, но цели не видно."""
         cfg = self._cfg_getter()
         reactions_cfg = cfg.behaviour.reactions
         model = reactions_cfg.model or cfg.llm.judge_model
@@ -323,6 +361,7 @@ class ReactionChooser:
             "name": _strip_fake_delimiters(display_name).strip(),
             "text": _strip_fake_delimiters(text).strip(),
             "emoji": " ".join(allowed),
+            "reply_to": _render_reply_to(reply_to),
         }
         system = _SLOT_RE.sub(lambda m: slot_values[m.group(1)], self._prompt_template)
         messages = [{"role": "system", "content": system}]
@@ -477,6 +516,7 @@ class ReactionScheduler:
                 context_rows=context_rows,
                 allowed=reactions_cfg.emoji,
                 now=now,
+                reply_to=await self._reply_target(chat_id, tg_message_id),
             )
             if emoji is None:
                 await self._db.insert_filter_log(
@@ -505,6 +545,16 @@ class ReactionScheduler:
             tz=tz,
             now=now,
         )
+
+    async def _reply_target(self, chat_id: int, tg_message_id: int) -> ReplyTarget:
+        """Сообщение, на которое ответил автор: само сообщение уже записано хендлером
+        до гейта, ссылка на ответ лежит в нём. Ответ на реплику бота сюда не попадает —
+        такой реплай проходит гейт как обращение, а реакции ставятся только на срезы."""
+        message = await self._db.message_by_tg_id(chat_id, tg_message_id)
+        if message is None or message.reply_to_tg_message_id is None:
+            return None
+        target = await self._db.message_by_tg_id(chat_id, message.reply_to_tg_message_id)
+        return REPLY_UNAVAILABLE if target is None else target
 
     @staticmethod
     def _recheck(state: ReactionState, cfg: ReactionsConfig, *, user_id: int, now: int) -> bool:
