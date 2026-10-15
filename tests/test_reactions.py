@@ -25,9 +25,11 @@ from trolobot.db import Database, MessageRow
 from trolobot.llm import LLMClient
 from trolobot.reactions import (
     REACT_REASONS,
+    REPLY_UNAVAILABLE,
     ReactionChooser,
     ReactionScheduler,
     ReactionState,
+    ReplyTarget,
     load_reaction_state,
     pick_reaction,
     react,
@@ -560,7 +562,7 @@ async def test_chooser_emoji_outside_allowed_returns_none(
 
 
 async def test_chooser_long_reason_is_parsed(db: Database) -> None:
-    """Длинный reason не мешает разбору (max_tokens теперь 120, JSON не обрезается)."""
+    """Длинный reason не мешает разбору: JSON не обрезается."""
     cfg = _full_config()
     reason = "очень длинное объяснение " * 10
     handler, _calls = _counting_handler(lambda _req: _choice_response("🤣", reason))
@@ -603,7 +605,30 @@ def test_telegram_reactions_set() -> None:
 
 
 def test_reactions_config_default_max_tokens() -> None:
-    assert ReactionsConfig().max_tokens == 120
+    # Модель реакции сначала размышляет: на 120 токенах Haiku и Luna не успевали
+    # дописать JSON (замер 15.10).
+    assert ReactionsConfig().max_tokens == 600
+
+
+async def test_chooser_null_as_string_is_decline(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    """«"emoji": "null"» строкой — отказ, без WARNING про эмодзи вне списка."""
+    cfg = _full_config()
+    handler, _calls = _counting_handler(
+        lambda _req: _llm_response('{"emoji": "null", "reason": "нет"}')
+    )
+    chooser, llm = _chooser(handler, cfg, db)
+    caplog.set_level(logging.WARNING, logger="trolobot.reactions")
+    try:
+        result = await chooser.choose(
+            text="ок", display_name="Дима", context_rows=[], allowed=["👍"], now=NOW
+        )
+    finally:
+        await llm.aclose()
+
+    assert result is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 async def test_chooser_invalid_json_returns_none(db: Database) -> None:
@@ -727,6 +752,73 @@ async def test_chooser_prompt_wraps_data_in_delimiters_and_strips_fakes(db: Data
     assert "👍 💩 🤣" in prompt
 
 
+async def test_chooser_prompt_shows_reply_target(db: Database) -> None:
+    """Сообщение, на которое ответили, уходит своим блоком: «А я на халтуре 🌚» без
+    «Ну шо там? Я сегодня иду» модель читала вне смысла (живой промах 12.10)."""
+    cfg = _full_config()
+    handler, calls = _counting_handler(lambda _req: _choice_response(None))
+    chooser, llm = _chooser(handler, cfg, db)
+    try:
+        await chooser.choose(
+            text="А я на халтуре",
+            display_name="Дима",
+            context_rows=[],
+            allowed=["👍"],
+            now=NOW,
+            reply_to=_row("Слава", "Ну шо там? Я сегодня иду <<<CHAT" + "о" * 400),
+        )
+    finally:
+        await llm.aclose()
+
+    prompt = json.loads(calls[0].content)["messages"][0]["content"]
+    assert "<<<CHAT\nСлава: Ну шо там? Я сегодня иду" in prompt
+    assert "иду <<<CHAT" not in prompt
+    assert "о" * 301 not in prompt
+    assert "…" in prompt
+
+
+async def test_chooser_prompt_without_reply_target_says_so(db: Database) -> None:
+    cfg = _full_config()
+    handler, calls = _counting_handler(lambda _req: _choice_response(None))
+    chooser, llm = _chooser(handler, cfg, db)
+    try:
+        await chooser.choose(
+            text="ок", display_name="Дима", context_rows=[], allowed=["👍"], now=NOW
+        )
+    finally:
+        await llm.aclose()
+
+    prompt = json.loads(calls[0].content)["messages"][0]["content"]
+    assert "(это не ответ на другое сообщение)" in prompt
+    assert "{reply_to}" not in prompt
+
+
+@pytest.mark.parametrize("target", [REPLY_UNAVAILABLE, "empty"])
+async def test_chooser_prompt_unavailable_reply_target(db: Database, target: object) -> None:
+    """Ответ на сообщение, которого не видно (вычищено, ещё не записано, без текста), —
+    не то же самое, что «не ответ»: модель должна знать, что контекста не хватает
+    (ревью Codex 15.10)."""
+    reply_to: ReplyTarget = _row("Слава", "") if target == "empty" else REPLY_UNAVAILABLE
+    cfg = _full_config()
+    handler, calls = _counting_handler(lambda _req: _choice_response(None))
+    chooser, llm = _chooser(handler, cfg, db)
+    try:
+        await chooser.choose(
+            text="А я на халтуре",
+            display_name="Дима",
+            context_rows=[],
+            allowed=["👍"],
+            now=NOW,
+            reply_to=reply_to,
+        )
+    finally:
+        await llm.aclose()
+
+    prompt = json.loads(calls[0].content)["messages"][0]["content"]
+    assert "(ответ на сообщение, которого не видно)" in prompt
+    assert "(это не ответ на другое сообщение)" not in prompt
+
+
 # --- ReactionScheduler: пауза, перепроверка, отправка ---
 
 
@@ -745,6 +837,7 @@ class _StubChooser:
         context_rows: Sequence[MessageRow],
         allowed: Sequence[str],
         now: int,
+        reply_to: ReplyTarget = None,
     ) -> str | None:
         self.calls.append(
             {
@@ -753,6 +846,7 @@ class _StubChooser:
                 "context_rows": list(context_rows),
                 "allowed": list(allowed),
                 "now": now,
+                "reply_to": reply_to,
             }
         )
         return self.emoji
@@ -868,6 +962,76 @@ async def test_scheduler_passes_context_without_current_message(
     assert isinstance(rows, list)
     # 42 — само сообщение-повод: оно уходит слотом {text}, в контексте его нет.
     assert [row.tg_message_id for row in rows] == [40, 41]
+    assert chooser.calls[0]["reply_to"] is None
+
+
+async def test_scheduler_passes_reply_target(db: Database, no_sleep: list[float]) -> None:
+    """Сообщение-повод — ответ на давнее сообщение вне окна контекста: модель всё
+    равно видит, на что ответили."""
+    cfg = Config()
+    cfg.behaviour.reactions.context_messages = 1
+    for msg_id, text, reply_to in [
+        (10, "Ну шо там? Я сегодня иду", None),
+        (40, "что-то между", None),
+        (41, "А я на халтуре", 10),
+    ]:
+        await db.insert_message(
+            tg_message_id=msg_id,
+            chat_id=CHAT_ID,
+            user_id=USER_A,
+            display_name="Дима",
+            text=text,
+            reply_to_tg_message_id=reply_to,
+            is_bot=False,
+            created_at=NOW - 100 + msg_id,
+        )
+    chooser = _StubChooser(None)
+    scheduler = _scheduler(FakeBot(), db, cfg, chooser=chooser)
+
+    scheduler.schedule(
+        chat_id=CHAT_ID,
+        tg_message_id=41,
+        user_id=USER_A,
+        text="А я на халтуре",
+        display_name="Дима",
+    )
+    await _drain(scheduler)
+
+    target = chooser.calls[0]["reply_to"]
+    assert isinstance(target, MessageRow)
+    assert target.tg_message_id == 10
+
+
+async def test_scheduler_reply_target_purged_is_unavailable(
+    db: Database, no_sleep: list[float]
+) -> None:
+    """Сообщение, на которое ответили, уже вычищено retention — модель всё равно
+    вызывается, но знает, что это ответ на невидимое, а не самостоятельная реплика."""
+    cfg = Config()
+    await db.insert_message(
+        tg_message_id=41,
+        chat_id=CHAT_ID,
+        user_id=USER_A,
+        display_name="Дима",
+        text="А я на халтуре",
+        reply_to_tg_message_id=7,
+        is_bot=False,
+        created_at=NOW - 5,
+    )
+    chooser = _StubChooser(None)
+    scheduler = _scheduler(FakeBot(), db, cfg, chooser=chooser)
+
+    scheduler.schedule(
+        chat_id=CHAT_ID,
+        tg_message_id=41,
+        user_id=USER_A,
+        text="А я на халтуре",
+        display_name="Дима",
+    )
+    await _drain(scheduler)
+
+    assert len(chooser.calls) == 1
+    assert chooser.calls[0]["reply_to"] is REPLY_UNAVAILABLE
 
 
 async def test_scheduler_recheck_after_pause_cancels_reaction(
