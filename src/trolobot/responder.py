@@ -94,6 +94,14 @@ from trolobot.timeutil import (
     seconds_until,
     week_key,
 )
+from trolobot.vocab import (
+    Vocab,
+    VocabEntry,
+    offer_allowed,
+    pick_offer,
+    render_vocab,
+    vocab_over_quota,
+)
 from trolobot.weather import (
     WeatherClient,
     WeatherPlaceExtractor,
@@ -211,6 +219,14 @@ _CHECKIN_LAST_AT_KEY = "checkin_last_at"
 _CALLBACK_TRIGGER = "callback"
 _CALLBACK_LAST_AT_KEY = "callback_last_at"
 
+# Словечки из словаря (CLAUDE.md, "словечки из словаря"): счётчик суток, «последнее»
+# для /status ("<unix>|<слово>") и сколько своих последних реплик смотреть, чтобы
+# объяснить словечко, которое он сам только что сказал.
+_LIFE_TRIGGER = "life"
+_VOCAB_COUNT_KEY = "vocab_count"
+_VOCAB_LAST_KEY = "vocab_last"
+_VOCAB_OWN_REPLIES = 2
+
 # Сколько последних реплик персонажа отдаётся дешёвой проверке "это мне?" при разборе
 # выбранного checkin-сообщения (CLAUDE.md, "меньше и разнообразнее", мера 3).
 _CHECKIN_FOLLOWUP_RECENT_REPLIES = 3
@@ -315,6 +331,7 @@ class Responder:
         weather: WeatherClient | None = None,
         weather_places: WeatherPlaceExtractor | None = None,
         diary: DiaryExtractor | None = None,
+        vocab_getter: Callable[[], Vocab] | None = None,
         patterns_getter: Callable[[], Patterns],
         prompt_store: _PromptStoreLike,
         rng: random.Random,
@@ -344,6 +361,9 @@ class Responder:
         # извлекаются (слот {diary} при этом всё равно заполняется уже записанным).
         self.diary = diary
         self._diary_tasks: set[asyncio.Task[None]] = set()
+        # Словечки из словарей /words (CLAUDE.md, "словечки из словаря"): getter, а не
+        # объект — владелец грузит словарь на горячую. None -> слот {vocab} пуст.
+        self.vocab_getter = vocab_getter
         self.patterns_getter = patterns_getter
         self.prompt_store = prompt_store
         self.rng = rng
@@ -1284,6 +1304,21 @@ class Responder:
         )
         jokes_block = render_jokes(joke_rows, now=now, cooldown_days=jokes_cfg.cooldown_days)
 
+        # Слот {vocab} (CLAUDE.md, "словечки из словаря"): значения мелькнувших в
+        # разговоре словечек и изредка — предложение употребить одно.
+        vocab = self.vocab_getter() if self.vocab_getter is not None else None
+        vocab_block, vocab_over = await self._vocab_block(
+            cfg,
+            vocab,
+            tz=tz,
+            now=now,
+            trigger_value=trigger_value,
+            trigger_text=trigger_text,
+            context_rows=context_rows,
+            recent_replies=filter_recent_replies,
+            is_address=is_address,
+        )
+
         # Погода (CLAUDE.md, "Интерфейсы: погода") — фон для ЛЮБОГО триггера: она
         # нужна и ambient'у, и обращению. Клиент сам глотает свои ошибки и сам
         # держит кэш, поэтому здесь нет ни try, ни проверки свежести. Нет домашней
@@ -1325,6 +1360,7 @@ class Responder:
             chat_memory=chat_memory_block,
             jokes=jokes_block,
             weather=weather_block,
+            vocab=vocab_block,
             **build_messages_kwargs,
         )
 
@@ -1465,6 +1501,8 @@ class Responder:
             system_prompt=system_prompt,
             trigger_text=trigger_text,
             now=now,
+            vocab=vocab,
+            vocab_over_quota=vocab_over,
         )
         verdict = await filters.check_output(text, filter_ctx, self.judge)
         if not verdict.ok:
@@ -1598,6 +1636,7 @@ class Responder:
             for joke in joke_rows:
                 if joke_used(sent_text, joke.text):
                     await self.db.mark_joke_used(joke.id, now)
+            await self._note_vocab_used(vocab, sent_text, tz=tz, now=now)
         # Горячее окно из ОБЩЕГО хвоста — только если владелец включил
         # hot_window.open_on_any_reply (CLAUDE.md, "меньше и разнообразнее", мера 2).
         # По умолчанию окно открывают лишь /life и /say: «после каждой своей реплики
@@ -1609,6 +1648,76 @@ class Responder:
         return SendOutcome(
             sent=True, text=sent_text, reason=send_reason, tg_message_id=sent_message_id
         )
+
+    async def _vocab_block(
+        self,
+        cfg: Config,
+        vocab: Vocab | None,
+        *,
+        tz: str,
+        now: int,
+        trigger_value: str,
+        trigger_text: str,
+        context_rows: Sequence[MessageRow],
+        recent_replies: Sequence[str],
+        is_address: bool,
+    ) -> tuple[str, bool]:
+        """Блок слота ``{vocab}`` (CLAUDE.md, "словечки из словаря") и признак «на
+        сегодня словечек хватит» для фильтра ``dedup:vocab``. Новость владельца
+        (``life``) — его текст, словечки туда не подмешиваются и не режутся."""
+        vocab_cfg = cfg.behaviour.vocab
+        if vocab is None or not vocab or not vocab_cfg.enabled or trigger_value == _LIFE_TRIGGER:
+            return "", False
+        count_raw = await self.db.get_state(day_key(_VOCAB_COUNT_KEY, now, tz))
+        count_today = int(count_raw) if count_raw is not None else 0
+        over_quota = vocab_over_quota(
+            vocab, cfg=vocab_cfg, recent_replies=recent_replies, count_today=count_today
+        )
+        sources = [trigger_text]
+        if vocab_cfg.meaning_context > 0:
+            sources.extend(row.text or "" for row in context_rows[-vocab_cfg.meaning_context :])
+        # «А что ты сейчас сказал?» — словечко в его собственной недавней реплике. Только
+        # в ответ на обращение: иначе значение своего же словечка в каждом промпте
+        # подталкивало модель повторять его (ревью Codex 17.10).
+        if is_address:
+            sources.extend(recent_replies[-_VOCAB_OWN_REPLIES:])
+        meanings: list[VocabEntry] = []
+        for source in sources:
+            for entry in vocab.find(source):
+                if entry not in meanings:
+                    meanings.append(entry)
+        meanings = meanings[: vocab_cfg.max_meanings]
+
+        offer: list[VocabEntry] = []
+        if offer_allowed(
+            cfg=vocab_cfg,
+            vocab=vocab,
+            recent_replies=recent_replies,
+            count_today=count_today,
+            rng=self.rng,
+        ):
+            offer = pick_offer(
+                vocab,
+                recent_replies=recent_replies,
+                size=vocab_cfg.offer_size,
+                rng=self.rng,
+                exclude=meanings,
+            )
+            if offer:
+                logger.info("vocab offer: %s", ", ".join(entry.word for entry in offer))
+        return render_vocab(offer, meanings), over_quota
+
+    async def _note_vocab_used(self, vocab: Vocab | None, text: str, *, tz: str, now: int) -> None:
+        """Словечко прозвучало в отправленной реплике — счётчик суток и «последнее» для
+        /status. Предложено оно было или модель сама вспомнила — неважно: квота общая."""
+        if vocab is None or not vocab:
+            return
+        used = vocab.find(text)
+        if not used:
+            return
+        await self.db.increment_state(day_key(_VOCAB_COUNT_KEY, now, tz))
+        await self.db.set_state(_VOCAB_LAST_KEY, f"{now}|{used[0].word}")
+        logger.info("vocab used: %s", ", ".join(entry.word for entry in used))
 
     async def _panic_or_stop_reason(self, now: int) -> str | None:
         """ "panic"/"stop", если бот сейчас молчит — читает ``state`` тем же

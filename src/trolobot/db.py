@@ -72,6 +72,14 @@ MIGRATIONS: dict[int, str] = {
         closed INTEGER NOT NULL DEFAULT 0
     );
     """,
+    6: """
+    CREATE TABLE IF NOT EXISTS vocab_dicts (
+        name TEXT PRIMARY KEY,
+        body TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        updated_at INTEGER NOT NULL
+    );
+    """,
 }
 
 
@@ -120,6 +128,18 @@ class JokeRow:
     created_at: int
     last_used_at: int | None
     uses: int
+
+
+@dataclass(frozen=True, slots=True)
+class VocabDictRow:
+    """Словарь словечек, загруженный владельцем (CLAUDE.md, "словечки из словаря").
+
+    ``body`` — исходный YAML как есть: разбирает его vocab.py, БД только хранит."""
+
+    name: str
+    body: str
+    enabled: bool
+    updated_at: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1691,3 +1711,48 @@ class Database:
             )
             for row in rows
         ]
+
+    # -- словечки из словаря (CLAUDE.md, "словечки из словаря") ----------------
+
+    async def upsert_vocab_dict(self, name: str, body: str, now: int) -> None:
+        """Новый словарь включён; у существующего заменяется тело, ``enabled`` сохраняется."""
+        conn = self._require_conn()
+        async with self._write_lock:
+            await conn.execute(
+                "INSERT INTO vocab_dicts (name, body, enabled, updated_at) VALUES (?, ?, 1, ?) "
+                "ON CONFLICT(name) DO UPDATE SET body = excluded.body, "
+                "updated_at = excluded.updated_at",
+                (name, body, now),
+            )
+            await conn.commit()
+
+    async def vocab_dicts(self) -> list[VocabDictRow]:
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT name, body, enabled, updated_at FROM vocab_dicts ORDER BY name"
+        )
+        return [
+            VocabDictRow(
+                name=row["name"],
+                body=row["body"],
+                enabled=bool(row["enabled"]),
+                updated_at=row["updated_at"],
+            )
+            for row in await cursor.fetchall()
+        ]
+
+    async def set_vocab_dict_enabled(self, name: str, enabled: bool) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute(
+                "UPDATE vocab_dicts SET enabled = ? WHERE name = ?", (int(enabled), name)
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def delete_vocab_dict(self, name: str) -> bool:
+        conn = self._require_conn()
+        async with self._write_lock:
+            cursor = await conn.execute("DELETE FROM vocab_dicts WHERE name = ?", (name,))
+            await conn.commit()
+            return cursor.rowcount > 0

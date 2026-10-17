@@ -31,6 +31,7 @@ from trolobot.db import MessageRow
 from trolobot.gate_types import PatternsLike
 from trolobot.motifs import motifs_in, story_count, used_motifs
 from trolobot.patterns import Patterns
+from trolobot.vocab import Vocab
 
 _MAX_LEN = 300
 
@@ -534,6 +535,15 @@ def _check_emoji_freq(text: str, recent_replies: list[str], window: int) -> bool
     return any(_has_emoji(reply) for reply in recent_replies[-window:])
 
 
+def _check_vocab(text: str, ctx: FilterContext) -> bool:
+    """dedup:vocab — словечко из словаря, когда на сегодня их уже хватит. Словечко из
+    сообщения собеседника («что такое багнюка?») не считается: на вопрос отвечают."""
+    if ctx.vocab is None or not ctx.vocab_over_quota:
+        return False
+    asked = set(ctx.vocab.find(ctx.trigger_text))
+    return any(entry not in asked for entry in ctx.vocab.find(text))
+
+
 def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
     """Слой 2: детерминированные правила, 0 мс. ``patterns`` — см. ``layer_regex``."""
     reasons: list[str] = []
@@ -546,6 +556,8 @@ def layer_rules(text: str, ctx: FilterContext, patterns: Patterns) -> list[str]:
         reasons.append("dedup:self_echo")
     if _check_motif(text, ctx, patterns):
         reasons.append("dedup:motif")
+    if _check_vocab(text, ctx):
+        reasons.append("dedup:vocab")
 
     if patterns.assistant_marker(text) is not None:
         reasons.append("style:assistant")
@@ -586,6 +598,10 @@ class FilterContext:
     system_prompt: str = ""  # тело промпта для проверки утечки
     trigger_text: str = ""  # сообщение-триггер ("" для ambient/spontaneous/morning)
     now: int = 0
+    # Словечки из словаря (CLAUDE.md, "словечки из словаря"): матчер и признак «на
+    # сегодня хватит» (vocab.vocab_over_quota). None/False — правило dedup:vocab молчит.
+    vocab: Vocab | None = None
+    vocab_over_quota: bool = False
 
 
 @dataclass(frozen=True, slots=True)

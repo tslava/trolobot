@@ -165,7 +165,8 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(
-    r"\{(age|few_shot|life|diary|chat_memory|jokes|weather|context|recent_replies|places|avoid|situation)\}"
+    r"\{(age|few_shot|life|diary|vocab|chat_memory|jokes|weather|context|recent_replies|places|avoid"
+    r"|situation)\}"
 )
 
 
@@ -343,6 +344,7 @@ def build_messages(
     chat_memory: str = "",
     jokes: str = "",
     weather: str = "",
+    vocab: str = "",
     json_reminder: str = _JSON_REMINDER,
 ) -> list[dict[str, str]]:
     """Собирает [system, user] для LLMClient.call().
@@ -370,6 +372,8 @@ def build_messages(
     {weather} (CLAUDE.md, "Интерфейсы: погода") — тоже в system: это факт из
     открытого API (weather.render_weather), фон жизни персонажа, а не сообщение
     участника; название места внутри блока приходит от геокодера, не из чата.
+    {vocab} (CLAUDE.md, "словечки из словаря") — тоже в system: словари грузит
+    владелец (vocab.render_vocab), это его данные, как {life}, а не ввод участников.
     """
     slot_values = {
         "age": str(age),
@@ -379,6 +383,7 @@ def build_messages(
         "chat_memory": chat_memory,
         "jokes": _strip_fake_delimiters(jokes).strip(),
         "weather": _strip_fake_delimiters(weather).strip(),
+        "vocab": _strip_fake_delimiters(vocab).strip(),
         "context": _CONTEXT_MARKER,
         "recent_replies": _RECENT_REPLIES_MARKER,
         "places": _PLACES_MARKER,

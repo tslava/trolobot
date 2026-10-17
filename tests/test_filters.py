@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from trolobot.config_models import Config
 from trolobot.db import MessageRow
 from trolobot.few_shot import load_few_shot
 from trolobot.filters import FilterContext, FilterVerdict, check_output
+from trolobot.vocab import Vocab, parse_vocab
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SYSTEM_PROMPT = (REPO_ROOT / "prompts" / "system.txt").read_text(encoding="utf-8")
@@ -558,6 +560,39 @@ async def test_all_few_shot_speak_true_examples_pass_check_output() -> None:
 # и разнообразнее", мера 5). Страховка к слоту {avoid}: если модель всё равно
 # притащила мотив из свежих реплик или байку сверх квоты — режем.
 # --------------------------------------------------------------------------- #
+
+
+_VOCAB_YAML = """
+name: x
+words:
+  - {word: багнюка, meaning: сырость}
+  - {word: айда, meaning: пошли}
+"""
+_VOCAB = Vocab([parse_vocab(_VOCAB_YAML)])
+
+
+@pytest.mark.parametrize(
+    ("over_quota", "trigger_text", "text", "cut"),
+    [
+        (True, "", "На улице багнюка.", True),
+        (False, "", "На улице багнюка.", False),
+        # Словечко из вопроса собеседника — ответ с ним проходит.
+        (True, "Федь, что такое багнюка?", "Багнюка это сырость.", False),
+        # Но другое словечко сверх лимита — всё равно срез.
+        (True, "Федь, что такое багнюка?", "Багнюка это сырость, айда домой.", True),
+        (True, "", "Без словечек.", False),
+    ],
+)
+async def test_dedup_vocab(over_quota: bool, trigger_text: str, text: str, cut: bool) -> None:
+    ctx = replace(_ctx(trigger_text=trigger_text), vocab=_VOCAB, vocab_over_quota=over_quota)
+    verdict = await check_output(text, ctx)
+    assert ("dedup:vocab" in verdict.reasons) is cut
+
+
+async def test_dedup_vocab_silent_without_vocab() -> None:
+    ctx = replace(_ctx(), vocab=None, vocab_over_quota=True)
+    verdict = await check_output("На улице багнюка.", ctx)
+    assert "dedup:vocab" not in verdict.reasons
 
 
 async def test_dedup_motif_cuts_repeated_prop() -> None:

@@ -46,6 +46,7 @@ from trolobot.vision import (
     pick_photo_size,
     should_describe,
 )
+from trolobot.vocab import VocabStore
 from trolobot.weather import WeatherClient
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,9 @@ class Deps:
     # её читает Responder; здесь она только ради строки в /status. None — клиента
     # нет (тесты хендлера), /status покажет «погода: нет».
     weather: WeatherClient | None = None
+    # Словари словечек (CLAUDE.md, "словечки из словаря") — для /words и /status;
+    # Responder получает свой getter. None — тесты хендлера без словарей.
+    vocab_store: VocabStore | None = None
     # user_id, для которых уже залогирован WARNING про display_name-инъекцию —
     # не спамить лог на каждое следующее сообщение того же участника.
     warned_user_ids: set[int] = field(default_factory=set)

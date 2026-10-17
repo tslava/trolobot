@@ -46,6 +46,7 @@ from trolobot.prompt import PLACES_NONE, SITUATION_AMBIENT, SITUATION_LATE, SITU
 from trolobot.responder import Responder
 from trolobot.stickers import Sticker
 from trolobot.timeutil import day_key, in_window
+from trolobot.vocab import Vocab, parse_vocab
 from trolobot.weather import Place, Weather
 
 CHAT_ID = -100123456
@@ -547,6 +548,7 @@ def _make_responder(
     weather: FakeWeatherClient | None = None,
     weather_places: FakeWeatherPlaces | None = None,
     diary: FakeDiary | None = None,
+    vocab: Vocab | None = None,
 ) -> Responder:
     patterns = Patterns(cfg.filters, cfg.persona.name_triggers, BOT_USERNAME)
     return Responder(
@@ -560,6 +562,7 @@ def _make_responder(
         weather=weather,  # type: ignore[arg-type]  # FakeWeatherClient: get/geocode/home_name
         weather_places=weather_places,  # type: ignore[arg-type]  # FakeWeatherPlaces: extract
         diary=diary,  # type: ignore[arg-type]  # FakeDiary: узкий протокол extract
+        vocab_getter=(lambda: vocab) if vocab is not None else None,
         patterns_getter=lambda: patterns,
         prompt_store=prompt_store if prompt_store is not None else FakePromptStore(),
         rng=rng if rng is not None else random.Random(seed),  # type: ignore[arg-type]
@@ -5985,6 +5988,260 @@ async def test_joke_not_marked_when_nothing_sent(db: Database) -> None:
         assert bot.sent == []
         assert (await db.jokes(10))[0].id == joke_id
         assert (await db.jokes(10))[0].uses == 0
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+# --- словечки из словаря (CLAUDE.md, "словечки из словаря") -------------------------
+
+PROMPT_TEMPLATE_WITH_VOCAB = (
+    "Ты Фёдор, тебе {age} лет.\n"
+    "{vocab}\n"
+    "Примеры:\n{few_shot}\n"
+    "{context}\n{recent_replies}\n{places}\n{situation}"
+)
+
+VOCAB_YAML = """
+name: сибирские
+about: сибирские словечки
+words:
+  - {word: багнюка, meaning: Промозглая погода}
+  - {word: айда, meaning: Призыв пойти}
+  - {word: хиус, meaning: Холодный ветер}
+"""
+
+
+def _test_vocab() -> Vocab:
+    return Vocab([parse_vocab(VOCAB_YAML)])
+
+
+async def _insert_human(db_: Database, tg_id: int, text: str, at: int) -> None:
+    await db_.insert_message(
+        tg_message_id=tg_id,
+        chat_id=CHAT_ID,
+        user_id=7,
+        display_name="Дима",
+        text=text,
+        reply_to_tg_message_id=None,
+        is_bot=False,
+        created_at=at,
+    )
+
+
+async def test_vocab_meaning_of_word_from_chat_goes_to_system(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 0.0
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    await _insert_human(db, 40, "Федь, а что такое багнюка?", DAY_NOW - 60)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        await _ambient(clock, responder)
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "мелькнули словечки" in system
+        assert "багнюка: промозглая погода" in system
+        assert "Можешь к месту употребить" not in system
+        assert "{vocab}" not in system
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_vocab_offer_then_counted_and_paused(db: Database) -> None:
+    """Кубик выпал -> словечки предложены; реплика со словечком -> счётчик суток и
+    «последнее»; следующая генерация -> не предлагаются (словечко в окне recent_window),
+    и своё словечко без обращения не подсовывается даже значением."""
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 1.0
+    llm, calls = _make_llm(cfg, db, _varied_responses("Айда, чего сидеть.", "Ну да, бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        await _ambient(clock, responder)
+        first = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Можешь к месту употребить одно из этих словечек (сибирские словечки)" in first
+        assert len(bot.sent) == 1
+        assert await db.get_state(day_key("vocab_count", DAY_NOW, cfg.persona.timezone)) == "1"
+        assert await db.get_state("vocab_last") == f"{DAY_NOW}|айда"
+
+        clock.value += max(cfg.behaviour.min_gap_sec, cfg.behaviour.chat_cooldown_min * 60) + 60
+        await _ambient(clock, responder)
+        second = _payload(calls[1])["messages"][0]["content"]  # type: ignore[index]
+        assert "словеч" not in second
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_vocab_unsolicited_word_over_quota_is_cut(db: Database) -> None:
+    """Подсказка в промпте лимит не держит: модель может повторить словечко сама.
+    Выходной фильтр режет такую реплику (dedup:vocab), даже в shadow (ревью Codex 17.10)."""
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 0.0
+    llm, _calls = _make_llm(cfg, db, _varied_responses("Айда, чего сидеть.", "Айда уже, ну."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        await _ambient(clock, responder)
+        assert len(bot.sent) == 1  # первое словечко сам — можно
+
+        clock.value += max(cfg.behaviour.min_gap_sec, cfg.behaviour.chat_cooldown_min * 60) + 60
+        await _ambient(clock, responder)
+        assert len(bot.sent) == 1
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute(
+            "SELECT stage, reason FROM filter_log WHERE verdict = 'cut' ORDER BY id"
+        )
+        assert ("dedup", "dedup:vocab") in [tuple(row) for row in await cursor.fetchall()]
+        assert await db.get_state(day_key("vocab_count", DAY_NOW, cfg.persona.timezone)) == "1"
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_vocab_word_from_question_passes_over_quota(db: Database) -> None:
+    """«Федь, что такое айда?» — словечко есть в вопросе, ответ с ним не режется, а
+    значение своего недавнего словечка в обращении приходит в промпт."""
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 0.0
+    tz = cfg.persona.timezone
+    await db.set_state(day_key("vocab_count", DAY_NOW, tz), str(cfg.behaviour.vocab.daily_cap))
+    await db.insert_bot_reply(
+        tg_message_id=30,
+        reply_to_tg_message_id=None,
+        trigger="ambient",
+        trigger_tg_message_id=None,
+        text="Айда на рынок.",
+        prompt_version=1,
+        few_shot_version=1,
+        delay_sec=0,
+        created_at=DAY_NOW - 3600,
+    )
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Айда значит пошли."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        await _drive(
+            clock,
+            responder._respond(
+                trigger=Trigger.MENTION,
+                trigger_msg_id=50,
+                user_id=7,
+                situation="",
+                delay_sec=0,
+                trigger_text="Федь, а что такое айда?",
+                addressed_items=[("Дима", "Федь, а что такое айда?")],
+            ),
+        )
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "айда: призыв пойти" in system
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_vocab_slot_empty_without_vocab_or_when_disabled(db: Database) -> None:
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 1.0
+    llm, calls = _make_llm(cfg, db, _varied_responses("Бывает.", "Ну да, бывает."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    await _insert_human(db, 40, "на улице багнюка", DAY_NOW - 60)
+    plain = _make_responder(
+        db, cfg, llm, bot, clock, prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB)
+    )
+    disabled_cfg = _config()
+    disabled_cfg.behaviour.vocab.enabled = False
+    disabled = _make_responder(
+        db,
+        disabled_cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        await _ambient(clock, plain)
+        clock.value += max(cfg.behaviour.min_gap_sec, cfg.behaviour.chat_cooldown_min * 60) + 60
+        await _ambient(clock, disabled)
+
+        assert len(calls) == 2
+        for call in calls:
+            system = _payload(call)["messages"][0]["content"]  # type: ignore[index]
+            assert "словеч" not in system
+            assert "{vocab}" not in system
+    finally:
+        await plain.shutdown()
+        await disabled.shutdown()
+        await llm.aclose()
+
+
+async def test_vocab_not_offered_for_life_news(db: Database) -> None:
+    """/life — текст владельца: словечки туда не подмешиваются."""
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 1.0
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Новую машину взял."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        event_id = await db.insert_life_event(text="в багнюку взял машину", created_at=DAY_NOW)
+        event = await db.life_event(event_id)
+        assert event is not None
+        task = await _drive(clock, responder.announce_life(event))
+        assert task.result().sent is True
+
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "словеч" not in system
     finally:
         await responder.shutdown()
         await llm.aclose()

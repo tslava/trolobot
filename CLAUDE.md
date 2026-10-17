@@ -2138,6 +2138,121 @@ def render_self_share(share: SelfShare, days: int) -> str
 #   _parse_choice: "emoji": "null" строкой -> отказ (None), без WARNING про эмодзи вне списка.
 ```
 
+## Интерфейсы: словечки из словаря
+
+Решение владельца 17.10.2026: персонаж изредка и к месту употребляет словечки из загружаемого словаря
+(первый — сибирские, со страницы imsiberian.com/slova) и знает их значение, если спросят. Без хардкода:
+словари грузит владелец файлом в личку, их может быть несколько. Словарь — чужой авторский текст, поэтому
+в публичный репо не коммитится: живёт в БД, в репо только `vocab.example.yaml` на несколько придуманных слов.
+Биография: персонаж вырос в новосибирском Академгородке (prompts/system.txt, CHARACTER.md раздел 4).
+Новых вызовов модели нет — только подстановка в промпт.
+
+```python
+# Формат файла (YAML, UTF-8):
+#   name: сибирские                     # 1..40 символов, имя словаря; файл с тем же name заменяет старый
+#   about: "сибирские словечки, с которыми ты вырос"   # необязательно, одна строка для модели
+#   words:
+#     - word: багнюка                   # ударение (U+0301) допускается, при сравнении вырезается
+#       meaning: промозглая, сырая погода
+#       example: "На улице багнюка, куда ты?"   # необязательно
+#       forms: [багнюку, багнюкой]      # необязательно: тогда ищутся только эти формы (и само word)
+# 1..2000 слов, word ≤ 40, meaning ≤ 300, example ≤ 200; повтор word (после нормализации) — ошибка.
+
+# schema.sql + db.MIGRATIONS[6], PRAGMA user_version = 6:
+CREATE TABLE vocab_dicts (
+    name TEXT PRIMARY KEY,
+    body TEXT NOT NULL,                  # исходный YAML как загрузил владелец
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at INTEGER NOT NULL
+);
+# db.py: VocabDictRow(name, body, enabled: bool, updated_at); upsert_vocab_dict(name, body, now) (enabled
+# сохраняется у существующего, новый — 1); vocab_dicts() по name; set_vocab_dict_enabled(name, enabled) -> bool;
+# delete_vocab_dict(name) -> bool. Retention не трогает.
+
+# config_models.py — BehaviourConfig.vocab: VocabConfig (description у каждого поля)
+class VocabConfig(BaseModel):
+    enabled: bool = True
+    probability: float = Field(default=0.15, ge=0.0, le=1.0)   # шанс предложить словечки в реплике
+    daily_cap: int = Field(default=2, ge=0, le=20)             # словечек в сутки, счётчик vocab_count
+    recent_window: int = Field(default=10, ge=0, le=50)        # столько последних реплик без словечек
+    offer_size: int = Field(default=3, ge=1, le=10)            # сколько слов предложить
+    meaning_context: int = Field(default=5, ge=0, le=30)       # последних сообщений чата, где ищется словечко
+    max_meanings: int = Field(default=3, ge=0, le=10)          # значений в промпте за раз
+
+# vocab.py — чистая часть
+class VocabWord(BaseModel): word; meaning; example = ""; forms: list[str] = []
+class VocabDict(BaseModel): name; about = ""; words: list[VocabWord]
+def parse_vocab(raw: str) -> VocabDict            # yaml.safe_load + pydantic; любая ошибка -> ValueError с текстом
+def normalize(text: str) -> str                   # без U+0301, lower, ё->е, пробелы схлопнуты
+@dataclass(frozen=True) class VocabEntry: word: str; meaning: str; example: str; about: str; dict_name: str
+class Vocab:                                      # собранные включённые словари, матчер внутри
+    def __init__(self, dicts: Sequence[VocabDict]) -> None
+    entries: tuple[VocabEntry, ...]
+    def find(self, text: str) -> list[VocabEntry]   # упомянутые в тексте, по порядку первого появления, без повторов
+# Матчинг по токенам нормализованного текста. forms заданы -> токен равен одной из форм (или word).
+# Иначе основа + ЗАКРЫТЫЙ список русских окончаний (ревью Codex 17.10: «любой хвост до N букв» путал
+# «колбас» с «колба»): глагол — основа инфинитива + формы (л/ла/ет/ют/й…), плюс основа настоящего для
+# -ить/-еть, -овать, -ять, -нуть; возвратный глагол принимает только формы на «ся/сь» (так «шарить» и
+# «шариться» не спорят); глагольные приставки (по/на/от/вы/за/…) отрезаются перед глагольной основой;
+# прилагательное на -ый/-ий/-ой — основа + окончания прилагательного (на -ой — ещё и как существительное);
+# существительное — без конечной гласной/й/ь + окончания, беглая гласная для -ок/-ек/-ец (гомонок ->
+# гомонка) и родительный множественного на -ек/-ок для основ на «к» (евражка -> евражек). Основа короче 3 —
+# только точно. Несколько подходящих слов -> самая длинная основа. Многословные word — точная
+# последовательность токенов.
+def offer_allowed(*, cfg: VocabConfig, vocab: Vocab, recent_replies: Sequence[str], count_today: int,
+                  rng: random.Random) -> bool
+# enabled -> есть слова -> count_today < daily_cap -> ни в одной из последних recent_window реплик нет
+# словечка (vocab.find; стикеры «[стикер #N]» пропускаются) -> кубик probability последним.
+def pick_offer(vocab, *, recent_replies, size, rng) -> list[VocabEntry]   # без слов из recent_replies
+def render_vocab(offer: Sequence[VocabEntry], meanings: Sequence[VocabEntry]) -> str
+# "" если оба пусты. Абзац предложения: «Можешь к месту употребить одно из этих словечек (<about>), только
+# если оно само ложится в реплику; не объясняй его и не бери в кавычки: багнюка (промозглая, сырая погода;
+# «На улице багнюка, куда ты?»); …». Абзац значений: «Справка: в разговоре мелькнули словечки. Если спросят,
+# что они значат, объясни своими словами; сам их без вопроса не повторяй: багнюка: промозглая, сырая погода;
+# …». Без «- » в начале строк и без тире. Поддельные разделители вырезаются.
+def vocab_over_quota(vocab, *, cfg, recent_replies, count_today) -> bool
+# count_today >= daily_cap или словечко в последних recent_window репликах (стикеры пропускаются).
+
+# vocab.py — VocabStore (по образцу PromptStore, под asyncio.Lock)
+class VocabStore:
+    def __init__(self, db: Database) -> None
+    async def load(self) -> None              # включённые из БД -> Vocab; битое тело -> WARNING и пропуск
+    def get(self) -> Vocab
+    async def put(self, raw: str, now: int) -> VocabDict       # parse_vocab (ValueError наружу) -> upsert -> load
+    async def set_enabled(self, name: str, enabled: bool) -> bool
+    async def remove(self, name: str) -> bool
+    async def dicts(self) -> list[tuple[VocabDictRow, VocabDict | None]]   # для /words; None — тело не разобралось
+
+# prompt.py: слот {vocab} в _SLOT_RE, build_messages(vocab: str = ""); prompts/system.txt — {vocab} СРАЗУ ПЕРЕД
+# блоком «КАК ТЫ ПИШЕШЬ» (после {diary}). Это данные владельца, как {life}, поэтому в system.
+# responder: kwarg vocab_getter: Callable[[], Vocab] | None = None. _generate_and_send для всех триггеров, кроме
+# life: meanings = vocab.find(trigger_text + последние meaning_context строк context_rows + 2 последние реплики
+# бота — ТОЛЬКО при обращении, иначе значение своего словечка подталкивало повторять)[:max_meanings]; offer =
+# pick_offer(...) если offer_allowed(count_today=day_key("vocab_count")) иначе []; слова из meanings в offer не
+# дублируются. FilterContext.vocab / vocab_over_quota -> filters.layer_rules "dedup:vocab": на сегодня словечек
+# хватит, а в реплике словечко, которого нет в trigger_text. dedup в enforce_stages — режет и в shadow. После успешной ТЕКСТОВОЙ отправки (не стикер, не say): vocab.find(
+# sent_text) непусто -> increment_state(day_key("vocab_count")), set_state("vocab_last", "<ts>|<word>").
+# app.py: VocabStore создаётся и load() до Responder; передаётся в Responder (vocab_getter=store.get) и в Deps.
+
+# commands.py — личка владельца, Deps += vocab_store: _VocabStoreLike | None, bot: _DownloaderLike | None
+#   документ с подписью /words — загрузить словарь: ≤ 512 КБ, UTF-8 (BOM допустим) -> put ->
+#       «Словарь «<name>»: N слов, включён.» / «Не разобрал файл: <ошибка>»; аудит "words:put" (new_value=name)
+#   /words               «<name>: N слов, вкл|выкл, dd.mm» по строке + подсказка; пусто -> «Словарей нет. …»
+#   /words show <имя>    первые слова «word: meaning» (обрезка 3500)
+#   /words on|off <имя>  включить/выключить; аудит "words:on"/"words:off"
+#   /words rm <имя>      удалить; аудит "words:rm"
+#   /status              «словечки: <словарей вкл>/<всего> (<слов>), сегодня <vocab_count>/<daily_cap>,
+#                         последнее <word> dd.mm | —»
+#   _HELP_TEXT           «/words [show|on|off|rm <имя>] — словари словечек; загрузка — файл с подписью /words»
+```
+
+Тесты: `tests/test_vocab.py` (parse_vocab ошибки и ударения; матчинг: падежи, глаголы, короткие слова только
+точно, forms, самая длинная основа, многословные, «колбаса» не «колба»; offer_allowed порядок и кубик;
+pick_offer; render_vocab без «- » и тире; VocabStore с настоящей БД), `test_db.py` (миграция 5->6, CRUD),
+`test_prompt.py` (слот), `test_responder.py` (значение в system при слове в обращении; предложение при кубике;
+счётчик после отправки; vocab_getter=None — как раньше), `test_commands.py` (загрузка документа, ошибки, все
+ветки /words, /status).
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»
