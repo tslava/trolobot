@@ -28,7 +28,17 @@ def test_parse_real_changelog_order_is_newest_first() -> None:
     releases = parse_changelog(REAL_CHANGELOG)
 
     versions = [r.version for r in releases]
-    assert versions == ["0.7.0", "0.6.2", "0.6.1", "0.6.0", "0.5.0", "0.4.0", "0.3.0", "0.2.0", "0.1.0"]
+    assert versions == [
+        "0.7.0",
+        "0.6.2",
+        "0.6.1",
+        "0.6.0",
+        "0.5.0",
+        "0.4.0",
+        "0.3.0",
+        "0.2.0",
+        "0.1.0",
+    ]
 
 
 def test_parse_real_changelog_skips_unreleased() -> None:
