@@ -11,15 +11,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_CHANGELOG = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
 
-def test_trolobot_version_is_0_6_2() -> None:
-    assert trolobot.__version__ == "0.6.2"
+def test_trolobot_version_is_0_7_0() -> None:
+    assert trolobot.__version__ == "0.7.0"
 
 
-def test_parse_real_changelog_latest_is_0_6_2_with_date_and_nonempty_blocks() -> None:
+def test_parse_real_changelog_latest_is_0_7_0_with_date_and_nonempty_blocks() -> None:
     releases = parse_changelog(REAL_CHANGELOG)
 
-    assert releases[0].version == "0.6.2"
-    assert releases[0].date == "2026-10-15"
+    assert releases[0].version == "0.7.0"
+    assert releases[0].date == "2026-10-17"
     assert releases[0].for_chat.strip() != ""
     assert releases[0].for_owner.strip() != ""
 
@@ -28,7 +28,7 @@ def test_parse_real_changelog_order_is_newest_first() -> None:
     releases = parse_changelog(REAL_CHANGELOG)
 
     versions = [r.version for r in releases]
-    assert versions == ["0.6.2", "0.6.1", "0.6.0", "0.5.0", "0.4.0", "0.3.0", "0.2.0", "0.1.0"]
+    assert versions == ["0.7.0", "0.6.2", "0.6.1", "0.6.0", "0.5.0", "0.4.0", "0.3.0", "0.2.0", "0.1.0"]
 
 
 def test_parse_real_changelog_skips_unreleased() -> None:
