@@ -29,6 +29,7 @@ EXPECTED_TABLES = {
     "self_facts",
     "chat_jokes",
     "people_threads",
+    "vocab_dicts",
 }
 
 
@@ -41,7 +42,7 @@ async def test_connect_creates_all_tables_and_bumps_user_version(tmp_path: Path)
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 5
+        assert row[0] == 6
 
         cursor = await conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
@@ -78,7 +79,7 @@ async def test_reconnect_is_idempotent(tmp_path: Path) -> None:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 5
+        assert row[0] == 6
         messages = await db2.recent_messages(42, 10)
         assert len(messages) == 1
         assert messages[0].text == "привет"
@@ -1707,7 +1708,7 @@ def _schema_sql_v1() -> str:
     assert life_events_block in schema_sql
     old_schema_sql = schema_sql.replace(life_events_block, "")
     old_schema_sql = _strip_self_facts(_strip_chat_memory(old_schema_sql))
-    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 1;")
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 6;", "PRAGMA user_version = 1;")
     assert "life_events" not in old_schema_sql
     return old_schema_sql
 
@@ -1717,7 +1718,7 @@ def _schema_sql_v2() -> str:
     теста миграции 2 -> 3 (CLAUDE.md, "долгая память чата")."""
     schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
     old_schema_sql = _strip_self_facts(_strip_chat_memory(schema_sql))
-    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 2;")
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 6;", "PRAGMA user_version = 2;")
     assert "chat_memory" not in old_schema_sql
     return old_schema_sql
 
@@ -1727,7 +1728,7 @@ def _schema_sql_v3() -> str:
     миграции 3 -> 4 (CLAUDE.md, "дневник дня")."""
     schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
     old_schema_sql = _strip_self_facts(schema_sql)
-    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 3;")
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 6;", "PRAGMA user_version = 3;")
     assert "self_facts" not in old_schema_sql
     return old_schema_sql
 
@@ -1739,10 +1740,23 @@ def _schema_sql_v4() -> str:
     start = schema_sql.index("-- Шутки чата и истории людей")
     end = schema_sql.index("CREATE INDEX idx_messages_chat_created")
     old_schema_sql = schema_sql[:start] + schema_sql[end:]
-    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 5;", "PRAGMA user_version = 4;")
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 6;", "PRAGMA user_version = 4;")
     assert "chat_jokes" not in old_schema_sql
     assert "people_threads" not in old_schema_sql
     assert "self_facts" in old_schema_sql
+    return old_schema_sql
+
+
+def _schema_sql_v5() -> str:
+    """schema.sql, но как будто ещё нет vocab_dicts (user_version == 5) — для теста
+    миграции 5 -> 6 (CLAUDE.md, "словечки из словаря")."""
+    schema_sql = importlib.resources.files("trolobot").joinpath("schema.sql").read_text("utf-8")
+    start = schema_sql.index("-- Словари словечек")
+    end = schema_sql.index("CREATE INDEX idx_messages_chat_created")
+    old_schema_sql = schema_sql[:start] + schema_sql[end:]
+    old_schema_sql = old_schema_sql.replace("PRAGMA user_version = 6;", "PRAGMA user_version = 5;")
+    assert "vocab_dicts" not in old_schema_sql
+    assert "chat_jokes" in old_schema_sql
     return old_schema_sql
 
 
@@ -1798,7 +1812,7 @@ async def test_migrate_v1_to_v3_adds_new_tables_and_keeps_existing_data(
         cursor = await raw_conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 5
+        assert row[0] == 6
 
         cursor = await raw_conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
@@ -1848,7 +1862,7 @@ async def test_migrate_v2_to_v3_adds_chat_memory_and_keeps_existing_data(
         cursor = await raw_conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 5
+        assert row[0] == 6
 
         messages = await db.recent_messages(42, 10)
         assert [m.text for m in messages] == ["привет со схемы v2"]
@@ -1892,7 +1906,7 @@ async def test_migrate_v3_to_v4_adds_self_facts_and_keeps_existing_data(
         cursor = await raw_conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 5
+        assert row[0] == 6
 
         assert [m.text for m in await db.recent_messages(42, 10)] == ["привет со схемы v3"]
         assert await db.chat_memory_count() == 1
@@ -1936,7 +1950,7 @@ async def test_migrate_v4_to_v5_adds_jokes_and_threads_and_keeps_existing_data(
         cursor = await raw_conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 5
+        assert row[0] == 6
 
         assert [m.text for m in await db.recent_messages(42, 10)] == ["привет со схемы v4"]
         assert len(await db.self_facts_since(0)) == 1
@@ -1947,6 +1961,64 @@ async def test_migrate_v4_to_v5_adds_jokes_and_threads_and_keeps_existing_data(
             user_id=1, display_name="A", text="ждёт ответа", created_at=2000
         )
         assert [t.id for t in await db.open_people_threads()] == [thread_id]
+    finally:
+        await db.close()
+
+
+async def test_migrate_v5_to_v6_adds_vocab_dicts_and_keeps_existing_data(
+    tmp_path: Path,
+) -> None:
+    """Реальная БД на сервере стоит на user_version == 5: миграция 6 добавляет
+    vocab_dicts и не трогает данные."""
+    path = tmp_path / "bot.db"
+    conn = await aiosqlite.connect(path)
+    try:
+        await conn.executescript(_schema_sql_v5())
+        await conn.execute(
+            "INSERT INTO chat_jokes (text, created_at, uses) VALUES ('опять гвозди', 5, 0)"
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    db = Database(path)
+    await db.connect()
+    try:
+        raw_conn = db._conn
+        assert raw_conn is not None
+        cursor = await raw_conn.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 6
+        assert [j.text for j in await db.jokes(10)] == ["опять гвозди"]
+        await db.upsert_vocab_dict("сибирские", "name: сибирские", 100)
+        assert [d.name for d in await db.vocab_dicts()] == ["сибирские"]
+    finally:
+        await db.close()
+
+
+async def test_vocab_dicts_crud(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bot.db")
+    await db.connect()
+    try:
+        await db.upsert_vocab_dict("б", "тело б", 100)
+        await db.upsert_vocab_dict("а", "тело а", 200)
+        rows = await db.vocab_dicts()
+        assert [(r.name, r.body, r.enabled, r.updated_at) for r in rows] == [
+            ("а", "тело а", True, 200),
+            ("б", "тело б", True, 100),
+        ]
+
+        assert await db.set_vocab_dict_enabled("а", False) is True
+        assert await db.set_vocab_dict_enabled("нет", False) is False
+        # Повторная загрузка заменяет тело, но не включает выключенный словарь.
+        await db.upsert_vocab_dict("а", "новое тело", 300)
+        first = (await db.vocab_dicts())[0]
+        assert (first.body, first.enabled, first.updated_at) == ("новое тело", False, 300)
+
+        assert await db.delete_vocab_dict("а") is True
+        assert await db.delete_vocab_dict("а") is False
+        assert [r.name for r in await db.vocab_dicts()] == ["б"]
     finally:
         await db.close()
 

@@ -563,6 +563,38 @@ class JokesConfig(BaseModel):
     )
 
 
+class VocabConfig(BaseModel):
+    """Словечки из словаря (CLAUDE.md, "словечки из словаря"): изредка и к месту предложить
+    модели пару слов из загруженного владельцем словаря, а мелькнувшее в разговоре — объяснить.
+    """
+
+    enabled: bool = Field(default=True, description="Включает словечки из словарей /words")
+    probability: float = Field(
+        default=0.15, ge=0.0, le=1.0, description="Шанс предложить словечки модели в одной реплике"
+    )
+    daily_cap: int = Field(
+        default=2, ge=0, le=20, description="Сколько словечек в сутки он может употребить"
+    )
+    recent_window: int = Field(
+        default=10,
+        ge=0,
+        le=50,
+        description="Столько последних реплик должно пройти без словечек до следующего",
+    )
+    offer_size: int = Field(
+        default=3, ge=1, le=10, description="Сколько словечек на выбор предложить модели"
+    )
+    meaning_context: int = Field(
+        default=5,
+        ge=0,
+        le=30,
+        description="В скольких последних сообщениях искать словечко, чтобы дать значение",
+    )
+    max_meanings: int = Field(
+        default=3, ge=0, le=10, description="Сколько значений словечек класть в промпт за раз"
+    )
+
+
 class CallbackConfig(BaseModel):
     """«Ну как там?» (CLAUDE.md, "шутки чата и истории людей"): через несколько дней
     персонаж сам спрашивает человека, чем кончилась история, о которой тот говорил.
@@ -744,6 +776,10 @@ class BehaviourConfig(BaseModel):
     jokes: JokesConfig = Field(
         default_factory=JokesConfig,
         description="Общие шутки чата: недельный пересказ достаёт, слот {jokes} в промпте",
+    )
+    vocab: VocabConfig = Field(
+        default_factory=VocabConfig,
+        description="Словечки из словарей /words: изредка в реплике, значение по вопросу",
     )
     callback: CallbackConfig = Field(
         default_factory=CallbackConfig,

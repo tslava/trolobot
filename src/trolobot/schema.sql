@@ -165,6 +165,15 @@ CREATE TABLE people_threads (
     closed INTEGER NOT NULL DEFAULT 0
 );
 
+-- Словари словечек (CLAUDE.md, "словечки из словаря") — грузит владелец файлом в личку;
+-- retention их не трогает.
+CREATE TABLE vocab_dicts (
+    name TEXT PRIMARY KEY,
+    body TEXT NOT NULL,                       -- исходный YAML словаря, как загрузил владелец
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX idx_messages_chat_created ON messages (chat_id, created_at);
 CREATE INDEX idx_messages_tg_message_id ON messages (tg_message_id);
 CREATE INDEX idx_bot_replies_created ON bot_replies (created_at);
@@ -174,4 +183,4 @@ CREATE INDEX idx_pending_replies_done_due ON pending_replies (done_at, due_at);
 CREATE INDEX idx_chat_memory_period_end ON chat_memory (period_end);
 CREATE INDEX idx_self_facts_created ON self_facts (created_at);
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;

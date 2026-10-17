@@ -8,3 +8,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .idea/
+
+# Свои словари словечек (/words) живут в БД бота, не в репо; пример — vocab.example.yaml
+vocab*.yaml
+!vocab.example.yaml

@@ -29,6 +29,7 @@ from trolobot.settings import Settings
 from trolobot.stickers import StickerChooser, load_catalog
 from trolobot.stores import ConfigStore, PromptStore
 from trolobot.vision import VisionDescriber
+from trolobot.vocab import VocabStore
 from trolobot.weather import Place, WeatherClient, WeatherPlaceExtractor
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,11 @@ async def main() -> None:
 
         prompt_store = PromptStore(db, settings.prompt_path, settings.few_shot_path)
         await prompt_store.load()
+
+        # Словари словечек (CLAUDE.md, "словечки из словаря") живут в БД: владелец
+        # грузит их файлом в личку, в репозитории их нет.
+        vocab_store = VocabStore(db)
+        await vocab_store.load()
 
         bot = Bot(token=settings.bot_token.get_secret_value())
         me = await bot.get_me()
@@ -114,6 +120,7 @@ async def main() -> None:
             bot_username=me.username or "",
             bot=bot,
             weather=weather,
+            vocab_store=vocab_store,
         )
 
         dispatcher = Dispatcher()
@@ -235,6 +242,7 @@ async def main() -> None:
                 weather=weather,
                 weather_places=weather_places,
                 diary=diary,
+                vocab_getter=vocab_store.get,
                 patterns_getter=config_store.patterns,
                 prompt_store=prompt_store,
                 rng=rng,

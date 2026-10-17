@@ -20,10 +20,11 @@ CLAUDE.md ("Интерфейсы этапа 6"). Чтобы не зависет�
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, BinaryIO, Protocol
 
 from aiogram import F, Router
 from aiogram.types import Message, User
@@ -53,7 +54,9 @@ if TYPE_CHECKING:
     # так что этот импорт не исполняется в рантайме. Прямой (не TYPE_CHECKING) импорт
     # trolobot.responder сюда нежелателен — тянет aiogram-цепочку в commands.py и
     # рискует циклическим импортом (bot.py и так импортирует и responder, и commands).
+    from trolobot.db import VocabDictRow
     from trolobot.responder import SendOutcome
+    from trolobot.vocab import Vocab, VocabDict
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,7 @@ _HELP_TEXT = (
     "/diary [rm N] — факты о себе за неделю (дневник дня): список, удалить\n"
     "/jokes [rm N] — шутки чата, которые он помнит: список, удалить\n"
     "/people [rm N] — незакрытые истории людей для «ну как там?»: список, удалить\n"
+    "/words [show|on|off|rm <имя>] — словари словечек; загрузка — файл с подписью /words\n"
     "/changelog [owner|<версия>] — что нового: блок для чата или для владельца\n"
     "/help — эта справка"
 )
@@ -119,6 +123,15 @@ _DIARY_LIST_DAYS = 7
 _JOKES_USAGE = "Использование: /jokes | /jokes rm N"
 _PEOPLE_USAGE = "Использование: /people | /people rm N"
 _JOKES_LIST_LIMIT = 1000
+
+# /words (CLAUDE.md, "словечки из словаря"): подсказка, потолок файла словаря и превью.
+_WORDS_USAGE = (
+    "Использование: /words | /words show|on|off|rm <имя>. "
+    "Загрузить словарь: отправь YAML-файл с подписью /words "
+    "(name, about, words: [{word, meaning, example, forms}])."
+)
+_WORDS_MAX_FILE_BYTES = 512 * 1024
+_WORDS_TOO_BIG = f"Файл больше {_WORDS_MAX_FILE_BYTES // 1024} КБ, словарь не загружен."
 
 
 class _MessageRowLike(Protocol):
@@ -239,6 +252,22 @@ class _ChatMemorizerLike(Protocol):
     async def run_due(self, *, now: int) -> Sequence[ChatMemoryRow]: ...
 
 
+class _VocabStoreLike(Protocol):
+    """Подмножество vocab.VocabStore, нужное /words и /status."""
+
+    def get(self) -> Vocab: ...
+    async def put(self, raw: str, now: int) -> VocabDict: ...
+    async def set_enabled(self, name: str, enabled: bool) -> bool: ...
+    async def remove(self, name: str) -> bool: ...
+    async def dicts(self) -> list[tuple[VocabDictRow, VocabDict | None]]: ...
+
+
+class _DownloaderLike(Protocol):
+    """Скачивание файла по file_id — подмножество aiogram.Bot.download (как bot.BotLike)."""
+
+    async def download(self, file: str, destination: BinaryIO | None = None) -> BinaryIO | None: ...
+
+
 class _ConfigStoreLike(Protocol):
     """Методы stores.ConfigStore, которые использует commands.py."""
 
@@ -309,6 +338,10 @@ class _CommandsDeps(Protocol):
     def memorizer(self) -> _ChatMemorizerLike | None: ...
     @property
     def weather(self) -> _WeatherLike | None: ...
+    @property
+    def vocab_store(self) -> _VocabStoreLike | None: ...
+    @property
+    def bot(self) -> _DownloaderLike | None: ...
 
 
 def _truncate(text: str) -> str:
@@ -481,6 +514,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
     stickers = int(await deps.db.get_state(day_key("sticker_count", now, tz)) or "0")
     followup_calls = int(await deps.db.get_state(day_key("followup_calls", now, tz)) or "0")
     vision_count = int(await deps.db.get_state(day_key("vision_count", now, tz)) or "0")
+    vocab_line = await _vocab_status_line(deps, cfg, now)
 
     # Потолок присутствия (CLAUDE.md, "меньше и разнообразнее", мера 1) — считается по
     # таблицам, как в гейте, а не по state-счётчику.
@@ -598,9 +632,34 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         checkin_line,
         presence_line,
         self_line,
+        vocab_line,
         weather_line,
     ]
     await _reply(message, "\n".join(lines))
+
+
+async def _vocab_status_line(deps: _CommandsDeps, cfg: Config, now: int) -> str:
+    """«словечки: 1/2 словарей (100 слов), сегодня 1/2, последнее багнюка 16.10»."""
+    store = deps.vocab_store
+    if store is None:
+        return "словечки: нет"
+    tz = cfg.persona.timezone
+    dicts = await store.dicts()
+    enabled = sum(1 for row, _ in dicts if row.enabled)
+    words = len(store.get().entries)
+    today = int(await deps.db.get_state(day_key("vocab_count", now, tz)) or "0")
+    last = "—"
+    last_raw = await deps.db.get_state("vocab_last")
+    if last_raw is not None:
+        at_raw, _, word = last_raw.partition("|")
+        try:
+            last = f"{word} {local_dt(int(at_raw), tz).strftime('%d.%m')}"
+        except ValueError:
+            last = "—"
+    return (
+        f"словечки: {enabled}/{len(dicts)} словарей ({words} слов), "
+        f"сегодня {today}/{cfg.behaviour.vocab.daily_cap}, последнее {last}"
+    )
 
 
 async def _cmd_last(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
@@ -1095,6 +1154,125 @@ async def _cmd_say(
         await _reply(message, "Бот молчит (panic/stop) — /resume.")
 
 
+def _plural_words(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} слово"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} слова"
+    return f"{n} слов"
+
+
+async def _cmd_words_upload(
+    message: Message, deps: _CommandsDeps, store: _VocabStoreLike, now: int, admin_user_id: int
+) -> None:
+    """Документ с подписью /words — загрузить словарь (тот же name — замена)."""
+    document = message.document
+    assert document is not None  # гарантирует вызывающий
+    if document.file_size is not None and document.file_size > _WORDS_MAX_FILE_BYTES:
+        await _reply(message, _WORDS_TOO_BIG)
+        return
+    if deps.bot is None:
+        await _reply(message, "Бот не может скачать файл, словарь не загружен.")
+        return
+    buffer = io.BytesIO()
+    await deps.bot.download(document.file_id, destination=buffer)
+    data = buffer.getvalue()
+    if len(data) > _WORDS_MAX_FILE_BYTES:
+        await _reply(message, _WORDS_TOO_BIG)
+        return
+    try:
+        raw = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        await _reply(message, "Файл не в UTF-8, словарь не загружен.")
+        return
+    try:
+        parsed = await store.put(raw, now)
+    except ValueError as exc:
+        await _reply(message, f"Не разобрал файл: {exc}")
+        return
+    await deps.db.audit_stop("words:put", admin_user_id, now, parsed.name)
+    logger.info("words put: %r, %d words", parsed.name, len(parsed.words))
+    enabled = next((row.enabled for row, _ in await store.dicts() if row.name == parsed.name), True)
+    state = "включён" if enabled else "выключен (/words on, чтобы включить)"
+    await _reply(message, f"Словарь «{parsed.name}»: {_plural_words(len(parsed.words))}, {state}.")
+
+
+def _resolve_dict_name(
+    dicts: Sequence[tuple[VocabDictRow, VocabDict | None]], name: str
+) -> VocabDictRow | None:
+    """Имя словаря: точное совпадение, иначе единственное без учёта регистра."""
+    exact = [row for row, _ in dicts if row.name == name]
+    if exact:
+        return exact[0]
+    folded = [row for row, _ in dicts if row.name.casefold() == name.casefold()]
+    return folded[0] if len(folded) == 1 else None
+
+
+async def _cmd_words(
+    message: Message,
+    deps: _CommandsDeps,
+    now: int,
+    admin_user_id: int,
+    args: list[str],
+) -> None:
+    """/words — словари словечек (CLAUDE.md, "словечки из словаря")."""
+    store = deps.vocab_store
+    if store is None:
+        await _reply(message, "Словари словечек недоступны.")
+        return
+    if message.document is not None:
+        await _cmd_words_upload(message, deps, store, now, admin_user_id)
+        return
+    dicts = await store.dicts()
+    tz = deps.config_store.get().persona.timezone
+    if not args:
+        if not dicts:
+            await _reply(message, "Словарей нет.\n" + _WORDS_USAGE)
+            return
+        lines = []
+        for row, parsed in dicts:
+            size = _plural_words(len(parsed.words)) if parsed is not None else "не разбирается"
+            lines.append(
+                f"{row.name}: {size}, {'вкл' if row.enabled else 'выкл'}, "
+                f"{local_dt(row.updated_at, tz).strftime('%d.%m')}"
+            )
+        lines.append(_WORDS_USAGE)
+        await _reply(message, "\n".join(lines))
+        return
+    sub_cmd = args[0].lower()
+    name = " ".join(args[1:]).strip()
+    if sub_cmd not in {"show", "on", "off", "rm"} or not name:
+        await _reply(message, _WORDS_USAGE)
+        return
+    found = _resolve_dict_name(dicts, name)
+    if found is None:
+        await _reply(message, f"Нет словаря «{name}».")
+        return
+    row = found
+    if sub_cmd == "show":
+        parsed = next(p for r, p in dicts if r.name == row.name)
+        if parsed is None:
+            await _reply(message, f"Словарь «{row.name}» не разбирается, загрузи его заново.")
+            return
+        header = f"{row.name}: {_plural_words(len(parsed.words))}"
+        if parsed.about:
+            header += f" ({parsed.about})"
+        lines = [header] + [f"{item.word}: {item.meaning}" for item in parsed.words]
+        await _reply(message, "\n".join(lines))
+        return
+    if sub_cmd == "rm":
+        await store.remove(row.name)
+        await deps.db.audit_stop("words:rm", admin_user_id, now, row.name)
+        logger.info("words rm: %r", row.name)
+        await _reply(message, f"Словарь «{row.name}» удалён.")
+        return
+    enabled = sub_cmd == "on"
+    await store.set_enabled(row.name, enabled)
+    await deps.db.audit_stop(f"words:{sub_cmd}", admin_user_id, now, row.name)
+    logger.info("words %s: %r", sub_cmd, row.name)
+    await _reply(message, f"Словарь «{row.name}» {'включён' if enabled else 'выключен'}.")
+
+
 async def _cmd_changelog(message: Message, deps: _CommandsDeps, args: list[str]) -> None:
     """/changelog [owner|<версия>] — релиз-ноты из CHANGELOG.md (CLAUDE.md, "версии и changelog").
 
@@ -1221,6 +1399,8 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_jokes(message, deps, now, admin_user_id, args)
                 elif cmd == "people":
                     await _cmd_people(message, deps, now, admin_user_id, args)
+                elif cmd == "words":
+                    await _cmd_words(message, deps, now, admin_user_id, args)
                 elif cmd == "changelog":
                     await _cmd_changelog(message, deps, args)
                 elif cmd == "help":

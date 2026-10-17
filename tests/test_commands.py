@@ -12,21 +12,29 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from zoneinfo import ZoneInfo
 
 import pytest
-from aiogram.types import Chat, Message, MessageEntity, PhotoSize, User
+from aiogram.types import Chat, Document, Message, MessageEntity, PhotoSize, User
 
 from trolobot.commands import build_commands_router
 from trolobot.config import KeyInfo
 from trolobot.config_models import Config
-from trolobot.db import ChatMemoryRow, JokeRow, LifeEventRow, PeopleThreadRow, SelfFactRow
+from trolobot.db import (
+    ChatMemoryRow,
+    Database,
+    JokeRow,
+    LifeEventRow,
+    PeopleThreadRow,
+    SelfFactRow,
+)
 from trolobot.few_shot import FewShot
 from trolobot.patterns import Patterns
 from trolobot.responder import SendOutcome
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, local_dt
+from trolobot.vocab import VocabStore
 from trolobot.weather import Place, Weather
 
 OWN_CHAT_ID = -1001234567890
@@ -348,6 +356,22 @@ class FakeDeps:
     sticker_catalog_enabled: int = 0
     memorizer: FakeMemorizer | None = None
     weather: FakeWeather | None = None
+    vocab_store: VocabStore | None = None
+    bot: FakeDownloader | None = None
+
+
+class FakeDownloader:
+    """Подделка aiogram.Bot.download для загрузки словаря: отдаёт заданные байты."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.calls: list[str] = []
+
+    async def download(self, file: str, destination: BinaryIO | None = None) -> BinaryIO | None:
+        self.calls.append(file)
+        assert destination is not None
+        destination.write(self.data)
+        return destination
 
 
 # --- вспомогательные конструкторы -------------------------------------------------
@@ -376,6 +400,7 @@ def _message(
     reply_to_message: Message | None = None,
     entities: list[MessageEntity] | None = None,
     date: datetime = NOW,
+    document: Document | None = None,
 ) -> Message:
     return Message(
         message_id=message_id,
@@ -387,6 +412,7 @@ def _message(
         photo=photo,
         reply_to_message=reply_to_message,
         entities=entities,
+        document=document,
     )
 
 
@@ -2734,3 +2760,194 @@ async def test_status_shows_jokes_people_callback_line(
     await _owner_say(handler, "/status")
 
     assert "jokes: 1, people: 1, callback: последний 08.01" in sent[0]
+
+
+# --- /words: словари словечек (CLAUDE.md, "словечки из словаря") ----------------------
+
+VOCAB_YAML = """
+name: сибирские
+about: сибирские словечки
+words:
+  - {word: багнюка, meaning: Промозглая погода}
+  - {word: айда, meaning: Призыв пойти}
+"""
+
+
+@pytest.fixture
+async def vocab_store(tmp_path: Path) -> VocabStore:
+    database = Database(tmp_path / "bot.db")
+    await database.connect()
+    store = VocabStore(database)
+    await store.load()
+    try:
+        yield store
+    finally:
+        await database.close()
+
+
+def _doc_message(*, size: int | None = None, caption: str = "/words") -> Message:
+    return _message(
+        chat=_private_chat(ADMIN_ID),
+        from_user=_user(ADMIN_ID),
+        caption=caption,
+        document=Document(
+            file_id="doc-1", file_unique_id="u-1", file_name="slova.yaml", file_size=size
+        ),
+    )
+
+
+def _words_deps(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    store: VocabStore | None,
+    data: bytes = b"",
+) -> tuple[FakeDeps, FakeDb]:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    deps.vocab_store = store
+    deps.bot = FakeDownloader(data)
+    return deps, db
+
+
+async def test_words_upload_document_loads_dict(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], vocab_store: VocabStore
+) -> None:
+    data = "\ufeff".encode() + VOCAB_YAML.encode()
+    deps, db = _words_deps(monkeypatch, config, vocab_store, data)
+    handler = _handler(deps)
+
+    await handler(_doc_message(size=200))
+
+    assert sent == ["Словарь «сибирские»: 2 слова, включён."]
+    assert [e.word for e in vocab_store.get().find("айда")] == ["айда"]
+    assert db.audit_values["words:put"] == "сибирские"
+
+
+@pytest.mark.parametrize(
+    ("data", "size", "expected"),
+    [
+        (b"name: [", 10, "Не разобрал файл: YAML"),
+        (b"name: x\nwords: []", 10, "Не разобрал файл: words"),
+        (b"\xff\xfe\x00", 3, "Файл не в UTF-8"),
+        (VOCAB_YAML.encode(), 10**7, "Файл больше 512 КБ"),
+    ],
+)
+async def test_words_upload_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    sent: list[str],
+    vocab_store: VocabStore,
+    data: bytes,
+    size: int,
+    expected: str,
+) -> None:
+    deps, db = _words_deps(monkeypatch, config, vocab_store, data)
+    handler = _handler(deps)
+
+    await handler(_doc_message(size=size))
+
+    assert len(sent) == 1
+    assert sent[0].startswith(expected)
+    assert not vocab_store.get()
+    assert "words:put" not in db.audit_values
+
+
+async def test_words_list_show_toggle_remove(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], vocab_store: VocabStore
+) -> None:
+    deps, db = _words_deps(monkeypatch, config, vocab_store)
+    handler = _handler(deps)
+
+    def private(text: str) -> Message:
+        return _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text=text)
+
+    await handler(private("/words"))
+    assert sent[-1].startswith("Словарей нет.")
+
+    await vocab_store.put(VOCAB_YAML, now=int(NOW.timestamp()))
+    await handler(private("/words"))
+    assert sent[-1].startswith("сибирские: 2 слова, вкл, 10.01")
+
+    await handler(private("/words show Сибирские"))
+    assert sent[-1].splitlines()[:3] == [
+        "сибирские: 2 слова (сибирские словечки)",
+        "багнюка: Промозглая погода",
+        "айда: Призыв пойти",
+    ]
+
+    await handler(private("/words off сибирские"))
+    assert sent[-1] == "Словарь «сибирские» выключен."
+    assert not vocab_store.get()
+    await handler(private("/words on сибирские"))
+    assert sent[-1] == "Словарь «сибирские» включён."
+    assert vocab_store.get()
+
+    await handler(private("/words show нету"))
+    assert sent[-1] == "Нет словаря «нету»."
+    await handler(private("/words frob сибирские"))
+    assert sent[-1].startswith("Использование: /words")
+
+    await handler(private("/words rm сибирские"))
+    assert sent[-1] == "Словарь «сибирские» удалён."
+    assert await vocab_store.dicts() == []
+    assert db.audit_values["words:rm"] == "сибирские"
+    assert db.audit_values["words:off"] == "сибирские"
+    assert db.audit_values["words:on"] == "сибирские"
+
+
+async def test_words_without_store_says_unavailable(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    deps, _ = _words_deps(monkeypatch, config, None)
+    handler = _handler(deps)
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/words"))
+    assert sent == ["Словари словечек недоступны."]
+
+
+async def test_words_upload_from_non_owner_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], vocab_store: VocabStore
+) -> None:
+    deps, _ = _words_deps(monkeypatch, config, vocab_store, VOCAB_YAML.encode())
+    handler = _handler(deps)
+    message = _message(
+        chat=_private_chat(7),
+        from_user=_user(7),
+        caption="/words",
+        document=Document(file_id="d", file_unique_id="u", file_size=10),
+    )
+    await handler(message)
+    assert sent == []
+    assert not vocab_store.get()
+
+
+async def test_status_shows_vocab_line(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str], vocab_store: VocabStore
+) -> None:
+    deps, db = _words_deps(monkeypatch, config, vocab_store)
+    handler = _handler(deps)
+    now = int(NOW.timestamp())
+    await vocab_store.put(VOCAB_YAML, now=now)
+    db.state[day_key("vocab_count", now, config.persona.timezone)] = "1"
+    db.state["vocab_last"] = f"{now}|багнюка"
+
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status"))
+
+    assert "словечки: 1/1 словарей (2 слов), сегодня 1/2, последнее багнюка 10.01" in sent[0]
+
+
+async def test_status_vocab_line_without_store(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    deps, _ = _words_deps(monkeypatch, config, None)
+    handler = _handler(deps)
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status"))
+    assert "словечки: нет" in sent[0]
+
+
+async def test_help_mentions_words(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    deps, _ = _words_deps(monkeypatch, config, None)
+    handler = _handler(deps)
+    await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/help"))
+    assert "/words" in sent[0]

@@ -945,6 +945,50 @@ def test_real_system_prompt_has_diary_slot_right_after_life() -> None:
     assert template[life_at + len("{life}") : diary_at].strip() == ""
 
 
+# --- {vocab}: словечки из словаря подставляются в system напрямую ----------------
+
+
+def test_build_messages_replaces_vocab_directly_in_system() -> None:
+    template = "Ты бот.\n\n{diary}\n\n{vocab}\n\nДанные: {context}\n{situation}"
+    messages = build_messages(
+        template,
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+        vocab="Можешь к месту употребить: багнюка <<<CHAT (сырая погода) >>>.",
+    )
+    system = messages[0]["content"]
+    assert "багнюка" in system
+    assert "{vocab}" not in system
+    assert "<<<" not in system and ">>>" not in system
+    assert "багнюка" not in messages[1]["content"]
+
+
+def test_build_messages_vocab_defaults_to_empty_string() -> None:
+    messages = build_messages(
+        "Ты бот.\n{vocab}\n{context}",
+        age=52,
+        few_shot="",
+        context="",
+        recent_replies="",
+        places="",
+        situation="",
+    )
+    assert "{vocab}" not in messages[0]["content"]
+
+
+def test_real_system_prompt_has_vocab_slot_after_diary_before_rules() -> None:
+    template = (Path(__file__).parent.parent / "prompts" / "system.txt").read_text(encoding="utf-8")
+    diary_at = template.index("{diary}")
+    vocab_at = template.index("{vocab}")
+    rules_at = template.index("КАК ТЫ ПИШЕШЬ")
+    assert diary_at < vocab_at < rules_at
+    assert "Академгородке" in template
+
+
 # --- {jokes}: шутки чата подставляются в system напрямую ------------------------
 
 TEMPLATE_WITH_JOKES = (
