@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     # trolobot.responder сюда нежелателен — тянет aiogram-цепочку в commands.py и
     # рискует циклическим импортом (bot.py и так импортирует и responder, и commands).
     from trolobot.db import VocabDictRow
-    from trolobot.responder import SendOutcome
+    from trolobot.responder import PreviewOutcome, SendOutcome
     from trolobot.vocab import Vocab, VocabDict
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,7 @@ _HELP_TEXT = (
     "/life <текст> — новость о себе: запомнить и сразу рассказать в чате\n"
     "/life list | rm N | post N — события: список, удалить, повторить\n"
     "/say <текст> — сказать в чат дословно\n"
+    "/ask <текст> — что ответил бы Фёдор на такое обращение; в чат ничего не уходит\n"
     "/memory [list|rm N|run] — долгая память чата: пересказы по неделям\n"
     "/diary [rm N] — факты о себе за неделю (дневник дня): список, удалить\n"
     "/jokes [rm N] — шутки чата, которые он помнит: список, удалить\n"
@@ -229,6 +230,8 @@ class _DbLike(Protocol):
     async def delete_joke(self, joke_id: int) -> bool: ...
     async def people_threads_all(self) -> Sequence[PeopleThreadRow]: ...
     async def delete_people_thread(self, thread_id: int) -> bool: ...
+    # -- /ask: имя владельца, каким его видит контекст чата ---------------------
+    async def display_names(self, user_ids: Sequence[int]) -> dict[int, str]: ...
 
 
 class _ResponderLike(Protocol):
@@ -240,6 +243,7 @@ class _ResponderLike(Protocol):
 
     async def announce_life(self, event: LifeEventRow) -> SendOutcome: ...
     async def say(self, text: str) -> SendOutcome: ...
+    async def preview(self, text: str, display_name: str, user_id: int = 0) -> PreviewOutcome: ...
 
 
 class _ChatMemorizerLike(Protocol):
@@ -1154,6 +1158,51 @@ async def _cmd_say(
         await _reply(message, "Бот молчит (panic/stop) — /resume.")
 
 
+def _preview_text(outcome: PreviewOutcome) -> str:
+    """Ответ на /ask: что ушло бы в чат, или почему промолчал бы."""
+    if outcome.sent:
+        lines = [f"Ответил бы: {outcome.text}"]
+        if outcome.reasons:
+            lines.append(f"Фильтр отметил, но пропустил (shadow): {', '.join(outcome.reasons)}")
+    elif outcome.reason == "llm:silent":
+        lines = ["Промолчал бы (модель решила не отвечать)."]
+    elif outcome.reason.startswith("llm:"):
+        lines = [f"Не ответил бы: {outcome.reason}."]
+        if outcome.text:
+            lines.append(f"Модель вернула: {outcome.text}")
+    else:
+        lines = [
+            f"Не ответил бы, срезал бы фильтр: {', '.join(outcome.reasons) or outcome.reason}."
+        ]
+        if outcome.text:
+            lines.append(f"Кандидат: {outcome.text}")
+    if outcome.fixes:
+        lines.append(f"Правки: {', '.join(outcome.fixes)}")
+    lines.append("(в чат не отправлено)")
+    return "\n".join(lines)
+
+
+async def _cmd_ask(
+    message: Message, deps: _CommandsDeps, user: User, raw_text: str, tokens: list[str]
+) -> None:
+    """/ask <текст> (CLAUDE.md, "предпросмотр ответа") — что ответил бы Фёдор, если бы
+    владелец обратился к нему в чате. Ничего не отправляет и не пишет."""
+    text = normalize_text(_command_arg_text(raw_text, tokens))
+    if not text:
+        await _reply(message, "Использование: /ask <текст>")
+        return
+    if deps.responder is None:
+        await _reply(message, "LLM-часть выключена, /ask недоступен.")
+        return
+    # Имя — то, под которым владелец уже есть в контексте чата; не писал в чат —
+    # имя из Telegram через тот же sanitize, что и для сообщений.
+    known = await deps.db.display_names([user.id])
+    name = known.get(user.id) or sanitize_display_name(user.full_name, user.id, set())
+    logger.info("ask preview: %r", text)
+    outcome = await deps.responder.preview(text, name, user.id)
+    await _reply(message, _preview_text(outcome))
+
+
 def _plural_words(n: int) -> str:
     if n % 10 == 1 and n % 100 != 11:
         return f"{n} слово"
@@ -1391,6 +1440,8 @@ def build_commands_router(deps: _CommandsDeps) -> Router:
                     await _cmd_life(message, deps, now, admin_user_id, args, text, tokens)
                 elif cmd == "say":
                     await _cmd_say(message, deps, now, admin_user_id, text, tokens)
+                elif cmd == "ask":
+                    await _cmd_ask(message, deps, user, text, tokens)
                 elif cmd == "memory":
                     await _cmd_memory(message, deps, now, admin_user_id, args)
                 elif cmd == "diary":

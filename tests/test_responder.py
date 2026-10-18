@@ -6247,6 +6247,119 @@ async def test_vocab_not_offered_for_life_news(db: Database) -> None:
         await llm.aclose()
 
 
+# --- /ask: предпросмотр ответа (CLAUDE.md, "предпросмотр ответа") -------------------
+
+
+async def _side_effects(db_: Database) -> dict[str, int]:
+    conn = db_._conn
+    assert conn is not None
+    counts = {}
+    for table in ("filter_log", "bot_replies", "state", "self_facts", "pending_replies"):
+        cursor = await conn.execute(f"SELECT COUNT(*) FROM {table}")
+        row = await cursor.fetchone()
+        assert row is not None
+        counts[table] = row[0]
+    return counts
+
+
+async def test_preview_builds_addressed_prompt_and_writes_nothing(db: Database) -> None:
+    cfg = _config()
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Да нормально, жить можно."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    await _insert_human(db, 40, "кто за пивом?", DAY_NOW - 60)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        before = await _side_effects(db)
+        outcome = await responder.preview("Федь, как дела?", "Слава")
+
+        assert outcome.sent is True
+        assert outcome.text == "Да нормально, жить можно."
+        assert outcome.reason == "send:mention"
+        user = _payload(calls[0])["messages"][1]["content"]  # type: ignore[index]
+        assert "Слава" in user and "Федь, как дела?" in user
+        assert "кто за пивом?" in user  # свежий контекст чата
+        assert bot.sent == []
+        assert bot.events == []
+        after = await _side_effects(db)
+        # Единственная запись — счётчик llm_calls/расходы в state (вызов настоящий).
+        assert {k: v for k, v in after.items() if k != "state"} == {
+            k: v for k, v in before.items() if k != "state"
+        }
+        assert await db.get_state(day_key("mention_count", DAY_NOW, cfg.persona.timezone)) is None
+        assert await db.get_state("last_mention_reply_at") is None
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_preview_puts_message_into_context_like_live_chat(db: Database) -> None:
+    """Сообщение из /ask — в конце контекста целиком (в situation оно обрезается до 300),
+    в БД его нет; фильтр видит его так же, как в чате: эхо срезается (ревью Codex 18.10)."""
+    cfg = _config()
+    cfg.filters.shadow = False
+    long_text = "Федь, " + "очень длинная история про соседа и чайник, " * 9 + "так что делать?"
+    assert len(long_text) > 300
+    echo = "Сосед вчера принёс старый чайник с рынка"
+    responses = iter([_ok_response("Да ничего не делать."), _ok_response(echo + ".")])
+    llm, calls = _make_llm(cfg, db, lambda _req: next(responses))
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        await responder.preview(long_text, "Слава", 7)
+        user = _payload(calls[0])["messages"][1]["content"]  # type: ignore[index]
+        assert f"Слава: {long_text}" in user
+        assert await db.recent_messages(CHAT_ID, 10) == []
+
+        cut = await responder.preview(f"{echo}, представляешь?", "Слава", 7)
+        assert cut.sent is False
+        assert "regex:echo" in cut.reasons
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_preview_silent_and_cut(db: Database) -> None:
+    cfg = _config()
+    cfg.filters.shadow = False
+    responses = iter([_silent_response(), _ok_response("Раз! Два! Три!")])
+    llm, _calls = _make_llm(cfg, db, lambda _req: next(responses))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(db, cfg, llm, bot, clock)
+    try:
+        silent = await responder.preview("Федь?", "Слава")
+        assert (silent.sent, silent.reason) == (False, "llm:silent")
+
+        cut = await responder.preview("Федь?", "Слава")
+        assert cut.sent is False
+        assert cut.reason == "style:exclaim"
+        assert "style:exclaim" in cut.reasons
+        assert cut.text == "Раз! Два! Три!"
+        assert bot.sent == []
+        conn = db._conn
+        assert conn is not None
+        cursor = await conn.execute("SELECT COUNT(*) FROM filter_log")
+        row = await cursor.fetchone()
+        assert row is not None and row[0] == 0
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_preview_without_main_model(db: Database) -> None:
+    cfg = _config()
+    cfg.llm.main_model = ""
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Бывает."))
+    responder = _make_responder(db, cfg, llm, FakeBot(), FakeClock(DAY_NOW))
+    try:
+        outcome = await responder.preview("Федь?", "Слава")
+        assert (outcome.sent, outcome.reason) == (False, "llm:no_model")
+        assert calls == []
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 # --- callback: «ну как там?» ---
 
 CALLBACK_AUTHOR_ID = 5
