@@ -2253,6 +2253,35 @@ pick_offer; render_vocab без «- » и тире; VocabStore с настоящ
 счётчик после отправки; vocab_getter=None — как раньше), `test_commands.py` (загрузка документа, ошибки, все
 ветки /words, /status).
 
+## Интерфейсы: предпросмотр ответа (/ask)
+
+Решение владельца 18.10.2026: проверять, как ответил бы Фёдор, не дёргая чат. Полноценная переписка в личке
+отклонена (смешивалась бы с группой: дневник, присутствие, дедуп, бюджет).
+
+```python
+# responder.py
+@dataclass(frozen=True)
+class PreviewOutcome: sent: bool; text: str; reason: str; reasons: tuple[str, ...] = (); fixes: tuple[str, ...] = ()
+async def preview(self, text: str, display_name: str, user_id: int = 0) -> PreviewOutcome
+# Как обращение (Trigger.MENTION) от display_name с текстом text: тот же _build_prompt (свежий контекст чата,
+# заведения, погода, дневник, шутки, словечки), та же модель, parse_reply, soften, check_output и _cut_reason.
+# Само сообщение дописывается в конец контекста ТОЛЬКО в памяти (_build_prompt(extra_row=...), окно
+# context_window сохраняется): модель видит его целиком, фильтр — как в чате (regex:echo, starts_name).
+# Известно и принято владельцем: ошибки провайдера в preview идут в общий предохранитель LLM, а гонка
+# дневного потолка вызовов (call_raw) — общая со всеми параллельными вызовами, не чинится здесь.
+# НИЧЕГО не пишет и не отправляет: ни filter_log (_build_prompt(record=False) глушит погоду по месту), ни
+# bot_replies, ни счётчиков, ни дневника/шуток/словечек/горячего окна; без _respond_lock. Вызовы моделей
+# настоящие (llm_calls, судья, погода по месту). Стикер не выбирается. llm.main_model пуст -> llm:no_model.
+# _build_prompt(...) -> _BuiltPrompt — сборка промпта, вынесенная из _generate_and_send (общая для обоих);
+# _filter_context(cfg, prompt, trigger_text, now) и _cut_reason(cfg, reasons) — тоже общие.
+
+# commands.py — личка владельца: /ask <текст> (normalize_text; пусто -> «Использование: /ask <текст>»;
+# responder None -> «LLM-часть выключена, /ask недоступен.»). Имя — db.display_names([owner]) (как в контексте
+# чата), иначе sanitize_display_name(full_name). Ответ: «Ответил бы: …» [+ «Фильтр отметил, но пропустил
+# (shadow): …»] | «Промолчал бы (модель решила не отвечать).» | «Не ответил бы: llm:…» | «Не ответил бы, срезал
+# бы фильтр: …» + «Кандидат: …»; [«Правки: fix:…»]; последней строкой «(в чат не отправлено)». Без аудита.
+```
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

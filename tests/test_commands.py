@@ -31,7 +31,7 @@ from trolobot.db import (
 )
 from trolobot.few_shot import FewShot
 from trolobot.patterns import Patterns
-from trolobot.responder import SendOutcome
+from trolobot.responder import PreviewOutcome, SendOutcome
 from trolobot.settings import Settings
 from trolobot.timeutil import day_key, local_dt
 from trolobot.vocab import VocabStore
@@ -98,6 +98,11 @@ class FakeDb:
     # таблицам, здесь — просто два числа.
     messages_today_value: int = 0
     bot_replies_today_value: int = 0
+
+    display_names_value: dict[int, str] = field(default_factory=dict)
+
+    async def display_names(self, user_ids: list[int]) -> dict[int, str]:
+        return {uid: name for uid, name in self.display_names_value.items() if uid in user_ids}
 
     async def count_messages_today(self, chat_id: int, day_start: int) -> int:
         return self.messages_today_value
@@ -303,6 +308,15 @@ class FakeResponder:
     )
     announce_life_calls: list[LifeEventRow] = field(default_factory=list)
     say_calls: list[str] = field(default_factory=list)
+    preview_result: PreviewOutcome = field(
+        default_factory=lambda: PreviewOutcome(sent=True, text="Бывает.", reason="send:mention")
+    )
+    preview_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    async def preview(self, text: str, display_name: str, user_id: int = 0) -> PreviewOutcome:
+        assert user_id == ADMIN_ID
+        self.preview_calls.append((text, display_name))
+        return self.preview_result
 
     async def announce_life(self, event: LifeEventRow) -> SendOutcome:
         self.announce_life_calls.append(event)
@@ -2951,3 +2965,116 @@ async def test_help_mentions_words(
     handler = _handler(deps)
     await handler(_message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/help"))
     assert "/words" in sent[0]
+
+
+# --- /ask: предпросмотр ответа (CLAUDE.md, "предпросмотр ответа") ----------------------
+
+
+def _ask(text: str) -> Message:
+    return _message(
+        chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID, first_name="Вячеслав"), text=text
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (
+            PreviewOutcome(sent=True, text="Бывает.", reason="send:mention"),
+            ["Ответил бы: Бывает.", "(в чат не отправлено)"],
+        ),
+        (
+            PreviewOutcome(
+                sent=True,
+                text="Ну да.",
+                reason="send:mention",
+                reasons=("regex:venue",),
+                fixes=("fix:dash",),
+            ),
+            [
+                "Ответил бы: Ну да.",
+                "Фильтр отметил, но пропустил (shadow): regex:venue",
+                "Правки: fix:dash",
+                "(в чат не отправлено)",
+            ],
+        ),
+        (
+            PreviewOutcome(sent=False, text="", reason="llm:silent"),
+            ["Промолчал бы (модель решила не отвечать).", "(в чат не отправлено)"],
+        ),
+        (
+            PreviewOutcome(sent=False, text="", reason="llm:timeout"),
+            ["Не ответил бы: llm:timeout.", "(в чат не отправлено)"],
+        ),
+        (
+            PreviewOutcome(
+                sent=False,
+                text="Айда опять.",
+                reason="dedup:vocab",
+                reasons=("dedup:vocab", "regex:venue"),
+            ),
+            [
+                "Не ответил бы, срезал бы фильтр: dedup:vocab, regex:venue.",
+                "Кандидат: Айда опять.",
+                "(в чат не отправлено)",
+            ],
+        ),
+    ],
+)
+async def test_ask_renders_preview(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    sent: list[str],
+    outcome: PreviewOutcome,
+    expected: list[str],
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder(preview_result=outcome)
+    deps, db, _, _ = _deps(settings=settings, config=config, responder=responder)
+    db.display_names_value = {ADMIN_ID: "Слава"}
+    handler = _handler(deps)
+
+    await handler(_ask("/ask   Федь,  какая погода?"))
+
+    assert responder.preview_calls == [("Федь, какая погода?", "Слава")]
+    assert sent == ["\n".join(expected)]
+    assert db.audit_stop_calls == []
+
+
+async def test_ask_falls_back_to_telegram_name(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder()
+    deps, _, _, _ = _deps(settings=settings, config=config, responder=responder)
+    handler = _handler(deps)
+
+    await handler(_ask("/ask привет"))
+
+    assert responder.preview_calls == [("привет", "Вячеслав")]
+
+
+async def test_ask_usage_and_no_responder(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder()
+    deps, _, _, _ = _deps(settings=settings, config=config, responder=responder)
+    await _handler(deps)(_ask("/ask"))
+    assert sent == ["Использование: /ask <текст>"]
+    assert responder.preview_calls == []
+
+    deps_none, _, _, _ = _deps(settings=settings, config=config, responder=None)
+    await _handler(deps_none)(_ask("/ask привет"))
+    assert sent[-1] == "LLM-часть выключена, /ask недоступен."
+
+
+async def test_ask_in_group_chat_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    responder = FakeResponder()
+    deps, _, _, _ = _deps(settings=settings, config=config, responder=responder)
+    await _handler(deps)(_message(chat=_chat(), from_user=_user(ADMIN_ID), text="/ask привет"))
+    assert sent == []
+    assert responder.preview_calls == []
