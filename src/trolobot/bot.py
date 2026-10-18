@@ -46,7 +46,7 @@ from trolobot.vision import (
     pick_photo_size,
     should_describe,
 )
-from trolobot.vocab import VocabStore
+from trolobot.vocab import VocabStore, explain_requested
 from trolobot.weather import WeatherClient
 
 logger = logging.getLogger(__name__)
@@ -246,6 +246,32 @@ async def _describe_photo(
     return photo_text(description, caption)
 
 
+async def _vocab_explain_asked(
+    deps: Deps, cfg: Config, gate_message: GateMessage, *, reply_to_other: bool, now: int
+) -> bool:
+    """«Не понял», «что это значит» (``vocab.explain_markers``) в течение
+    ``explain_window_min`` после его реплики со словечком из словаря. Не ему, если это
+    реплай на другого человека или после его реплики люди написали больше
+    ``explain_max_between`` сообщений — разговор ушёл дальше (ревью Codex 18.10)."""
+    vocab_cfg = cfg.behaviour.vocab
+    if (
+        deps.vocab_store is None
+        or reply_to_other
+        or not vocab_cfg.enabled
+        or vocab_cfg.explain_window_min <= 0
+        or not explain_requested(gate_message.text, vocab_cfg)
+    ):
+        return False
+    last = await deps.db.last_bot_replies(1)
+    if not last or now - last[0].created_at > vocab_cfg.explain_window_min * 60:
+        return False
+    # Текущее сообщение уже записано — оно тоже «после», его не считаем.
+    between = await deps.db.messages_after(deps.settings.allowed_chat_id, last[0].tg_message_id)
+    if between - 1 > vocab_cfg.explain_max_between:
+        return False
+    return bool(deps.vocab_store.get().find(last[0].text))
+
+
 async def _followup_inputs(
     deps: Deps, cfg: Config, gate_message: GateMessage
 ) -> tuple[list[MessageRow], list[str]]:
@@ -383,6 +409,7 @@ def build_router(deps: Deps) -> Router:
             and message.reply_to_message.from_user is not None
             and message.reply_to_message.from_user.id == deps.bot_user_id
         )
+        reply_to_other = message.reply_to_message is not None and not reply_to_bot
         created_at = int(message.date.timestamp())
 
         text = normalize_text(message.text or message.caption)
@@ -460,6 +487,26 @@ def build_router(deps: Deps) -> Router:
             await deps.db.apply_state_changes(decision.state_changes)
 
             if decision.verdict is Verdict.DROP:
+                if decision.reason in FOLLOWUP_REASONS and await _vocab_explain_asked(
+                    deps, cfg, gate_message, reply_to_other=reply_to_other, now=now
+                ):
+                    # «Не понял» сразу после его словечка (CLAUDE.md, "словечки из
+                    # словаря") — вопрос ему, даже без имени и реплая: объяснит.
+                    await deps.db.insert_filter_log(
+                        trigger_tg_message_id=gate_message.tg_message_id,
+                        candidate_text=text,
+                        verdict="pass",
+                        stage="followup",
+                        reason="followup:vocab_explain",
+                        shadow=False,
+                        created_at=now,
+                    )
+                    logger.info("vocab explain pass: %s", text[:_LOG_TEXT_MAX_LEN])
+                    if deps.responder is not None:
+                        await deps.responder.on_gate_pass(
+                            gate_message, Trigger.FOLLOWUP, display_name
+                        )
+                    return
                 if (
                     decision.reason in FOLLOWUP_REASONS
                     and deps.followup is not None
@@ -615,8 +662,25 @@ def build_router(deps: Deps) -> Router:
                         shadow=False,
                         created_at=now,
                     )
+                trigger = decision.trigger
+                if trigger is Trigger.AMBIENT and await _vocab_explain_asked(
+                    deps, cfg, gate_message, reply_to_other=reply_to_other, now=now
+                ):
+                    # Кубик ambient выпал, но это «не понял» после его словечка: тот же
+                    # followup, что и на DROP, — иначе объяснение срезал бы dedup:vocab
+                    # (ревью Codex 18.10).
+                    await deps.db.insert_filter_log(
+                        trigger_tg_message_id=gate_message.tg_message_id,
+                        candidate_text=text,
+                        verdict="pass",
+                        stage="followup",
+                        reason="followup:vocab_explain",
+                        shadow=False,
+                        created_at=now,
+                    )
+                    trigger = Trigger.FOLLOWUP
                 if deps.responder is not None:
-                    await deps.responder.on_gate_pass(gate_message, decision.trigger, display_name)
+                    await deps.responder.on_gate_pass(gate_message, trigger, display_name)
                 else:
                     logger.info("gate pass: %s (%s)", decision.trigger, text[:_LOG_TEXT_MAX_LEN])
         except Exception:

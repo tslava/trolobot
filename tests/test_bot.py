@@ -10,8 +10,10 @@ from __future__ import annotations
 import io
 import logging
 import random
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -28,6 +30,7 @@ from trolobot.sanitize import stable_n
 from trolobot.settings import Settings
 from trolobot.stores import ConfigStore, PromptStore
 from trolobot.timeutil import day_key
+from trolobot.vocab import VocabStore
 
 OWN_CHAT_ID = -1001234567890
 FOREIGN_CHAT_ID = -100999
@@ -1595,3 +1598,150 @@ async def test_photo_picks_size_within_max_width(
 
     # 1280 шире потолка — берётся превью 90 px.
     assert bot.downloaded == ["small"]
+
+
+# --- «не понял» после его словечка (CLAUDE.md, "словечки из словаря") ----------------
+
+_VOCAB_YAML = """
+name: сибирские
+words:
+  - {word: айда, meaning: пошли}
+"""
+
+
+async def _vocab_explain_setup(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reply_text: str,
+    reply_ago: int,
+    cfg: Config | None = None,
+) -> tuple[Callable[..., Any], _FakeResponder]:
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID)
+    responder = _FakeResponder()
+    deps = _deps(db, cfg or Config(), settings=settings, responder=responder)
+    store = VocabStore(db)
+    await store.put(_VOCAB_YAML, now=0)
+    deps.vocab_store = store
+    await db.insert_bot_reply(
+        tg_message_id=50,
+        reply_to_tg_message_id=None,
+        trigger="ambient",
+        trigger_tg_message_id=None,
+        text=reply_text,
+        prompt_version=1,
+        few_shot_version=1,
+        delay_sec=0,
+        created_at=int(DAY.timestamp()) - reply_ago,
+    )
+    return build_router(deps).message.handlers[0].callback, responder
+
+
+async def test_vocab_explain_after_word_passes_as_followup(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler, responder = await _vocab_explain_setup(
+        db, monkeypatch, reply_text="Айда на рынок.", reply_ago=600
+    )
+    await handler(
+        _message(from_user=_user(user_id=5, first_name="Дима"), text="чё? не понял", date=DAY)
+    )
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("followup:vocab_explain") == 1
+    assert "gate:not_live" not in summary
+    assert [(trigger, name) for _m, trigger, name in responder.calls] == [
+        (Trigger.FOLLOWUP, "Дима")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reply_text", "reply_ago", "text"),
+    [
+        ("Айда на рынок.", 3 * 3600, "не понял"),  # словечко давно
+        ("Пошли на рынок.", 600, "не понял"),  # в реплике нет словечка
+        ("Айда на рынок.", 600, "понял, иду"),  # не вопрос о значении
+    ],
+)
+async def test_vocab_explain_not_triggered(
+    db: Database, monkeypatch: pytest.MonkeyPatch, reply_text: str, reply_ago: int, text: str
+) -> None:
+    handler, responder = await _vocab_explain_setup(
+        db, monkeypatch, reply_text=reply_text, reply_ago=reply_ago
+    )
+    await handler(_message(from_user=_user(user_id=5, first_name="Дима"), text=text, date=DAY))
+
+    summary = dict(await db.filter_log_summary(0))
+    assert "followup:vocab_explain" not in summary
+    assert summary.get("gate:not_live") == 1
+    assert responder.calls == []
+
+
+async def test_vocab_explain_reply_to_other_human_is_not_for_bot(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """«в смысле?» реплаем на чужое сообщение — вопрос не ему (ревью Codex 18.10)."""
+    handler, responder = await _vocab_explain_setup(
+        db, monkeypatch, reply_text="Айда на рынок.", reply_ago=600
+    )
+    other = _message(message_id=60, from_user=_user(user_id=6, first_name="Оля"), text="я завтра")
+    await handler(
+        _message(
+            message_id=61,
+            from_user=_user(user_id=5, first_name="Дима"),
+            text="в смысле?",
+            reply_to_message=other,
+            date=DAY,
+        )
+    )
+    summary = dict(await db.filter_log_summary(0))
+    assert "followup:vocab_explain" not in summary
+    assert responder.calls == []
+
+
+async def test_vocab_explain_after_conversation_moved_on_is_not_for_bot(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """После его словечка люди написали больше explain_max_between сообщений."""
+    handler, responder = await _vocab_explain_setup(
+        db, monkeypatch, reply_text="Айда на рынок.", reply_ago=600
+    )
+    for i in range(3):
+        await db.insert_message(
+            tg_message_id=51 + i,
+            chat_id=OWN_CHAT_ID,
+            user_id=6,
+            display_name="Оля",
+            text=f"болтаем {i}",
+            reply_to_tg_message_id=None,
+            is_bot=False,
+            created_at=int(DAY.timestamp()) - 300 + i,
+        )
+    await handler(
+        _message(
+            message_id=60, from_user=_user(user_id=5, first_name="Дима"), text="не понял", date=DAY
+        )
+    )
+    summary = dict(await db.filter_log_summary(0))
+    assert "followup:vocab_explain" not in summary
+    assert responder.calls == []
+
+
+async def test_vocab_explain_on_ambient_pass_becomes_followup(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Кубик ambient выпал на «не понял» — всё равно followup, чтобы объяснение не
+    срезал dedup:vocab (ревью Codex 18.10)."""
+    handler, responder = await _vocab_explain_setup(
+        db, monkeypatch, reply_text="Айда на рынок.", reply_ago=600, cfg=_config_ambient_always()
+    )
+    users = [_user(user_id=5, first_name="Дима"), _user(user_id=6, first_name="Оля")]
+    await handler(_message(message_id=51, from_user=users[0], text="ну", date=DAY))
+    await handler(_message(message_id=52, from_user=users[1], text="и что", date=DAY))
+    responder.calls.clear()
+    await handler(_message(message_id=53, from_user=users[0], text="не понял", date=DAY))
+
+    summary = dict(await db.filter_log_summary(0))
+    assert summary.get("pass:ambient") == 1  # третье сообщение прошло гейт по кубику
+    assert summary.get("followup:vocab_explain") == 1
+    assert [trigger for _m, trigger, _n in responder.calls] == [Trigger.FOLLOWUP]
