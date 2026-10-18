@@ -53,7 +53,7 @@ from typing import Protocol
 from trolobot import filters
 from trolobot.chat_memory import render_chat_memory
 from trolobot.config_models import Config, HotWindowConfig
-from trolobot.db import Database, LifeEventRow, MessageRow, PendingRow
+from trolobot.db import Database, JokeRow, LifeEventRow, MessageRow, PendingRow
 from trolobot.delays import debounce_seconds, fast_delay, pick_delay
 from trolobot.diary import DiaryExtractor, render_diary
 from trolobot.filters import FilterContext
@@ -315,6 +315,51 @@ def _window_hours(window: tuple[str, str]) -> float:
     if end_sec <= start_sec:
         end_sec += 24 * _SECONDS_PER_HOUR
     return (end_sec - start_sec) / _SECONDS_PER_HOUR
+
+
+def _cut_reason(cfg: Config, reasons: Sequence[str]) -> str | None:
+    """Режет ли выходной фильтр и по какой причине. Мера 4 контракта «меньше и
+    разнообразнее»: shadow остаётся щадящим режимом для новых слоёв, но стадии из
+    filters.enforce_stages (по умолчанию dedup и style) режут всегда — именно повторы
+    и сорванный стиль остановили чат 15.09, а shadow их пропускал. В shadow причиной
+    уходит enforce-стадия, без shadow — первая из списка. None — реплика уйдёт."""
+    enforce_stages = set(cfg.filters.enforce_stages)
+    enforced = [reason for reason in reasons if reason.split(":", 1)[0] in enforce_stages]
+    if not cfg.filters.shadow:
+        return reasons[0] if reasons else None
+    return enforced[0] if enforced else None
+
+
+@dataclass(frozen=True)
+class PreviewOutcome:
+    """Итог ``Responder.preview`` для ``/ask``: что ответил бы Фёдор, ничего не
+    отправляя. ``reason`` — как у ``SendOutcome``: "send:mention", "llm:silent",
+    "llm:<ошибка>", причина среза фильтра. ``reasons`` — все сработавшие причины
+    фильтра, включая пропущенные shadow-режимом; ``fixes`` — правки пост-обработки."""
+
+    sent: bool
+    text: str
+    reason: str
+    reasons: tuple[str, ...] = ()
+    fixes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _BuiltPrompt:
+    """Итог ``Responder._build_prompt``: сообщения для модели и то, что после ответа
+    нужно фильтру, стикерам, шуткам и словечкам."""
+
+    messages: list[dict[str, str]]
+    context_rows: list[MessageRow]
+    recent_replies: list[str]
+    filter_recent_replies: list[str]
+    patterns: Patterns
+    system_prompt: str
+    is_address: bool
+    record_trigger: str
+    joke_rows: list[JokeRow]
+    vocab: Vocab | None
+    vocab_over: bool
 
 
 class Responder:
@@ -1049,6 +1094,7 @@ class Responder:
         trigger_text: str,
         trigger_msg_id: int | None,
         patterns: Patterns,
+        record: bool = True,
     ) -> str:
         """Вторая строка блока погоды — про место, о котором спросили (CLAUDE.md,
         "Интерфейсы: погода в другом месте").
@@ -1079,29 +1125,42 @@ class Responder:
         home_name = self.weather.home_name
         query = await self.weather_places.extract(trigger_text, now=now)
         if query is None:
-            await self._weather_log(trigger_msg_id, "weather:no_place", None, now, cut=True)
+            await self._weather_log(record, trigger_msg_id, "weather:no_place", None, now, cut=True)
             return block
         if home_name and query.casefold() == home_name.casefold():
             return block
 
         place = await self.weather.geocode(query)
         if place is None:
-            await self._weather_log(trigger_msg_id, "weather:not_found", query, now, cut=True)
+            await self._weather_log(
+                record, trigger_msg_id, "weather:not_found", query, now, cut=True
+            )
             return block
         if home_name and place.name.casefold() == home_name.casefold():
             return block
 
         line = render_weather_place(place.name, await self.weather.get(place), tz, now)
         if not line:
-            await self._weather_log(trigger_msg_id, "weather:not_found", place.name, now, cut=True)
+            await self._weather_log(
+                record, trigger_msg_id, "weather:not_found", place.name, now, cut=True
+            )
             return block
 
-        await self._weather_log(trigger_msg_id, "weather:place", place.name, now, cut=False)
+        await self._weather_log(record, trigger_msg_id, "weather:place", place.name, now, cut=False)
         return f"{block}\n{line}" if block else line
 
     async def _weather_log(
-        self, trigger_msg_id: int | None, reason: str, candidate: str | None, now: int, *, cut: bool
+        self,
+        record: bool,
+        trigger_msg_id: int | None,
+        reason: str,
+        candidate: str | None,
+        now: int,
+        *,
+        cut: bool,
     ) -> None:
+        if not record:
+            return
         await self.db.insert_filter_log(
             trigger_tg_message_id=trigger_msg_id,
             candidate_text=candidate,
@@ -1112,105 +1171,31 @@ class Responder:
             created_at=now,
         )
 
-    async def _generate_and_send(
+    async def _build_prompt(
         self,
         *,
         cfg: Config,
         tz: str,
         trigger_value: str,
         trigger_msg_id: int | None,
-        user_id: int | None,
         situation: str,
         delay_sec: int,
         now: int,
-        trigger_text: str = "",
-        addressed_items: list[tuple[str, str]] | None = None,
-        pending_id: int | None = None,
-        checkin_rows: Sequence[MessageRow] | None = None,
-    ) -> SendOutcome:
-        """Возвращает SendOutcome с тем же reason, что уходит в filter_log — нужно
-        ``announce_life``/``say`` (CLAUDE.md, "события жизни"), которые зовут этот
-        метод напрямую (в обход дебаунса/пендинга) и должны сообщить владельцу через
-        commands.py, отправился ли текст. ``_respond_inner`` результат игнорирует —
-        поведение обычных триггеров (gate PASS, morning, spontaneous) не меняется.
-
-        ``hot`` (признак «горячего окна», CLAUDE.md, "горячее окно") берётся ровно
-        один раз здесь, в самом начале, до вызова модели — чтобы проверка бюджета
-        (``_recheck_ambient_budget``) и счётчики после отправки были согласованы,
-        даже если окно успеет закрыться, пока ждём ответа LLM. Распространяется
-        только на ``ambient`` — spontaneous и обращения горячее окно не трогает
-        (обращения обрабатывает отдельно ``_handle_debounced_inner``).
+        trigger_text: str,
+        addressed_items: list[tuple[str, str]] | None,
+        record: bool = True,
+        extra_row: MessageRow | None = None,
+    ) -> _BuiltPrompt:
+        """Сборка промпта для основной модели — общая для живого ответа
+        (``_generate_and_send``) и предпросмотра ``/ask`` (``preview``), чтобы
+        владелец видел ровно то, что ушло бы в чат. ``record=False`` — без записей
+        в ``filter_log`` (погода по месту); остальная сборка только читает БД.
+        ``extra_row`` — сообщение, которого нет в БД (предпросмотр): дописывается в
+        конец контекста в памяти, окно ``context_window`` сохраняется.
         """
-        hot = False
-        if trigger_value == Trigger.AMBIENT.value:
-            hot = await self._hot_until(cfg, now) is not None
-
-        if trigger_value in _AMBIENT_LIKE_TRIGGER_VALUES:
-            # Пока этот ответ ждал лок, другой мог уже уйти и обновить
-            # ambient_count/last_ambient_at (или hot_ambient_count) —
-            # перечитываем их с нуля вместо того, чтобы полагаться на состояние,
-            # увиденное до захвата лока.
-            recheck_reason = await self._recheck_ambient_budget(cfg, now, hot)
-            if recheck_reason is not None:
-                await self.db.insert_filter_log(
-                    trigger_tg_message_id=trigger_msg_id,
-                    candidate_text=None,
-                    verdict="cut",
-                    stage="send",
-                    reason=recheck_reason,
-                    shadow=False,
-                    created_at=now,
-                )
-                await self._finish_pending(pending_id, now)
-                return SendOutcome(sent=False, text="", reason=recheck_reason)
-
-        if trigger_value in _UNSOLICITED_TRIGGER_VALUES:
-            # Потолок присутствия и пауза между репликами (CLAUDE.md, "меньше и
-            # разнообразнее", меры 1 и 2) — до вызова модели: неадресный повод не
-            # стоит ни денег, ни места в чате. Обращения сюда не попадают: их
-            # ограничивает _recheck (потолок) и перенос pending (пауза), /life и
-            # /say — кнопка владельца — не ограничены вовсе.
-            unsolicited_reason: str | None = None
-            if await self._presence_over_cap(cfg, now):
-                unsolicited_reason = "send:presence_cap"
-            elif await self._min_gap_due(cfg, now) is not None:
-                unsolicited_reason = "send:min_gap"
-            if unsolicited_reason is not None:
-                await self.db.insert_filter_log(
-                    trigger_tg_message_id=trigger_msg_id,
-                    candidate_text=None,
-                    verdict="cut",
-                    stage="send",
-                    reason=unsolicited_reason,
-                    shadow=False,
-                    created_at=now,
-                )
-                await self._finish_pending(pending_id, now)
-                return SendOutcome(sent=False, text="", reason=unsolicited_reason)
-
-        if not cfg.llm.main_model:
-            # LLM включён (есть openrouter_api_key), но модель ещё не задана —
-            # это не ошибка вызова, а нормальное состояние до первого /set
-            # llm.main_model. Молчание, без похода в сеть.
-            await self.db.insert_filter_log(
-                trigger_tg_message_id=trigger_msg_id,
-                candidate_text=None,
-                verdict="cut",
-                stage="llm",
-                reason="llm:no_model",
-                shadow=False,
-                created_at=now,
-            )
-            if (
-                self._last_no_model_warn_at is None
-                or now - self._last_no_model_warn_at >= _NO_MODEL_WARN_INTERVAL_SEC
-            ):
-                self._last_no_model_warn_at = now
-                logger.warning("llm.main_model не задан, ответ не сгенерирован")
-            await self._finish_pending(pending_id, now)
-            return SendOutcome(sent=False, text="", reason="llm:no_model")
-
         context_rows = await self.db.recent_messages(self.chat_id, cfg.behaviour.context_window)
+        if extra_row is not None:
+            context_rows = [*context_rows, extra_row][-cfg.behaviour.context_window :]
         recent_replies_list = await self.db.recent_bot_replies(cfg.behaviour.recent_replies_memory)
         context = render_context(context_rows)
         recent_replies = "\n".join(recent_replies_list)
@@ -1337,6 +1322,7 @@ class Responder:
                 trigger_text=trigger_text,
                 trigger_msg_id=trigger_msg_id,
                 patterns=patterns,
+                record=record,
             )
 
         # checkin (CLAUDE.md, "вернулся проверить") — единственный триггер, где модель
@@ -1363,6 +1349,229 @@ class Responder:
             vocab=vocab_block,
             **build_messages_kwargs,
         )
+        return _BuiltPrompt(
+            messages=messages,
+            context_rows=context_rows,
+            recent_replies=recent_replies_list,
+            filter_recent_replies=filter_recent_replies,
+            patterns=patterns,
+            system_prompt=system_prompt,
+            is_address=is_address,
+            record_trigger=record_trigger,
+            joke_rows=joke_rows,
+            vocab=vocab,
+            vocab_over=vocab_over,
+        )
+
+    async def _filter_context(
+        self, cfg: Config, prompt: _BuiltPrompt, *, trigger_text: str, now: int
+    ) -> FilterContext:
+        muted_ids = await self.db.muted_user_ids()
+        muted_names = list((await self.db.display_names(list(muted_ids))).values())
+        # Всегда (не только для триггера "places") — белый список regex:venue/regex:latin
+        # должен знать реальные заведения независимо от того, спрашивали про них сейчас.
+        places_names = await self.db.places_names()
+        return FilterContext(
+            cfg=cfg,
+            recent_replies=prompt.filter_recent_replies,
+            context_rows=prompt.context_rows,
+            places_names=places_names,
+            participant_names=_unique_participant_names(prompt.context_rows),
+            bot_names=[cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers],
+            muted_names=muted_names,
+            patterns=prompt.patterns,
+            system_prompt=prompt.system_prompt,
+            trigger_text=trigger_text,
+            now=now,
+            vocab=prompt.vocab,
+            vocab_over_quota=prompt.vocab_over,
+        )
+
+    async def preview(self, text: str, display_name: str, user_id: int = 0) -> PreviewOutcome:
+        """``/ask`` (CLAUDE.md, "предпросмотр ответа"): что ответил бы Фёдор, если бы
+        ``display_name`` обратился к нему в чате с ``text``, — тот же промпт со свежим
+        контекстом чата, та же модель, пост-обработка и выходной фильтр. Ничего не
+        отправляет и не пишет: ни filter_log, ни bot_replies, ни счётчиков, дневника,
+        шуток, словечек и горячего окна. Вызовы моделей настоящие и идут в общий
+        бюджет (llm_calls, судья, погода по месту). Без _respond_lock: в чат ничего
+        не уходит, ждать чужую генерацию незачем.
+
+        Само сообщение дописывается в контекст только в памяти (ревью Codex 18.10): в
+        живом чате оно уже записано хендлером до генерации, и без него модель видела бы
+        текст лишь в situation (обрезка 300 символов), а фильтр — не видел вовсе
+        (regex:echo, regex:starts_name)."""
+        cfg = self.cfg_getter()
+        tz = cfg.persona.timezone
+        now = self._clock()
+        if not cfg.llm.main_model:
+            return PreviewOutcome(sent=False, text="", reason="llm:no_model")
+        prompt = await self._build_prompt(
+            cfg=cfg,
+            tz=tz,
+            trigger_value=Trigger.MENTION.value,
+            trigger_msg_id=None,
+            situation="",
+            delay_sec=0,
+            now=now,
+            trigger_text=text,
+            addressed_items=[(display_name, text)],
+            record=False,
+            extra_row=MessageRow(
+                id=0,
+                tg_message_id=None,
+                chat_id=self.chat_id,
+                user_id=user_id,
+                display_name=display_name,
+                text=text,
+                reply_to_tg_message_id=None,
+                is_bot=False,
+                created_at=now,
+            ),
+        )
+        try:
+            result = await self.llm.call(
+                prompt.messages, model=cfg.llm.main_model, max_tokens=cfg.llm.max_tokens, now=now
+            )
+        except LLMError as exc:
+            return PreviewOutcome(sent=False, text="", reason=exc.reason)
+        reply = parse_reply(result.text)
+        if reply is None:
+            return PreviewOutcome(sent=False, text=result.text, reason="llm:invalid_json")
+        if not reply.speak:
+            return PreviewOutcome(sent=False, text="", reason="llm:silent")
+        fixed = soften(reply.text, recent_replies=prompt.filter_recent_replies, cfg=cfg.filters)
+        if not fixed.text:
+            return PreviewOutcome(
+                sent=False, text=reply.text, reason="fix:empty", fixes=fixed.fixes
+            )
+        filter_ctx = await self._filter_context(cfg, prompt, trigger_text=text, now=now)
+        verdict = await filters.check_output(fixed.text, filter_ctx, self.judge)
+        reasons = () if verdict.ok else (verdict.reasons or (verdict.reason,))
+        cut_reason = _cut_reason(cfg, reasons) if reasons else None
+        return PreviewOutcome(
+            sent=cut_reason is None,
+            text=fixed.text,
+            reason=cut_reason or f"send:{Trigger.MENTION.value}",
+            reasons=tuple(reasons),
+            fixes=fixed.fixes,
+        )
+
+    async def _generate_and_send(
+        self,
+        *,
+        cfg: Config,
+        tz: str,
+        trigger_value: str,
+        trigger_msg_id: int | None,
+        user_id: int | None,
+        situation: str,
+        delay_sec: int,
+        now: int,
+        trigger_text: str = "",
+        addressed_items: list[tuple[str, str]] | None = None,
+        pending_id: int | None = None,
+        checkin_rows: Sequence[MessageRow] | None = None,
+    ) -> SendOutcome:
+        """Возвращает SendOutcome с тем же reason, что уходит в filter_log — нужно
+        ``announce_life``/``say`` (CLAUDE.md, "события жизни"), которые зовут этот
+        метод напрямую (в обход дебаунса/пендинга) и должны сообщить владельцу через
+        commands.py, отправился ли текст. ``_respond_inner`` результат игнорирует —
+        поведение обычных триггеров (gate PASS, morning, spontaneous) не меняется.
+
+        ``hot`` (признак «горячего окна», CLAUDE.md, "горячее окно") берётся ровно
+        один раз здесь, в самом начале, до вызова модели — чтобы проверка бюджета
+        (``_recheck_ambient_budget``) и счётчики после отправки были согласованы,
+        даже если окно успеет закрыться, пока ждём ответа LLM. Распространяется
+        только на ``ambient`` — spontaneous и обращения горячее окно не трогает
+        (обращения обрабатывает отдельно ``_handle_debounced_inner``).
+        """
+        hot = False
+        if trigger_value == Trigger.AMBIENT.value:
+            hot = await self._hot_until(cfg, now) is not None
+
+        if trigger_value in _AMBIENT_LIKE_TRIGGER_VALUES:
+            # Пока этот ответ ждал лок, другой мог уже уйти и обновить
+            # ambient_count/last_ambient_at (или hot_ambient_count) —
+            # перечитываем их с нуля вместо того, чтобы полагаться на состояние,
+            # увиденное до захвата лока.
+            recheck_reason = await self._recheck_ambient_budget(cfg, now, hot)
+            if recheck_reason is not None:
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=trigger_msg_id,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="send",
+                    reason=recheck_reason,
+                    shadow=False,
+                    created_at=now,
+                )
+                await self._finish_pending(pending_id, now)
+                return SendOutcome(sent=False, text="", reason=recheck_reason)
+
+        if trigger_value in _UNSOLICITED_TRIGGER_VALUES:
+            # Потолок присутствия и пауза между репликами (CLAUDE.md, "меньше и
+            # разнообразнее", меры 1 и 2) — до вызова модели: неадресный повод не
+            # стоит ни денег, ни места в чате. Обращения сюда не попадают: их
+            # ограничивает _recheck (потолок) и перенос pending (пауза), /life и
+            # /say — кнопка владельца — не ограничены вовсе.
+            unsolicited_reason: str | None = None
+            if await self._presence_over_cap(cfg, now):
+                unsolicited_reason = "send:presence_cap"
+            elif await self._min_gap_due(cfg, now) is not None:
+                unsolicited_reason = "send:min_gap"
+            if unsolicited_reason is not None:
+                await self.db.insert_filter_log(
+                    trigger_tg_message_id=trigger_msg_id,
+                    candidate_text=None,
+                    verdict="cut",
+                    stage="send",
+                    reason=unsolicited_reason,
+                    shadow=False,
+                    created_at=now,
+                )
+                await self._finish_pending(pending_id, now)
+                return SendOutcome(sent=False, text="", reason=unsolicited_reason)
+
+        if not cfg.llm.main_model:
+            # LLM включён (есть openrouter_api_key), но модель ещё не задана —
+            # это не ошибка вызова, а нормальное состояние до первого /set
+            # llm.main_model. Молчание, без похода в сеть.
+            await self.db.insert_filter_log(
+                trigger_tg_message_id=trigger_msg_id,
+                candidate_text=None,
+                verdict="cut",
+                stage="llm",
+                reason="llm:no_model",
+                shadow=False,
+                created_at=now,
+            )
+            if (
+                self._last_no_model_warn_at is None
+                or now - self._last_no_model_warn_at >= _NO_MODEL_WARN_INTERVAL_SEC
+            ):
+                self._last_no_model_warn_at = now
+                logger.warning("llm.main_model не задан, ответ не сгенерирован")
+            await self._finish_pending(pending_id, now)
+            return SendOutcome(sent=False, text="", reason="llm:no_model")
+
+        prompt = await self._build_prompt(
+            cfg=cfg,
+            tz=tz,
+            trigger_value=trigger_value,
+            trigger_msg_id=trigger_msg_id,
+            situation=situation,
+            delay_sec=delay_sec,
+            now=now,
+            trigger_text=trigger_text,
+            addressed_items=addressed_items,
+        )
+        recent_replies_list = prompt.recent_replies
+        filter_recent_replies = prompt.filter_recent_replies
+        is_address = prompt.is_address
+        record_trigger = prompt.record_trigger
+        joke_rows = prompt.joke_rows
+        vocab = prompt.vocab
+        messages = prompt.messages
 
         result = await self.llm.call(
             messages, model=cfg.llm.main_model, max_tokens=cfg.llm.max_tokens, now=now
@@ -1481,41 +1690,14 @@ class Responder:
             await self._finish_pending(pending_id, now)
             return SendOutcome(sent=False, text=reply.text, reason="fix:empty")
 
-        muted_ids = await self.db.muted_user_ids()
-        muted_names = list((await self.db.display_names(list(muted_ids))).values())
-        participant_names = _unique_participant_names(context_rows)
-        bot_names = [cfg.persona.name, cfg.persona.display_name, *cfg.persona.name_triggers]
-        # Всегда (не только для триггера "places") — белый список regex:venue/regex:latin
-        # должен знать реальные заведения независимо от того, спрашивали про них сейчас.
-        places_names = await self.db.places_names()
-
-        filter_ctx = FilterContext(
-            cfg=cfg,
-            recent_replies=filter_recent_replies,
-            context_rows=context_rows,
-            places_names=places_names,
-            participant_names=participant_names,
-            bot_names=bot_names,
-            muted_names=muted_names,
-            patterns=patterns,
-            system_prompt=system_prompt,
-            trigger_text=trigger_text,
-            now=now,
-            vocab=vocab,
-            vocab_over_quota=vocab_over,
-        )
+        filter_ctx = await self._filter_context(cfg, prompt, trigger_text=trigger_text, now=now)
         verdict = await filters.check_output(text, filter_ctx, self.judge)
         if not verdict.ok:
             # reasons может быть пустым только у чужого FilterVerdict, собранного
             # вручную (тесты) — тогда используем verdict.reason.
             reasons = verdict.reasons or (verdict.reason,)
-            # Мера 4 контракта «меньше и разнообразнее»: shadow остаётся щадящим
-            # режимом для новых слоёв, но стадии из filters.enforce_stages
-            # (по умолчанию dedup и style) режут всегда — именно повторы и сорванный
-            # стиль остановили чат 15.09, а shadow их пропускал.
-            enforce_stages = set(cfg.filters.enforce_stages)
-            enforced = [reason for reason in reasons if reason.split(":", 1)[0] in enforce_stages]
-            cut = (not cfg.filters.shadow) or bool(enforced)
+            cut_reason = _cut_reason(cfg, reasons)
+            cut = cut_reason is not None
             # На каждую сработавшую причину — своя строка filter_log (для shadow-статистики
             # по каждому слою отдельно); shadow=1 значит «записали, но отправили».
             for reason in reasons:
@@ -1529,12 +1711,9 @@ class Responder:
                     shadow=not cut,
                     created_at=now,
                 )
-            if cut:
+            if cut_reason is not None:
                 logger.info("cut: %s", ", ".join(reasons))
                 await self._finish_pending(pending_id, now)
-                # В shadow режет только enforce-стадия — она и уходит причиной;
-                # без shadow причина обычная, первая из списка.
-                cut_reason = enforced[0] if cfg.filters.shadow else reasons[0]
                 return SendOutcome(sent=False, text=text, reason=cut_reason)
 
         reply_to_message_id: int | None = None
