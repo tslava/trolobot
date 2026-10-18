@@ -97,10 +97,12 @@ from trolobot.timeutil import (
 from trolobot.vocab import (
     Vocab,
     VocabEntry,
+    explain_requested,
     offer_allowed,
     pick_offer,
     render_vocab,
     vocab_over_quota,
+    vocab_requested,
 )
 from trolobot.weather import (
     WeatherClient,
@@ -345,6 +347,15 @@ class PreviewOutcome:
 
 
 @dataclass(frozen=True)
+class _VocabPlan:
+    """Слот ``{vocab}`` и данные для ``dedup:vocab`` (CLAUDE.md, "словечки из словаря")."""
+
+    block: str = ""
+    over_quota: bool = False
+    allowed: frozenset[VocabEntry] = frozenset()
+
+
+@dataclass(frozen=True)
 class _BuiltPrompt:
     """Итог ``Responder._build_prompt``: сообщения для модели и то, что после ответа
     нужно фильтру, стикерам, шуткам и словечкам."""
@@ -360,6 +371,7 @@ class _BuiltPrompt:
     joke_rows: list[JokeRow]
     vocab: Vocab | None
     vocab_over: bool
+    vocab_allowed: frozenset[VocabEntry]
 
 
 class Responder:
@@ -1292,7 +1304,7 @@ class Responder:
         # Слот {vocab} (CLAUDE.md, "словечки из словаря"): значения мелькнувших в
         # разговоре словечек и изредка — предложение употребить одно.
         vocab = self.vocab_getter() if self.vocab_getter is not None else None
-        vocab_block, vocab_over = await self._vocab_block(
+        vocab_plan = await self._vocab_block(
             cfg,
             vocab,
             tz=tz,
@@ -1346,7 +1358,7 @@ class Responder:
             chat_memory=chat_memory_block,
             jokes=jokes_block,
             weather=weather_block,
-            vocab=vocab_block,
+            vocab=vocab_plan.block,
             **build_messages_kwargs,
         )
         return _BuiltPrompt(
@@ -1360,7 +1372,8 @@ class Responder:
             record_trigger=record_trigger,
             joke_rows=joke_rows,
             vocab=vocab,
-            vocab_over=vocab_over,
+            vocab_over=vocab_plan.over_quota,
+            vocab_allowed=vocab_plan.allowed,
         )
 
     async def _filter_context(
@@ -1385,6 +1398,7 @@ class Responder:
             now=now,
             vocab=prompt.vocab,
             vocab_over_quota=prompt.vocab_over,
+            vocab_allowed=prompt.vocab_allowed,
         )
 
     async def preview(self, text: str, display_name: str, user_id: int = 0) -> PreviewOutcome:
@@ -1840,35 +1854,52 @@ class Responder:
         context_rows: Sequence[MessageRow],
         recent_replies: Sequence[str],
         is_address: bool,
-    ) -> tuple[str, bool]:
-        """Блок слота ``{vocab}`` (CLAUDE.md, "словечки из словаря") и признак «на
-        сегодня словечек хватит» для фильтра ``dedup:vocab``. Новость владельца
-        (``life``) — его текст, словечки туда не подмешиваются и не режутся."""
+    ) -> _VocabPlan:
+        """Слот ``{vocab}`` (CLAUDE.md, "словечки из словаря") и всё, что из него нужно
+        фильтру ``dedup:vocab``. Новость владельца (``life``) — его текст, словечки туда
+        не подмешиваются и не режутся."""
         vocab_cfg = cfg.behaviour.vocab
         if vocab is None or not vocab or not vocab_cfg.enabled or trigger_value == _LIFE_TRIGGER:
-            return "", False
+            return _VocabPlan()
         count_raw = await self.db.get_state(day_key(_VOCAB_COUNT_KEY, now, tz))
         count_today = int(count_raw) if count_raw is not None else 0
         over_quota = vocab_over_quota(
             vocab, cfg=vocab_cfg, recent_replies=recent_replies, count_today=count_today
         )
-        sources = [trigger_text]
-        if vocab_cfg.meaning_context > 0:
-            sources.extend(row.text or "" for row in context_rows[-vocab_cfg.meaning_context :])
+        # Просьба («скажи по-сибирски») и «не понял» — только в обращении: в ambient
+        # их никто ему не адресовал.
+        requested = is_address and vocab_requested(trigger_text, vocab, vocab_cfg)
+        explain = is_address and explain_requested(trigger_text, vocab_cfg)
         # «А что ты сейчас сказал?» — словечко в его собственной недавней реплике. Только
         # в ответ на обращение: иначе значение своего же словечка в каждом промпте
         # подталкивало модель повторять его (ревью Codex 17.10).
+        own_words: list[VocabEntry] = []
         if is_address:
-            sources.extend(recent_replies[-_VOCAB_OWN_REPLIES:])
-        meanings: list[VocabEntry] = []
+            for reply in recent_replies[-_VOCAB_OWN_REPLIES:]:
+                own_words.extend(e for e in vocab.find(reply) if e not in own_words)
+        # «Не понял» — значения его словечек первыми, чтобы не вылетели за max_meanings.
+        meanings: list[VocabEntry] = list(own_words) if explain else []
+        sources = [trigger_text]
+        if vocab_cfg.meaning_context > 0:
+            sources.extend(row.text or "" for row in context_rows[-vocab_cfg.meaning_context :])
         for source in sources:
-            for entry in vocab.find(source):
-                if entry not in meanings:
-                    meanings.append(entry)
-        meanings = meanings[: vocab_cfg.max_meanings]
+            meanings.extend(e for e in vocab.find(source) if e not in meanings)
+        meanings.extend(e for e in own_words if e not in meanings)
+        meanings = meanings[: max(vocab_cfg.max_meanings, len(own_words) if explain else 0)]
 
         offer: list[VocabEntry] = []
-        if offer_allowed(
+        if requested:
+            # Прямо попросили — без кубика, дневного потолка и паузы.
+            offer = pick_offer(
+                vocab,
+                recent_replies=recent_replies,
+                size=vocab_cfg.request_size,
+                rng=self.rng,
+                exclude=meanings,
+                fill=True,
+            )
+            logger.info("vocab requested: %s", ", ".join(entry.word for entry in offer))
+        elif offer_allowed(
             cfg=vocab_cfg,
             vocab=vocab,
             recent_replies=recent_replies,
@@ -1884,7 +1915,14 @@ class Responder:
             )
             if offer:
                 logger.info("vocab offer: %s", ", ".join(entry.word for entry in offer))
-        return render_vocab(offer, meanings), over_quota
+        # Что фильтр пропускает и сверх лимита: предложенное по просьбе и его собственные
+        # недавние словечки, когда их просят объяснить.
+        allowed = frozenset([*(offer if requested else ()), *(own_words if explain else ())])
+        return _VocabPlan(
+            block=render_vocab(offer, meanings, requested=requested),
+            over_quota=over_quota,
+            allowed=allowed,
+        )
 
     async def _note_vocab_used(self, vocab: Vocab | None, text: str, *, tz: str, now: int) -> None:
         """Словечко прозвучало в отправленной реплике — счётчик суток и «последнее» для
