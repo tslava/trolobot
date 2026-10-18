@@ -31,7 +31,7 @@ from trolobot.db import MessageRow
 from trolobot.gate_types import PatternsLike
 from trolobot.motifs import motifs_in, story_count, used_motifs
 from trolobot.patterns import Patterns
-from trolobot.vocab import Vocab
+from trolobot.vocab import Vocab, VocabEntry
 
 _MAX_LEN = 300
 
@@ -540,7 +540,7 @@ def _check_vocab(text: str, ctx: FilterContext) -> bool:
     сообщения собеседника («что такое багнюка?») не считается: на вопрос отвечают."""
     if ctx.vocab is None or not ctx.vocab_over_quota:
         return False
-    asked = set(ctx.vocab.find(ctx.trigger_text))
+    asked = set(ctx.vocab.find(ctx.trigger_text)) | ctx.vocab_allowed
     return any(entry not in asked for entry in ctx.vocab.find(text))
 
 
@@ -602,6 +602,9 @@ class FilterContext:
     # сегодня хватит» (vocab.vocab_over_quota). None/False — правило dedup:vocab молчит.
     vocab: Vocab | None = None
     vocab_over_quota: bool = False
+    # Словечки, которые можно и сверх лимита: предложенные по просьбе «скажи
+    # по-сибирски» и свои недавние, когда их просят объяснить.
+    vocab_allowed: frozenset[VocabEntry] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

@@ -593,6 +593,52 @@ class VocabConfig(BaseModel):
     max_meanings: int = Field(
         default=3, ge=0, le=10, description="Сколько значений словечек класть в промпт за раз"
     )
+    request_markers: list[str] = Field(
+        default_factory=lambda: [r"\bсловеч", r"\bсловар", r"\bдиалект"],
+        description="Просьба сказать словечком (регулярки); ещё имя словаря: «по-сибирски»",
+    )
+    request_size: int = Field(
+        default=5, ge=1, le=20, description="Сколько словечек показать модели, когда его попросили"
+    )
+    explain_markers: list[str] = Field(
+        default_factory=lambda: [
+            r"\bне понял",
+            r"\bне поняла",
+            r"\bне понятно",
+            r"\bнепонятно",
+            r"\bчто (это |оно )?значит",
+            r"\bчто это (за слово|такое)",
+            r"\bв смысле\b",
+            r"\bэто как\b",
+            r"\bпереведи",
+            r"\bпо-русски",
+            r"\bчё это\b",
+            r"\bчо это\b",
+        ],
+        description="Регулярки «не понял, что это значит» — после его словечка это вопрос ему",
+    )
+    explain_window_min: int = Field(
+        default=30,
+        ge=0,
+        le=1440,
+        description="Сколько минут после его словечка «не понял» считается вопросом ему",
+    )
+    explain_max_between: int = Field(
+        default=2,
+        ge=0,
+        le=20,
+        description="Больше стольких сообщений людей после его словечка — «не понял» уже не ему",
+    )
+
+    @field_validator("request_markers", "explain_markers")
+    @classmethod
+    def _validate_markers(cls, value: list[str]) -> list[str]:
+        for pattern in value:
+            try:
+                re.compile(pattern, re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"invalid regex pattern {pattern!r}: {exc}") from exc
+        return value
 
 
 class CallbackConfig(BaseModel):

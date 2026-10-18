@@ -17,6 +17,7 @@ system. В публичный репозиторий словари не ком�
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import random
 import re
@@ -87,6 +88,12 @@ _ERRORS_SHOWN = 5
 
 _OFFER_HEADER = "Можешь к месту употребить одно из этих словечек"
 _OFFER_TAIL = ", только если оно само ложится в реплику; не объясняй его и не бери в кавычки: "
+_REQUEST_HEADER = "Тебя просят сказать по-своему: употреби одно-два из этих словечек"
+_REQUEST_TAIL = ", к месту, как сказал бы сам; объяснять не нужно, пока не спросят: "
+# Имя словаря как признак просьбы: «сибирские» -> «сибирс» ловит «по-сибирски»,
+# «сибирское», но не «Сибири».
+_NAME_STEM_MIN = 5
+_NAME_STEM_CUT = 3
 _MEANINGS_HEADER = (
     "Справка: в разговоре мелькнули словечки. Если спросят, что они значат, объясни "
     "своими словами; сам их без вопроса не повторяй: "
@@ -202,6 +209,36 @@ class VocabEntry:
     dict_name: str
 
 
+def _name_stem(name: str) -> str | None:
+    tokens = _tokens(name)
+    if not tokens or len(tokens[0]) < _NAME_STEM_MIN:
+        return None
+    word = tokens[0]
+    return word[: max(_NAME_STEM_MIN, len(word) - _NAME_STEM_CUT)]
+
+
+@functools.lru_cache(maxsize=32)
+def _compile(patterns: tuple[str, ...]) -> tuple[re.Pattern[str], ...]:
+    return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
+
+
+def vocab_requested(text: str, vocab: Vocab, cfg: VocabConfig) -> bool:
+    """Просят сказать словечком: «скажи по-сибирски», «а какие у тебя словечки?» —
+    ``request_markers`` или основа имени включённого словаря."""
+    if not text or not vocab:
+        return False
+    if any(p.search(text) for p in _compile(tuple(cfg.request_markers))):
+        return True
+    tokens = _tokens(text)
+    return any(token.startswith(stem) for stem in vocab.name_stems for token in tokens)
+
+
+def explain_requested(text: str, cfg: VocabConfig) -> bool:
+    """«Не понял», «что это значит», «в смысле» — по ``explain_markers``. Регулярки
+    идут по исходному тексту (не по normalize: там «чё» уже «че»)."""
+    return bool(text) and any(p.search(text) for p in _compile(tuple(cfg.explain_markers)))
+
+
 @dataclass(frozen=True, slots=True)
 class _Rule:
     stem: str
@@ -271,6 +308,9 @@ class Vocab:
                 self._index(entry, item)
         self.entries: tuple[VocabEntry, ...] = tuple(entries)
         self._max_phrase = max((len(p) for p in self._phrases), default=0)
+        self.name_stems: tuple[str, ...] = tuple(
+            stem for stem in (_name_stem(d.name) for d in dicts) if stem is not None
+        )
 
     def _index(self, entry: VocabEntry, item: VocabWord) -> None:
         for variant in (item.word, *item.forms):
@@ -381,12 +421,20 @@ def pick_offer(
     size: int,
     rng: random.Random,
     exclude: Sequence[VocabEntry] = (),
+    fill: bool = False,
 ) -> list[VocabEntry]:
-    """``size`` случайных слов, которых не было в ``recent_replies`` и нет в ``exclude``."""
+    """``size`` случайных слов, которых не было в ``recent_replies`` и нет в ``exclude``.
+    ``fill`` — не хватило таких (маленький словарь, всё недавно звучало) — добрать из
+    остальных: по прямой просьбе пустой список хуже повтора (ревью Codex 18.10)."""
     used = {id(entry) for reply in _speech(recent_replies) for entry in vocab.find(reply)}
     used.update(id(entry) for entry in exclude)
     pool = [entry for entry in vocab.entries if id(entry) not in used]
-    return rng.sample(pool, min(size, len(pool)))
+    picked = rng.sample(pool, min(size, len(pool)))
+    if fill and len(picked) < size:
+        chosen = {id(entry) for entry in picked}
+        rest = [entry for entry in vocab.entries if id(entry) not in chosen]
+        picked.extend(rng.sample(rest, min(size - len(picked), len(rest))))
+    return picked
 
 
 def _clean(text: str) -> str:
@@ -404,8 +452,11 @@ def _meaning(text: str) -> str:
     return cleaned
 
 
-def render_vocab(offer: Sequence[VocabEntry], meanings: Sequence[VocabEntry]) -> str:
+def render_vocab(
+    offer: Sequence[VocabEntry], meanings: Sequence[VocabEntry], *, requested: bool = False
+) -> str:
     """Блок слота ``{vocab}``: предложение словечек и/или значения мелькнувших.
+    ``requested`` — его прямо попросили сказать словечком (другой заголовок).
     Пусто -> "". Без «- » в начале строк (regex:prompt_leak) и без тире."""
     parts: list[str] = []
     if offer:
@@ -417,8 +468,9 @@ def render_vocab(offer: Sequence[VocabEntry], meanings: Sequence[VocabEntry]) ->
             meaning = _meaning(entry.meaning)
             detail = f"{meaning}; «{example}»" if example else meaning
             items.append(f"{_clean(entry.word)} ({detail})")
-        header = f"{_OFFER_HEADER} ({about})" if about else _OFFER_HEADER
-        parts.append(header + _OFFER_TAIL + "; ".join(items) + ".")
+        base, tail = (_REQUEST_HEADER, _REQUEST_TAIL) if requested else (_OFFER_HEADER, _OFFER_TAIL)
+        header = f"{base} ({about})" if about else base
+        parts.append(header + tail + "; ".join(items) + ".")
     if meanings:
         items = [f"{_clean(entry.word)}: {_meaning(entry.meaning)}" for entry in meanings]
         parts.append(_MEANINGS_HEADER + "; ".join(items) + ".")

@@ -13,12 +13,14 @@ from trolobot.db import Database
 from trolobot.vocab import (
     Vocab,
     VocabStore,
+    explain_requested,
     normalize,
     offer_allowed,
     parse_vocab,
     pick_offer,
     render_vocab,
     vocab_over_quota,
+    vocab_requested,
 )
 
 SIBERIAN = """
@@ -379,3 +381,66 @@ async def test_vocab_store_skips_broken_body(
         assert dicts["битый"] is None
     finally:
         await db.close()
+
+
+# --- просьба «скажи по-сибирски» и «не понял» ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Федь, скажи что-нибудь по-сибирски", True),
+        ("а по сибирски как будет?", True),
+        ("у тебя есть сибирский словарь", True),
+        ("какие у тебя словечки?", True),
+        ("это диалект такой?", True),
+        ("в Сибири холодно", False),
+        ("Федь, как дела?", False),
+        ("", False),
+    ],
+)
+def test_vocab_requested(text: str, expected: bool) -> None:
+    assert vocab_requested(text, _vocab(), VocabConfig()) is expected
+
+
+def test_vocab_requested_needs_vocab() -> None:
+    assert vocab_requested("скажи по-сибирски", Vocab(), VocabConfig()) is False
+
+
+def test_vocab_requested_by_custom_marker() -> None:
+    cfg = VocabConfig(request_markers=[r"\bпо-нашему\b"])
+    assert vocab_requested("скажи по-нашему", _vocab(), cfg) is True
+    assert vocab_requested("какие словечки?", _vocab(), cfg) is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ничего не понял", True),
+        ("Не поняла, это что?", True),
+        ("а что это значит?", True),
+        ("чё это за слово", True),
+        ("в смысле?", True),
+        ("переведи на русский", True),
+        ("понял, иду", False),
+        ("смысл жизни", False),
+        ("", False),
+    ],
+)
+def test_explain_requested(text: str, expected: bool) -> None:
+    assert explain_requested(text, VocabConfig()) is expected
+
+
+def test_render_vocab_requested_header() -> None:
+    vocab = _vocab()
+    text = render_vocab(vocab.find("айда"), [], requested=True)
+    assert text.startswith("Тебя просят сказать по-своему: употреби одно-два из этих словечек")
+    assert "Можешь к месту" not in text
+
+
+def test_pick_offer_fill_takes_recent_when_unused_run_out() -> None:
+    """По прямой просьбе пустой список хуже повтора (ревью Codex 18.10)."""
+    vocab = Vocab([parse_vocab("name: x\nwords:\n  - {word: айда, meaning: пошли}")])
+    assert pick_offer(vocab, recent_replies=["айда"], size=3, rng=random.Random(0)) == []
+    filled = pick_offer(vocab, recent_replies=["айда"], size=3, rng=random.Random(0), fill=True)
+    assert [entry.word for entry in filled] == ["айда"]

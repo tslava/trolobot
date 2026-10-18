@@ -2234,6 +2234,25 @@ class VocabStore:
 # sent_text) непусто -> increment_state(day_key("vocab_count")), set_state("vocab_last", "<ts>|<word>").
 # app.py: VocabStore создаётся и load() до Responder; передаётся в Responder (vocab_getter=store.get) и в Deps.
 
+# Просьба и «не понял» (решение владельца 18.10.2026: «скажи по-сибирски» молча игнорировалось — словарь
+# в промпт не попадал без кубика; и «главное, чтобы мог пояснить, если кто-то не понял»):
+# VocabConfig += request_markers (["\bсловеч", "\bсловар", "\bдиалект"]), request_size 5, explain_markers
+# («не понял», «что это значит», «в смысле», «чё это», «переведи»…), explain_window_min 30.
+def vocab_requested(text, vocab, cfg) -> bool   # request_markers или основа имени словаря (Vocab.name_stems:
+                                                # «сибирские» -> «сибирс»: «по-сибирски», не «Сибири»)
+def explain_requested(text, cfg) -> bool        # explain_markers по исходному тексту
+# responder._vocab_block -> _VocabPlan(block, over_quota, allowed). Только при обращении:
+#   requested -> request_size слов без кубика, потолка и паузы, заголовок «Тебя просят сказать по-своему…»;
+#   explain -> значения его словечек из 2 последних реплик первыми (max_meanings их не режет).
+#   allowed = предложенные по просьбе + свои словечки при explain -> FilterContext.vocab_allowed: dedup:vocab
+#   их не режет и сверх лимита.
+# bot.py, ветка DROP: причина в FOLLOWUP_REASONS, explain_requested(text) и его последняя реплика
+# (db.last_bot_replies(1)) моложе explain_window_min и со словечком -> filter_log followup:vocab_explain (pass),
+# on_gate_pass(Trigger.FOLLOWUP). Раньше проверки горячего окна. Ветка PASS с Trigger.AMBIENT — та же проверка,
+# триггер меняется на FOLLOWUP (иначе объяснение резал бы dedup:vocab). Не ему (ревью Codex 18.10): реплай на
+# другого человека; после его реплики людей больше explain_max_between (2) сообщений (db.messages_after).
+# Просьба: pick_offer(fill=True) — не хватило несказанных слов, добирает из недавних.
+
 # commands.py — личка владельца, Deps += vocab_store: _VocabStoreLike | None, bot: _DownloaderLike | None
 #   документ с подписью /words — загрузить словарь: ≤ 512 КБ, UTF-8 (BOM допустим) -> put ->
 #       «Словарь «<name>»: N слов, включён.» / «Не разобрал файл: <ошибка>»; аудит "words:put" (new_value=name)

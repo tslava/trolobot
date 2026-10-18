@@ -6217,6 +6217,95 @@ async def test_vocab_slot_empty_without_vocab_or_when_disabled(db: Database) -> 
         await llm.aclose()
 
 
+async def _mention(clock: FakeClock, responder: Responder, text: str, trigger: Trigger) -> None:
+    await _drive(
+        clock,
+        responder._respond(
+            trigger=trigger,
+            trigger_msg_id=50,
+            user_id=7,
+            situation="",
+            delay_sec=0,
+            trigger_text=text,
+            addressed_items=[("Дима", text)],
+        ),
+    )
+
+
+async def test_vocab_request_offers_words_without_dice_and_quota(db: Database) -> None:
+    """«Скажи по-сибирски» — словечки предложены без кубика и лимита, и реплика с ними
+    проходит фильтр даже сверх суточного потолка."""
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 0.0
+    tz = cfg.persona.timezone
+    await db.set_state(day_key("vocab_count", DAY_NOW, tz), str(cfg.behaviour.vocab.daily_cap))
+    llm, calls = _make_llm(cfg, db, lambda _req: _ok_response("Хиус сегодня, айда по домам."))
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        await _mention(clock, responder, "Федь, скажи что-нибудь по-сибирски", Trigger.MENTION)
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        assert "Тебя просят сказать по-своему" in system
+        assert all(word in system for word in ("багнюка", "айда", "хиус"))
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
+async def test_vocab_explain_own_word_after_not_understood(db: Database) -> None:
+    """«Не понял» после его «айда» (followup из гейта): значение его словечка в промпте,
+    объяснение с этим словечком проходит фильтр, хотя словечко только что звучало."""
+    cfg = _config()
+    cfg.behaviour.vocab.probability = 0.0
+    cfg.behaviour.vocab.max_meanings = 1
+    await db.insert_bot_reply(
+        tg_message_id=30,
+        reply_to_tg_message_id=None,
+        trigger="ambient",
+        trigger_tg_message_id=None,
+        text="Айда на рынок, пока хиус не начался.",
+        prompt_version=1,
+        few_shot_version=1,
+        delay_sec=0,
+        created_at=DAY_NOW - 600,
+    )
+    await _insert_human(db, 40, "на улице багнюка", DAY_NOW - 300)
+    llm, calls = _make_llm(
+        cfg, db, lambda _req: _ok_response("Айда значит пошли, а хиус это ветер.")
+    )
+    bot = FakeBot()
+    clock = FakeClock(DAY_NOW)
+    responder = _make_responder(
+        db,
+        cfg,
+        llm,
+        bot,
+        clock,
+        prompt_store=FakePromptStore(prompt=PROMPT_TEMPLATE_WITH_VOCAB),
+        vocab=_test_vocab(),
+    )
+    try:
+        await _mention(clock, responder, "ничего не понял", Trigger.FOLLOWUP)
+        system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
+        # Его словечки первыми и обе, даже при max_meanings=1.
+        assert "айда: призыв пойти" in system
+        assert "хиус: холодный ветер" in system
+        assert len(bot.sent) == 1
+    finally:
+        await responder.shutdown()
+        await llm.aclose()
+
+
 async def test_vocab_not_offered_for_life_news(db: Database) -> None:
     """/life — текст владельца: словечки туда не подмешиваются."""
     cfg = _config()
