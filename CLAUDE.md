@@ -2301,6 +2301,34 @@ async def preview(self, text: str, display_name: str, user_id: int = 0) -> Previ
 # бы фильтр: …» + «Кандидат: …»; [«Правки: fix:…»]; последней строкой «(в чат не отправлено)». Без аудита.
 ```
 
+## Интерфейсы: тревога владельцу
+
+Решение владельца 26.10.2026: с 22.10 OpenRouter четыре дня отвечал 402 (кончились кредиты), основная модель
+не вызывалась, бот молчал, а «ошибок подряд» в `/status` было 0 — дешёвые модели проходили и сбрасывали серию.
+Отказ провайдера сам не пройдёт, поэтому бот пишет владельцу в личку.
+
+```python
+# config_models.LlmConfig += alert_owner: bool = True; alert_interval_hours: int = Field(24, ge=1, le=168)
+# llm.py: class RefusalHook(Protocol): async __call__(*, status, model, message, now) -> None
+#   LLMClient(..., on_refusal: RefusalHook | None = None). На каждый не-2xx ответ: _register_error как раньше,
+#   set_state("llm_last_error", "<now>|<status>"), затем hook(status, model, message=error.message из JSON
+#   или начало тела, ≤ 200). Исключение хука -> logger.exception, исход вызова прежний (LLMError("llm:http")).
+#   Таймаут и транспортные ошибки хук не зовут.
+# alerts.py
+def is_refusal(status: int) -> bool          # 4xx, кроме 408 и 429
+def render_alert(*, status, model, message, interval_hours) -> str   # код + подсказка (402 кредиты, 401 ключ), модель, ответ
+class OwnerAlerter:
+    def __init__(self, *, bot, db, admin_user_id: int, cfg_getter) -> None
+    async def provider_refused(self, *, status, model, message, now) -> None
+    # alert_owner и admin_user_id != 0 и is_refusal -> под asyncio.Lock: state alert_last:llm_<status> моложе
+    # alert_interval_hours -> выход; bot.send_message(admin_user_id, render_alert(...)); TelegramAPIError ->
+    # WARNING, ключ не ставится (следующий отказ попробует снова); успех -> set_state(alert_last:llm_<status>, now).
+# app.py: OwnerAlerter(bot=bot, db=db, admin_user_id=settings.admin_user_id, cfg_getter=config_store.get) ->
+#   LLMClient(on_refusal=alerter.provider_refused). replay/places_fill/stickers_fill — без хука.
+# commands.py /status: строка предохранителя += «последний отказ провайдера: 402 в HH:MM dd.mm» (моложе суток)
+#   или «нет за сутки».
+```
+
 ## Конвенции
 
 - Все времена — unix seconds (`int`), таймзона только при показе и при вычислении «суток»

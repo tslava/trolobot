@@ -14,6 +14,7 @@ import sys
 import httpx
 from aiogram import Bot, Dispatcher
 
+from trolobot.alerts import OwnerAlerter
 from trolobot.bot import Deps, build_router
 from trolobot.chat_memory import ChatMemorizer
 from trolobot.commands import build_commands_router
@@ -145,8 +146,17 @@ async def main() -> None:
                 logger.warning("судья отключён: llm.judge_model не задан")
 
             http = httpx.AsyncClient(timeout=cfg.llm.timeout_sec)
+            # Отказ провайдера (кончились кредиты, ключ не принят) — сообщение владельцу
+            # в личку (CLAUDE.md, "Интерфейсы: тревога владельцу").
+            alerter = OwnerAlerter(
+                bot=bot, db=db, admin_user_id=settings.admin_user_id, cfg_getter=config_store.get
+            )
             llm = LLMClient(
-                api_key=api_key.get_secret_value(), cfg_getter=config_store.get, db=db, http=http
+                api_key=api_key.get_secret_value(),
+                cfg_getter=config_store.get,
+                db=db,
+                http=http,
+                on_refusal=alerter.provider_refused,
             )
 
             judge_prompt = settings.judge_prompt_path.read_text(encoding="utf-8")

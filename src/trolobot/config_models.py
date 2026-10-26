@@ -963,6 +963,12 @@ class LlmConfig(BaseModel):
     circuit_pause_min: int = Field(
         default=30, ge=0, le=1440, description="Минуты паузы после срабатывания предохранителя"
     )
+    alert_owner: bool = Field(
+        default=True, description="Писать владельцу в личку, если провайдер отказывает (4xx)"
+    )
+    alert_interval_hours: int = Field(
+        default=24, ge=1, le=168, description="Не чаще раза в столько часов на один код ответа"
+    )
     # Fallback-цены за 1M токенов: используются, только если провайдер не вернул usage.cost.
     price_in_usd_per_1m: float = Field(
         default=5.0, ge=0.0, description="Fallback-цена входных токенов за 1M, если нет usage.cost"

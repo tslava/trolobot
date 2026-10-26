@@ -63,6 +63,24 @@ def _truncate_body(text: str) -> str:
     return text[:_LOG_BODY_LIMIT]
 
 
+def _error_message(response: httpx.Response) -> str:
+    """``error.message`` из тела ответа OpenRouter, иначе начало тела."""
+    try:
+        data: Any = response.json()
+        message = data["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        return _truncate_body(response.text)
+    return _truncate_body(str(message))
+
+
+class RefusalHook(Protocol):
+    """Тревога владельцу (CLAUDE.md, "Интерфейсы: тревога владельцу"), реализация —
+    alerts.OwnerAlerter.provider_refused. Зовётся на каждый не-2xx ответ провайдера;
+    что из них считать отказом, решает сама реализация."""
+
+    async def __call__(self, *, status: int, model: str, message: str, now: int) -> None: ...
+
+
 class LLMClient:
     def __init__(
         self,
@@ -70,8 +88,10 @@ class LLMClient:
         cfg_getter: Callable[[], Config],
         db: _StateStore,
         http: httpx.AsyncClient | None = None,
+        on_refusal: RefusalHook | None = None,
     ) -> None:
         self._api_key = api_key
+        self._on_refusal = on_refusal
         self._cfg_getter = cfg_getter
         self._db = db
         self._http = (
@@ -187,6 +207,8 @@ class LLMClient:
                 _truncate_body(response.text),
             )
             await self._register_error(now, cfg)
+            await self._db.set_state("llm_last_error", f"{now}|{response.status_code}")
+            await self._notify_refusal(response, model=model, now=now)
             raise LLMError("llm:http")
 
         try:
@@ -258,6 +280,17 @@ class LLMClient:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
+
+    async def _notify_refusal(self, response: httpx.Response, *, model: str, now: int) -> None:
+        if self._on_refusal is None:
+            return
+        try:
+            await self._on_refusal(
+                status=response.status_code, model=model, message=_error_message(response), now=now
+            )
+        except Exception:
+            # Тревога — побочный канал: её сбой не должен менять исход вызова модели.
+            logger.exception("llm refusal hook failed")
 
     async def _register_error(self, now: int, cfg: Config) -> None:
         streak = await self._db.increment_state("llm_error_streak", by=1)
