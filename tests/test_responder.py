@@ -6051,7 +6051,7 @@ async def test_vocab_meaning_of_word_from_chat_goes_to_system(db: Database) -> N
         system = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
         assert "мелькнули словечки" in system
         assert "багнюка: промозглая погода" in system
-        assert "Можешь к месту употребить" not in system
+        assert "В этой реплике употреби" not in system
         assert "{vocab}" not in system
     finally:
         await responder.shutdown()
@@ -6079,7 +6079,7 @@ async def test_vocab_offer_then_counted_and_paused(db: Database) -> None:
     try:
         await _ambient(clock, responder)
         first = _payload(calls[0])["messages"][0]["content"]  # type: ignore[index]
-        assert "Можешь к месту употребить одно из этих словечек (сибирские словечки)" in first
+        assert "В этой реплике употреби одно из этих словечек (сибирские словечки)" in first
         assert len(bot.sent) == 1
         assert await db.get_state(day_key("vocab_count", DAY_NOW, cfg.persona.timezone)) == "1"
         assert await db.get_state("vocab_last") == f"{DAY_NOW}|айда"

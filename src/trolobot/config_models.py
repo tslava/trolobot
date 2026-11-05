@@ -610,7 +610,7 @@ class VocabConfig(BaseModel):
         description="Столько последних реплик должно пройти без словечек до следующего",
     )
     offer_size: int = Field(
-        default=3, ge=1, le=10, description="Сколько словечек на выбор предложить модели"
+        default=8, ge=1, le=10, description="Сколько словечек на выбор предложить модели"
     )
     meaning_context: int = Field(
         default=5,
