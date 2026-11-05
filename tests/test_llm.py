@@ -506,13 +506,16 @@ async def test_call_raw_respects_circuit_and_caps_same_as_call() -> None:
     assert len(calls) == 0
 
 
+WALL_NOW = NOW + 7200
+
+
 class RecordingHook:
     def __init__(self, *, fail: bool = False) -> None:
         self.calls: list[dict[str, object]] = []
         self.fail = fail
 
-    async def __call__(self, *, status: int, model: str, message: str, now: int) -> None:
-        self.calls.append({"status": status, "model": model, "message": message, "now": now})
+    async def __call__(self, *, status: int, model: str, message: str) -> None:
+        self.calls.append({"status": status, "model": model, "message": message})
         if self.fail:
             raise RuntimeError("hook broke")
 
@@ -520,7 +523,14 @@ class RecordingHook:
 def _hooked_client(handler: Handler, store: FakeStore, hook: RecordingHook) -> LLMClient:
     cfg = Config()
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return LLMClient(api_key=API_KEY, cfg_getter=lambda: cfg, db=store, http=http, on_refusal=hook)
+    return LLMClient(
+        api_key=API_KEY,
+        cfg_getter=lambda: cfg,
+        db=store,
+        http=http,
+        on_refusal=hook,
+        clock=lambda: WALL_NOW,
+    )
 
 
 async def test_http_error_calls_refusal_hook_with_provider_message() -> None:
@@ -540,10 +550,10 @@ async def test_http_error_calls_refusal_hook_with_provider_message() -> None:
             "status": 402,
             "model": "big/model",
             "message": "Prompt tokens limit exceeded: 5863 > 3332.",
-            "now": NOW,
         }
     ]
-    assert store.state["llm_last_error"] == f"{NOW}|402"
+    # Время отказа — по часам клиента, не now вызывающего (у фото это дата сообщения).
+    assert store.state["llm_last_error"] == f"{WALL_NOW}|402"
 
 
 async def test_refusal_hook_gets_raw_body_when_not_json() -> None:
@@ -595,3 +605,23 @@ async def test_refusal_hook_not_called_on_success_or_timeout() -> None:
 
     assert hook.calls == []
     assert "llm_last_error" not in store.state
+
+
+async def test_secrets_are_redacted_from_hook_and_log(caplog: pytest.LogCaptureFixture) -> None:
+    store = FakeStore()
+    hook = RecordingHook()
+    leaked = f"bad key {API_KEY}, also sk-or-v1-abcdef123 and Bearer xyz.token"
+    client = _hooked_client(
+        lambda _req: httpx.Response(401, json={"error": {"message": leaked}}), store, hook
+    )
+    try:
+        with pytest.raises(LLMError):
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    message = str(hook.calls[0]["message"])
+    for secret in (API_KEY, "sk-or-v1-abcdef123", "xyz.token"):
+        assert secret not in message
+        assert secret not in caplog.text
+    assert message.startswith("bad key ***")

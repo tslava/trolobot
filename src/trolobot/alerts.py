@@ -5,16 +5,22 @@
 кредиты), бот молчал, а заметили это только по разбору логов. Отказ провайдера
 (4xx, кроме таймаута и rate limit) — не случайный сбой, сам он не пройдёт, поэтому
 бот пишет владельцу сам: не чаще раза в ``llm.alert_interval_hours`` на код ответа.
+
+Ревью Codex 26.10: отправка идёт фоновой задачей (вызов модели под локом ответов не
+ждёт Telegram), время — по своим часам (``now`` вызывающего бывает датой старого
+сообщения), а слот «следующая тревога не раньше» занимается ДО отправки: если Telegram
+доставил, но ответ потерялся, повтора не будет. Не отправилось — следующая попытка
+через час, а не через сутки.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import time
 from collections.abc import Callable
 from typing import Protocol
-
-from aiogram.exceptions import TelegramAPIError
 
 from trolobot.config_models import Config
 
@@ -23,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Временные сбои: проходят сами, тревога по ним — шум.
 _TRANSIENT_STATUSES = frozenset({408, 429})
 _MESSAGE_LIMIT = 200
+_RETRY_AFTER_FAILURE_SEC = 3600
 _HINTS = {
     401: "ключ OpenRouter не принят, проверь OPENROUTER_API_KEY",
     402: "кончились кредиты, пополни на openrouter.ai/settings/credits",
@@ -64,35 +71,57 @@ class OwnerAlerter:
         db: _StateStore,
         admin_user_id: int,
         cfg_getter: Callable[[], Config],
+        clock: Callable[[], int] = lambda: int(time.time()),
     ) -> None:
         self._bot = bot
         self._db = db
         self._admin_user_id = admin_user_id
         self._cfg_getter = cfg_getter
-        # Параллельные вызовы модели получают 402 одновременно — без лока ушло бы
-        # несколько одинаковых сообщений.
+        self._clock = clock
+        # Параллельные вызовы модели получают 402 одновременно — без лока слот заняли
+        # бы несколько и ушло бы несколько одинаковых сообщений.
         self._lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task[None]] = set()
 
-    async def provider_refused(self, *, status: int, model: str, message: str, now: int) -> None:
+    async def provider_refused(self, *, status: int, model: str, message: str) -> None:
         cfg = self._cfg_getter().llm
         if not cfg.alert_owner or self._admin_user_id == 0 or not is_refusal(status):
             return
-        key = f"alert_last:llm_{status}"
+        key = f"alert_next:llm_{status}"
         async with self._lock:
-            last_raw = await self._db.get_state(key)
-            if last_raw is not None and now - int(last_raw) < cfg.alert_interval_hours * 3600:
+            now = self._clock()
+            next_raw = await self._db.get_state(key)
+            if next_raw is not None and now < int(next_raw):
                 return
-            text = render_alert(
-                status=status,
-                model=model,
-                message=message,
-                interval_hours=cfg.alert_interval_hours,
-            )
-            try:
-                await self._bot.send_message(self._admin_user_id, text)
-            except TelegramAPIError as exc:
-                # Не отметили отправку — следующий отказ попробует снова.
-                logger.warning("owner alert not sent: %s", type(exc).__name__)
-                return
-            await self._db.set_state(key, str(now))
-            logger.info("owner alert sent: llm status=%s model=%s", status, model)
+            await self._db.set_state(key, str(now + cfg.alert_interval_hours * 3600))
+        text = render_alert(
+            status=status,
+            model=model,
+            message=message,
+            interval_hours=cfg.alert_interval_hours,
+        )
+        task = asyncio.ensure_future(self._send(key, text, status=status, model=model))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _send(self, key: str, text: str, *, status: int, model: str) -> None:
+        try:
+            await self._bot.send_message(self._admin_user_id, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Тревога не ушла (или неизвестно, ушла ли) — следующая попытка через час.
+            # Любое исключение: фоновая задача никому его не отдаст.
+            logger.warning("owner alert not sent: %s", type(exc).__name__)
+            await self._db.set_state(key, str(self._clock() + _RETRY_AFTER_FAILURE_SEC))
+            return
+        logger.info("owner alert sent: llm status=%s model=%s", status, model)
+
+    async def shutdown(self) -> None:
+        """Отменить неотправленные тревоги: при остановке процесса они не нужны."""
+        tasks = [task for task in self._tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task

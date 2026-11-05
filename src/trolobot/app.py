@@ -58,6 +58,7 @@ async def main() -> None:
     callback_task: asyncio.Task[None] | None = None
     memory_task: asyncio.Task[None] | None = None
     llm: LLMClient | None = None
+    alerter: OwnerAlerter | None = None
     responder: Responder | None = None
     reaction_scheduler: ReactionScheduler | None = None
     weather: WeatherClient | None = None
@@ -314,6 +315,8 @@ async def main() -> None:
             await responder.shutdown()
         if reaction_scheduler is not None:
             await reaction_scheduler.shutdown()
+        if alerter is not None:
+            await alerter.shutdown()
         if llm is not None:
             await llm.aclose()
         if weather is not None:

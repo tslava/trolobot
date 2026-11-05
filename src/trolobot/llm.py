@@ -13,6 +13,8 @@ add_state_float), а не к конкретному Database: increment_state/ad
 from __future__ import annotations
 
 import logging
+import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -59,26 +61,40 @@ class LLMError(Exception):
         self.reason = reason
 
 
+# Ключи и заголовок авторизации, если провайдер или прокси вдруг вернёт их в теле
+# ошибки: тело уходит в лог и владельцу в личку (ревью Codex 26.10).
+_SECRET_RE = re.compile(r"sk-or-[\w-]+|Bearer\s+\S+", re.IGNORECASE)
+_REDACTED = "***"
+
+
+def _redact(text: str, api_key: str) -> str:
+    if api_key:
+        text = text.replace(api_key, _REDACTED)
+    return _SECRET_RE.sub(_REDACTED, text)
+
+
 def _truncate_body(text: str) -> str:
     return text[:_LOG_BODY_LIMIT]
 
 
-def _error_message(response: httpx.Response) -> str:
-    """``error.message`` из тела ответа OpenRouter, иначе начало тела."""
+def _error_message(response: httpx.Response, api_key: str) -> str:
+    """``error.message`` из тела ответа OpenRouter, иначе начало тела; без секретов.
+    Секреты вырезаются до обрезки, чтобы от ключа не остался видимый кусок."""
     try:
         data: Any = response.json()
-        message = data["error"]["message"]
+        message = str(data["error"]["message"])
     except (ValueError, KeyError, TypeError):
-        return _truncate_body(response.text)
-    return _truncate_body(str(message))
+        message = response.text
+    return _truncate_body(_redact(message, api_key))
 
 
 class RefusalHook(Protocol):
     """Тревога владельцу (CLAUDE.md, "Интерфейсы: тревога владельцу"), реализация —
     alerts.OwnerAlerter.provider_refused. Зовётся на каждый не-2xx ответ провайдера;
-    что из них считать отказом, решает сама реализация."""
+    что из них считать отказом, решает сама реализация. Времени не получает: ``now``
+    вызывающего бывает датой старого сообщения (описание фото), у тревоги свои часы."""
 
-    async def __call__(self, *, status: int, model: str, message: str, now: int) -> None: ...
+    async def __call__(self, *, status: int, model: str, message: str) -> None: ...
 
 
 class LLMClient:
@@ -89,9 +105,11 @@ class LLMClient:
         db: _StateStore,
         http: httpx.AsyncClient | None = None,
         on_refusal: RefusalHook | None = None,
+        clock: Callable[[], int] = lambda: int(time.time()),
     ) -> None:
         self._api_key = api_key
         self._on_refusal = on_refusal
+        self._clock = clock
         self._cfg_getter = cfg_getter
         self._db = db
         self._http = (
@@ -204,11 +222,12 @@ class LLMClient:
             logger.warning(
                 "llm http error: status=%s body=%s",
                 response.status_code,
-                _truncate_body(response.text),
+                _truncate_body(_redact(response.text, self._api_key)),
             )
             await self._register_error(now, cfg)
-            await self._db.set_state("llm_last_error", f"{now}|{response.status_code}")
-            await self._notify_refusal(response, model=model, now=now)
+            # Время по часам, а не now вызывающего: /status показывает, когда отказ был.
+            await self._db.set_state("llm_last_error", f"{self._clock()}|{response.status_code}")
+            await self._notify_refusal(response, model=model)
             raise LLMError("llm:http")
 
         try:
@@ -217,7 +236,7 @@ class LLMClient:
             logger.warning(
                 "llm invalid json: status=%s body=%s",
                 response.status_code,
-                _truncate_body(response.text),
+                _truncate_body(_redact(response.text, self._api_key)),
             )
             await self._register_error(now, cfg)
             raise LLMError("llm:http") from None
@@ -228,7 +247,7 @@ class LLMClient:
             logger.warning(
                 "llm malformed response: status=%s body=%s",
                 response.status_code,
-                _truncate_body(response.text),
+                _truncate_body(_redact(response.text, self._api_key)),
             )
             await self._register_error(now, cfg)
             raise LLMError("llm:http") from None
@@ -281,12 +300,14 @@ class LLMClient:
             completion_tokens=completion_tokens,
         )
 
-    async def _notify_refusal(self, response: httpx.Response, *, model: str, now: int) -> None:
+    async def _notify_refusal(self, response: httpx.Response, *, model: str) -> None:
         if self._on_refusal is None:
             return
         try:
             await self._on_refusal(
-                status=response.status_code, model=model, message=_error_message(response), now=now
+                status=response.status_code,
+                model=model,
+                message=_error_message(response, self._api_key),
             )
         except Exception:
             # Тревога — побочный канал: её сбой не должен менять исход вызова модели.
