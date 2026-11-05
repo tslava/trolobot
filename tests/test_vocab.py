@@ -193,6 +193,16 @@ def test_mya_noun_is_not_berem() -> None:
     assert _words(vocab, "два беремени") == ["беремя"]
 
 
+def test_short_mya_nouns_inflect() -> None:
+    """«имя», «семя» — короткие разносклоняемые: тоже от основы на «-ен» (ревью Codex 05.11)."""
+    raw = "name: x\nwords:\n  - {word: имя, meaning: m}\n  - {word: семя, meaning: m}"
+    vocab = Vocab([parse_vocab(raw)])
+    assert _words(vocab, "моё имя") == ["имя"]
+    assert _words(vocab, "об имени") == ["имя"]
+    assert _words(vocab, "о семени") == ["семя"]
+    assert _words(vocab, "именами") == ["имя"]
+
+
 @pytest.mark.parametrize("order", ["шарить first", "шариться first"])
 def test_reflexive_and_plain_verb_with_same_stem_do_not_collide(order: str) -> None:
     """«шарить» и «шариться» с одной основой: форма на «ся/сь» — только возвратному,

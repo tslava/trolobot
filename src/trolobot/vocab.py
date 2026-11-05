@@ -282,9 +282,9 @@ def _rules(word: str) -> list[tuple[str, frozenset[str], bool | None]]:
         rules.append((base[:-2], _NOMINAL_ENDINGS, None))
         if not base.endswith("ой"):  # «шишкобой» — существительное: шишкобо|ев
             return rules
-    if base.endswith("мя") and len(base) >= 5:
-        # Беремя, бремя: беремени, беременем. Общая основа «берем» с пустым окончанием
-        # путала его с «берём» (05.11, живой случай).
+    if base.endswith("мя") and len(base) >= 3:
+        # Беремя, бремя, имя, семя: беремени, беременем, об имени. Общая основа «берем»
+        # с пустым окончанием путала его с «берём» (05.11, живой случай).
         rules.append((base[:-1] + "ен", _MYA_ENDINGS, None))
         return rules
     stem = base[:-1] if base[-1] in _SOFT_ENDINGS else base
