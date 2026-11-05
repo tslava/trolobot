@@ -183,6 +183,26 @@ def test_kolbas_is_not_kolba() -> None:
     assert _words(vocab, "колбой пахнет") == ["колба"]
 
 
+def test_mya_noun_is_not_berem() -> None:
+    """«беремя» склоняется от «беремен-»; «берём» — не оно (живой случай 05.11)."""
+    vocab = Vocab([parse_vocab("name: x\nwords:\n  - {word: беремя, meaning: охапка}")])
+    assert _words(vocab, "Мы берём иногда") == []
+    assert _words(vocab, "берем всё подряд") == []
+    assert _words(vocab, "принёс беремя дров") == ["беремя"]
+    assert _words(vocab, "с беременем дров") == ["беремя"]
+    assert _words(vocab, "два беремени") == ["беремя"]
+
+
+def test_short_mya_nouns_inflect() -> None:
+    """«имя», «семя» — короткие разносклоняемые: тоже от основы на «-ен» (ревью Codex 05.11)."""
+    raw = "name: x\nwords:\n  - {word: имя, meaning: m}\n  - {word: семя, meaning: m}"
+    vocab = Vocab([parse_vocab(raw)])
+    assert _words(vocab, "моё имя") == ["имя"]
+    assert _words(vocab, "об имени") == ["имя"]
+    assert _words(vocab, "о семени") == ["семя"]
+    assert _words(vocab, "именами") == ["имя"]
+
+
 @pytest.mark.parametrize("order", ["шарить first", "шариться first"])
 def test_reflexive_and_plain_verb_with_same_stem_do_not_collide(order: str) -> None:
     """«шарить» и «шариться» с одной основой: форма на «ся/сь» — только возвратному,
@@ -294,7 +314,8 @@ def test_render_vocab_offer_and_meanings() -> None:
     vocab = _vocab()
     text = render_vocab(vocab.find("багнюка"), vocab.find("паут"))
     first, second = text.split("\n")
-    assert first.startswith("Можешь к месту употребить одно из этих словечек (сибирские")
+    assert first.startswith("В этой реплике употреби одно из этих словечек (сибирские")
+    assert "Не меняй ради словечка, о чём говоришь" in first
     assert "Багнюка (промозглая, сырая погода (томское); «На улице багнюка, куда ты?»)" in first
     assert second == (
         "Справка: в разговоре мелькнули словечки. Если спросят, что они значат, объясни "
@@ -435,7 +456,7 @@ def test_render_vocab_requested_header() -> None:
     vocab = _vocab()
     text = render_vocab(vocab.find("айда"), [], requested=True)
     assert text.startswith("Тебя просят сказать по-своему: употреби одно-два из этих словечек")
-    assert "Можешь к месту" not in text
+    assert "В этой реплике употреби" not in text
 
 
 def test_pick_offer_fill_takes_recent_when_unused_run_out() -> None:
