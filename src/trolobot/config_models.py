@@ -96,6 +96,21 @@ TELEGRAM_REACTIONS: frozenset[str] = frozenset(
     }
 )
 
+# Палитра реакций по умолчанию (решение владельца 05.11.2026): за 10 дней из трёх эмодзи
+# 🤣 было 21 раз, 👍 8, 💩 ни разу — у «смешно» был один вариант, а 👍 и 💩 описаны
+# одинаково. Описание уходит модели выбора реакции, по нему она различает оттенки.
+# Замер на 150 случаях: просьбу «не повторяйся» модель не слушает (34 из 41 стали 😁),
+# поэтому повтор ограничивает код — ReactionsConfig.max_repeat.
+DEFAULT_REACTION_EMOJI: dict[str, str] = {
+    "🤣": "смешно до слёз: шутка, над которой правда смеёшься",
+    "😁": "улыбнуло: удачная шутка, но не до слёз",
+    "👍": "одобряю всерьёз: дельная мысль, хорошее дело",
+    "💩": "одобряю по-свойски, с подколкой: так принято в этом чате",
+    "🔥": "здорово, впечатляет: поездка, покупка, вещь своими руками",
+    "👏": "молодец: доделал, справился, добился",
+    "🍾": "повод отметить: праздник, большая хорошая новость",
+}
+
 
 def _validate_hhmm(value: str) -> str:
     if not _HHMM_RE.match(value):
@@ -218,9 +233,15 @@ class ReactionsConfig(BaseModel):
     daily_cap: int = Field(
         default=8, ge=0, le=100, description="Потолок реакций в сутки, отдельно от ambient/mention"
     )
-    emoji: list[str] = Field(
-        default_factory=lambda: ["👍", "💩", "🤣"],
-        description="Из чего выбирается реакция; только из набора реакций Telegram (не 😂)",
+    emoji: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_REACTION_EMOJI),
+        description="Эмодзи -> когда уместно (видит модель); только из набора реакций Telegram",
+    )
+    max_repeat: int = Field(
+        default=2,
+        ge=0,
+        le=20,
+        description="Одно эмодзи не больше N раз подряд; 0 — без ограничения",
     )
     delay_sec: tuple[int, int] = Field(
         default=(20, 120),
@@ -243,16 +264,23 @@ class ReactionsConfig(BaseModel):
         default=6, ge=1, le=30, description="Сколько последних сообщений чата показать модели"
     )
 
+    @field_validator("emoji", mode="before")
+    @classmethod
+    def _emoji_list_to_dict(cls, value: object) -> object:
+        # Прежний формат — список без описаний (`/set behaviour.reactions.emoji [👍, 🤣]`).
+        if isinstance(value, list):
+            return {str(e): "" for e in value}
+        return value
+
     @field_validator("emoji")
     @classmethod
-    def _validate_non_empty(cls, value: list[str]) -> list[str]:
+    def _validate_non_empty(cls, value: dict[str, str]) -> dict[str, str]:
         if not value:
             raise ValueError("reactions.emoji must not be empty")
         # Клавиатура телефона дописывает вариационный селектор U+FE0F («❤️»), а в наборе
         # реакций Telegram эмодзи без него («❤») — срезаем, чтобы /set не отвергал
         # правильную реакцию и в Telegram уходила ровно та форма, что в наборе.
-        value = [e.replace("\ufe0f", "") for e in value]
-        return value
+        return {e.replace("\ufe0f", ""): meaning.strip() for e, meaning in value.items()}
 
     @field_validator("delay_sec")
     @classmethod
@@ -962,6 +990,12 @@ class LlmConfig(BaseModel):
     )
     circuit_pause_min: int = Field(
         default=30, ge=0, le=1440, description="Минуты паузы после срабатывания предохранителя"
+    )
+    alert_owner: bool = Field(
+        default=True, description="Писать владельцу в личку, если провайдер отказывает (4xx)"
+    )
+    alert_interval_hours: int = Field(
+        default=24, ge=1, le=168, description="Не чаще раза в столько часов на один код ответа"
     )
     # Fallback-цены за 1M токенов: используются, только если провайдер не вернул usage.cost.
     price_in_usd_per_1m: float = Field(

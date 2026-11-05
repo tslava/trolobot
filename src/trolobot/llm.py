@@ -13,12 +13,15 @@ add_state_float), а не к конкретному Database: increment_state/ad
 from __future__ import annotations
 
 import logging
+import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
 
+from trolobot.alerts import is_refusal
 from trolobot.config_models import Config
 from trolobot.timeutil import day_key
 
@@ -59,8 +62,40 @@ class LLMError(Exception):
         self.reason = reason
 
 
+# Ключи и заголовок авторизации, если провайдер или прокси вдруг вернёт их в теле
+# ошибки: тело уходит в лог и владельцу в личку (ревью Codex 26.10).
+_SECRET_RE = re.compile(r"sk-or-[\w-]+|Bearer\s+\S+", re.IGNORECASE)
+_REDACTED = "***"
+
+
+def _redact(text: str, api_key: str) -> str:
+    if api_key:
+        text = text.replace(api_key, _REDACTED)
+    return _SECRET_RE.sub(_REDACTED, text)
+
+
 def _truncate_body(text: str) -> str:
     return text[:_LOG_BODY_LIMIT]
+
+
+def _error_message(response: httpx.Response, api_key: str) -> str:
+    """``error.message`` из тела ответа OpenRouter, иначе начало тела; без секретов.
+    Секреты вырезаются до обрезки, чтобы от ключа не остался видимый кусок."""
+    try:
+        data: Any = response.json()
+        message = str(data["error"]["message"])
+    except (ValueError, KeyError, TypeError):
+        message = response.text
+    return _truncate_body(_redact(message, api_key))
+
+
+class RefusalHook(Protocol):
+    """Тревога владельцу (CLAUDE.md, "Интерфейсы: тревога владельцу"), реализация —
+    alerts.OwnerAlerter.provider_refused. Зовётся на каждый не-2xx ответ провайдера;
+    что из них считать отказом, решает сама реализация. Времени не получает: ``now``
+    вызывающего бывает датой старого сообщения (описание фото), у тревоги свои часы."""
+
+    async def __call__(self, *, status: int, model: str, message: str) -> None: ...
 
 
 class LLMClient:
@@ -70,8 +105,12 @@ class LLMClient:
         cfg_getter: Callable[[], Config],
         db: _StateStore,
         http: httpx.AsyncClient | None = None,
+        on_refusal: RefusalHook | None = None,
+        clock: Callable[[], int] = lambda: int(time.time()),
     ) -> None:
         self._api_key = api_key
+        self._on_refusal = on_refusal
+        self._clock = clock
         self._cfg_getter = cfg_getter
         self._db = db
         self._http = (
@@ -184,9 +223,16 @@ class LLMClient:
             logger.warning(
                 "llm http error: status=%s body=%s",
                 response.status_code,
-                _truncate_body(response.text),
+                _truncate_body(_redact(response.text, self._api_key)),
             )
             await self._register_error(now, cfg)
+            if is_refusal(response.status_code):
+                # Только отказы (402, 401…): свежий 429 или 5xx не должен затирать в /status
+                # настоящий отказ. Время по часам, а не now вызывающего (у фото — дата сообщения).
+                await self._db.set_state(
+                    "llm_last_refusal", f"{self._clock()}|{response.status_code}"
+                )
+            await self._notify_refusal(response, model=model)
             raise LLMError("llm:http")
 
         try:
@@ -195,7 +241,7 @@ class LLMClient:
             logger.warning(
                 "llm invalid json: status=%s body=%s",
                 response.status_code,
-                _truncate_body(response.text),
+                _truncate_body(_redact(response.text, self._api_key)),
             )
             await self._register_error(now, cfg)
             raise LLMError("llm:http") from None
@@ -206,7 +252,7 @@ class LLMClient:
             logger.warning(
                 "llm malformed response: status=%s body=%s",
                 response.status_code,
-                _truncate_body(response.text),
+                _truncate_body(_redact(response.text, self._api_key)),
             )
             await self._register_error(now, cfg)
             raise LLMError("llm:http") from None
@@ -258,6 +304,19 @@ class LLMClient:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
+
+    async def _notify_refusal(self, response: httpx.Response, *, model: str) -> None:
+        if self._on_refusal is None:
+            return
+        try:
+            await self._on_refusal(
+                status=response.status_code,
+                model=model,
+                message=_error_message(response, self._api_key),
+            )
+        except Exception:
+            # Тревога — побочный канал: её сбой не должен менять исход вызова модели.
+            logger.exception("llm refusal hook failed")
 
     async def _register_error(self, now: int, cfg: Config) -> None:
         streak = await self._db.increment_state("llm_error_streak", by=1)

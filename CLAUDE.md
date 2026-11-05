@@ -2138,6 +2138,34 @@ def render_self_share(share: SelfShare, days: int) -> str
 #   _parse_choice: "emoji": "null" строкой -> отказ (None), без WARNING про эмодзи вне списка.
 ```
 
+## Интерфейсы: палитра реакций
+
+Решение владельца 05.11.2026: за 26.10–05.11 из 29 реакций 21 была 🤣, 8 — 👍, 💩 — ни одной с середины
+октября. Причины: на «смешно» был один вариант, 👍 и 💩 описаны одинаково («одобряю»). Палитра шире и с
+оттенками, описание каждого эмодзи — в конфиге, а не в промпте. Замер на 150 прошлых случаях: список своих
+последних реакций в промпте с просьбой «не повторяйся» модель не слушает (34 из 41 стали 😁), поэтому повтор
+ограничивает код.
+
+```python
+# config_models.py
+DEFAULT_REACTION_EMOJI: dict[str, str]   # 🤣 смешно до слёз, 😁 улыбнуло, 👍 одобряю всерьёз,
+                                         # 💩 одобряю по-свойски, 🔥 впечатляет, 👏 молодец, 🍾 повод отметить
+# ReactionsConfig.emoji: list[str] -> dict[str, str] (эмодзи -> когда уместно); before-валидатор принимает
+#   прежний список (описания пустые) — /set списком работает; U+FE0F срезается с ключей; валидатор Config —
+#   ключи ⊆ TELEGRAM_REACTIONS, как раньше.
+# ReactionsConfig.max_repeat: int = Field(2, ge=0, le=20)  # одно эмодзи не больше N раз подряд; 0 — без ограничения
+# db.py: async def recent_reactions(self, limit: int) -> list[str]   # filter_log react:sent, candidate_text, хронологически
+# reactions.py:
+def palette_without_repeats(emoji: Mapping[str, str], recent: Sequence[str], max_repeat: int) -> dict[str, str]
+#   последние max_repeat реакций — одно и то же эмодзи -> его нет в палитре; единственное эмодзи не убирается.
+#   ReactionChooser.choose(..., allowed: Mapping[str, str], ...) — слот {emoji}: по строке «эмодзи — описание»
+#   (пустое описание -> только эмодзи). ReactionScheduler: allowed = palette_without_repeats(emoji,
+#   db.recent_reactions(max_repeat), max_repeat). Режим semantic: false (кубик) повтор не ограничивает.
+#   pick_reaction/_fallback_emoji: заглушка — первый ключ, кубик — rng.choice(list(emoji)).
+# prompts/reaction.txt: критерии те же (почти всегда null; беда, жалоба, дети всерьёз, непонятное — null;
+#   «обычная реплика в тему — тоже null»); конкретные эмодзи в тексте не названы — палитра из конфига.
+```
+
 ## Интерфейсы: словечки из словаря
 
 Решение владельца 17.10.2026: персонаж изредка и к месту употребляет словечки из загружаемого словаря
@@ -2299,6 +2327,40 @@ async def preview(self, text: str, display_name: str, user_id: int = 0) -> Previ
 # чата), иначе sanitize_display_name(full_name). Ответ: «Ответил бы: …» [+ «Фильтр отметил, но пропустил
 # (shadow): …»] | «Промолчал бы (модель решила не отвечать).» | «Не ответил бы: llm:…» | «Не ответил бы, срезал
 # бы фильтр: …» + «Кандидат: …»; [«Правки: fix:…»]; последней строкой «(в чат не отправлено)». Без аудита.
+```
+
+## Интерфейсы: тревога владельцу
+
+Решение владельца 26.10.2026: с 22.10 OpenRouter четыре дня отвечал 402 (кончились кредиты), основная модель
+не вызывалась, бот молчал, а «ошибок подряд» в `/status` было 0 — дешёвые модели проходили и сбрасывали серию.
+Отказ провайдера сам не пройдёт, поэтому бот пишет владельцу в личку.
+
+```python
+# config_models.LlmConfig += alert_owner: bool = True; alert_interval_hours: int = Field(24, ge=1, le=168)
+# llm.py: class RefusalHook(Protocol): async __call__(*, status, model, message) -> None   # без now: см. ниже
+#   LLMClient(..., on_refusal: RefusalHook | None = None, clock=lambda: int(time.time())). На каждый не-2xx
+#   ответ: _register_error как раньше, is_refusal(status) -> set_state("llm_last_refusal", "<clock()>|<status>") (временные 408/429/5xx не затирают отказ), затем hook(status,
+#   model, message=error.message из JSON или начало тела, ≤ 200). Исключение хука -> logger.exception, исход
+#   вызова прежний (LLMError("llm:http")). Таймаут и транспортные ошибки хук не зовут.
+#   _redact: ключ из настроек, «sk-or-…» и «Bearer …» -> «***» в message хука и во всех логах тела ответа;
+#   вырезается ДО обрезки до 200 символов (иначе от ключа остался бы кусок).
+# alerts.py
+def is_refusal(status: int) -> bool          # 4xx, кроме 408 и 429
+def render_alert(*, status, model, message, interval_hours) -> str   # код + подсказка (402 кредиты, 401 ключ), модель, ответ
+class OwnerAlerter:
+    def __init__(self, *, bot, db, admin_user_id: int, cfg_getter, clock=lambda: int(time.time())) -> None
+    async def provider_refused(self, *, status, model, message) -> None
+    # alert_owner и admin_user_id != 0 и is_refusal -> под asyncio.Lock: now = clock() (НЕ now вызывающего: у
+    # описания фото это дата старого сообщения); state alert_next:llm_<status> > now -> выход; иначе слот
+    # занимается ДО отправки: set_state(alert_next, now + alert_interval_hours*3600) — потерянный ответ Telegram
+    # не даст повтора. Отправка — фоновая asyncio.Task (вызов модели идёт под локом ответов и Telegram не ждёт);
+    # любое исключение отправки и отмена (shutdown посреди отправки) -> alert_next = clock() + 3600
+    # (повтор через час, не через сутки); исключение — WARNING, отмена пробрасывается.
+    async def shutdown(self) -> None         # отменить неотправленные; app.py зовёт в finally
+# app.py: OwnerAlerter(bot=bot, db=db, admin_user_id=settings.admin_user_id, cfg_getter=config_store.get) ->
+#   LLMClient(on_refusal=alerter.provider_refused). replay/places_fill/stickers_fill — без хука.
+# commands.py /status: строка предохранителя += «последний отказ провайдера: 402 в HH:MM dd.mm» (моложе суток)
+#   или «нет за сутки».
 ```
 
 ## Конвенции

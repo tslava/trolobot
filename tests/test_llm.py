@@ -504,3 +504,144 @@ async def test_call_raw_respects_circuit_and_caps_same_as_call() -> None:
 
     assert excinfo.value.reason == "llm:calls_cap"
     assert len(calls) == 0
+
+
+WALL_NOW = NOW + 7200
+
+
+class RecordingHook:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.fail = fail
+
+    async def __call__(self, *, status: int, model: str, message: str) -> None:
+        self.calls.append({"status": status, "model": model, "message": message})
+        if self.fail:
+            raise RuntimeError("hook broke")
+
+
+def _hooked_client(handler: Handler, store: FakeStore, hook: RecordingHook) -> LLMClient:
+    cfg = Config()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return LLMClient(
+        api_key=API_KEY,
+        cfg_getter=lambda: cfg,
+        db=store,
+        http=http,
+        on_refusal=hook,
+        clock=lambda: WALL_NOW,
+    )
+
+
+async def test_http_error_calls_refusal_hook_with_provider_message() -> None:
+    store = FakeStore()
+    hook = RecordingHook()
+    body = {"error": {"message": "Prompt tokens limit exceeded: 5863 > 3332.", "code": 402}}
+    client = _hooked_client(lambda _req: httpx.Response(402, json=body), store, hook)
+    try:
+        with pytest.raises(LLMError) as excinfo:
+            await client.call(MESSAGES, model="big/model", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    assert excinfo.value.reason == "llm:http"
+    assert hook.calls == [
+        {
+            "status": 402,
+            "model": "big/model",
+            "message": "Prompt tokens limit exceeded: 5863 > 3332.",
+        }
+    ]
+    # Время отказа — по часам клиента, не now вызывающего (у фото это дата сообщения).
+    assert store.state["llm_last_refusal"] == f"{WALL_NOW}|402"
+
+
+async def test_refusal_hook_gets_raw_body_when_not_json() -> None:
+    store = FakeStore()
+    hook = RecordingHook()
+    client = _hooked_client(lambda _req: httpx.Response(500, text="bad gateway"), store, hook)
+    try:
+        with pytest.raises(LLMError):
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    assert hook.calls[0]["status"] == 500
+    assert hook.calls[0]["message"] == "bad gateway"
+
+
+async def test_refusal_hook_failure_keeps_llm_http_reason() -> None:
+    store = FakeStore()
+    hook = RecordingHook(fail=True)
+    client = _hooked_client(lambda _req: httpx.Response(402, json={}), store, hook)
+    try:
+        with pytest.raises(LLMError) as excinfo:
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    assert excinfo.value.reason == "llm:http"
+    assert store.state["llm_error_streak"] == "1"
+
+
+async def test_refusal_hook_not_called_on_success_or_timeout() -> None:
+    store = FakeStore()
+    hook = RecordingHook()
+    client = _hooked_client(lambda _req: _ok_response(), store, hook)
+    try:
+        await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    def timeout(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow")
+
+    client = _hooked_client(timeout, store, hook)
+    try:
+        with pytest.raises(LLMError):
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    assert hook.calls == []
+    assert "llm_last_refusal" not in store.state
+
+
+async def test_secrets_are_redacted_from_hook_and_log(caplog: pytest.LogCaptureFixture) -> None:
+    store = FakeStore()
+    hook = RecordingHook()
+    leaked = f"bad key {API_KEY}, also sk-or-v1-abcdef123 and Bearer xyz.token"
+    client = _hooked_client(
+        lambda _req: httpx.Response(401, json={"error": {"message": leaked}}), store, hook
+    )
+    try:
+        with pytest.raises(LLMError):
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+
+    message = str(hook.calls[0]["message"])
+    for secret in (API_KEY, "sk-or-v1-abcdef123", "xyz.token"):
+        assert secret not in message
+        assert secret not in caplog.text
+    assert message.startswith("bad key ***")
+
+
+async def test_transient_error_does_not_overwrite_last_refusal() -> None:
+    store = FakeStore()
+    hook = RecordingHook()
+    client = _hooked_client(lambda _req: httpx.Response(402, json={}), store, hook)
+    try:
+        with pytest.raises(LLMError):
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+    for status in (429, 503):
+        client = _hooked_client(lambda _req, s=status: httpx.Response(s, json={}), store, hook)
+        try:
+            with pytest.raises(LLMError):
+                await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+        finally:
+            await client.aclose()
+
+    assert store.state["llm_last_refusal"] == f"{WALL_NOW}|402"

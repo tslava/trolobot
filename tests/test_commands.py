@@ -1607,6 +1607,28 @@ async def test_status_shows_circuit_closed_when_key_expired(
     assert "Предохранитель LLM: закрыт, ошибок подряд: 5" in text
 
 
+async def test_status_shows_last_provider_refusal_for_a_day(
+    monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
+) -> None:
+    """22–26.10.2026 дешёвые модели сбрасывали «ошибок подряд», пока основная получала
+    402 — /status показывает последний отказ отдельно, сутки после него."""
+    settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
+    deps, db, _, _ = _deps(settings=settings, config=config)
+    now = int(NOW.timestamp())
+    db.state["llm_last_refusal"] = f"{now - 3600}|402"
+    handler = _handler(deps)
+
+    message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
+    await handler(message)
+
+    expected = local_dt(now - 3600, config.persona.timezone).strftime("%H:%M %d.%m")
+    assert f"последний отказ провайдера: 402 в {expected}" in sent[0]
+
+    db.state["llm_last_refusal"] = f"{now - 86400}|402"
+    await handler(message)
+    assert "последний отказ провайдера: нет за сутки" in sent[1]
+
+
 async def test_status_shows_stop_only_while_active(
     monkeypatch: pytest.MonkeyPatch, config: Config, sent: list[str]
 ) -> None:
