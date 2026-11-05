@@ -435,4 +435,4 @@ def test_reactions_emoji_rofl_accepted_without_allowed_emoji() -> None:
 def test_reactions_emoji_variation_selector_is_stripped() -> None:
     """С клавиатуры приходит «❤️» (с U+FE0F), в наборе Telegram — «❤»."""
     cfg = Config.model_validate({"behaviour": {"reactions": {"emoji": ["👍", "❤\ufe0f"]}}})
-    assert cfg.behaviour.reactions.emoji == ["👍", "❤"]
+    assert list(cfg.behaviour.reactions.emoji) == ["👍", "❤"]

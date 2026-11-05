@@ -19,7 +19,7 @@ def test_parse_real_changelog_latest_is_0_9_0_with_date_and_nonempty_blocks() ->
     releases = parse_changelog(REAL_CHANGELOG)
 
     assert releases[0].version == "0.9.0"
-    assert releases[0].date == "2026-10-26"
+    assert releases[0].date == "2026-11-05"
     assert releases[0].for_chat.strip() != ""
     assert releases[0].for_owner.strip() != ""
 

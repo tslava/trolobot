@@ -614,6 +614,19 @@ class Database:
         rows = await cursor.fetchall()
         return [(str(row["reason"]), int(row["cnt"])) for row in rows]
 
+    async def recent_reactions(self, limit: int) -> list[str]:
+        """Последние поставленные реакции (filter_log react:sent), хронологически."""
+        conn = self._require_conn()
+        cursor = await conn.execute(
+            "SELECT candidate_text FROM filter_log WHERE stage = 'react' AND reason = 'react:sent' "
+            "AND candidate_text IS NOT NULL ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        emoji = [str(row["candidate_text"]) for row in rows]
+        emoji.reverse()
+        return emoji
+
     async def recent_bot_replies(self, limit: int) -> list[str]:
         conn = self._require_conn()
         cursor = await conn.execute(

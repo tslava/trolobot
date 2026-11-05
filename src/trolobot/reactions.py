@@ -35,7 +35,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final, Literal, Protocol
@@ -91,6 +91,29 @@ _GT_RUN_RE = re.compile(r">{3,}")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 _SLOT_RE = re.compile(r"\{(context|name|text|emoji|reply_to)\}")
+
+
+def _render_palette(allowed: Mapping[str, str]) -> str:
+    """Слот {emoji}: по строке «эмодзи — когда уместно» (решение владельца 05.11.2026:
+    без описаний модель различала только «смешно» и «одобряю» и ставила 🤣 почти всегда)."""
+    return "\n".join(f"{e} — {meaning}" if meaning else e for e, meaning in allowed.items())
+
+
+def palette_without_repeats(
+    emoji: Mapping[str, str], recent: Sequence[str], max_repeat: int
+) -> dict[str, str]:
+    """Палитра без эмодзи, которое стояло последние ``max_repeat`` раз подряд.
+
+    Замер 05.11.2026 на 150 прошлых случаях: просьбу в промпте не повторяться модель
+    не слушает, поэтому повтор ограничивает код. ``recent`` — хронологически.
+    Единственное эмодзи палитры не убирается: пустой выбор хуже повтора."""
+    palette = dict(emoji)
+    if max_repeat <= 0 or len(recent) < max_repeat or len(palette) <= 1:
+        return palette
+    tail = {e.replace("\ufe0f", "") for e in recent[-max_repeat:]}
+    if len(tail) == 1:
+        palette.pop(tail.pop(), None)
+    return palette
 
 
 def _strip_fake_delimiters(text: str) -> str:
@@ -185,7 +208,7 @@ def pick_reaction(
     seed так стабильнее (ровно как одиннадцатый шаг гейта — последний).
 
     При ``cfg.semantic`` (CLAUDE.md, "Интерфейсы: реакции с задержкой и смыслом")
-    шаг «кубик» пропускается и возвращается заглушка ``cfg.emoji[0]``: фильтром
+    шаг «кубик» пропускается и возвращается заглушка — первое из ``cfg.emoji``: фильтром
     служит модель (``ReactionChooser``), а не вероятность, и конкретное эмодзи
     выбирает тоже она — здесь важно лишь «реакция в принципе возможна».
     """
@@ -200,10 +223,10 @@ def pick_reaction(
     if state.last_reaction_user_id is not None and state.last_reaction_user_id == user_id:
         return None
     if cfg.semantic:
-        return cfg.emoji[0]
+        return next(iter(cfg.emoji))
     if rng.random() >= cfg.probability:
         return None
-    return rng.choice(cfg.emoji)
+    return rng.choice(list(cfg.emoji))
 
 
 async def load_reaction_state(db: Database, tz: str, now: int) -> ReactionState:
@@ -341,12 +364,13 @@ class ReactionChooser:
         text: str,
         display_name: str,
         context_rows: Sequence[MessageRow],
-        allowed: Sequence[str],
+        allowed: Mapping[str, str],
         now: int,
         reply_to: ReplyTarget = None,
     ) -> str | None:
-        """``reply_to`` — сообщение, на которое ответил автор: ``None`` — не ответ,
-        ``REPLY_UNAVAILABLE`` — ответ, но цели не видно."""
+        """``allowed`` — эмодзи -> когда уместно; ``reply_to`` — сообщение, на которое
+        ответил автор: ``None`` — не ответ, ``REPLY_UNAVAILABLE`` — ответ, но цели не
+        видно."""
         cfg = self._cfg_getter()
         reactions_cfg = cfg.behaviour.reactions
         model = reactions_cfg.model or cfg.llm.judge_model
@@ -360,7 +384,7 @@ class ReactionChooser:
             "context": context or _CONTEXT_EMPTY,
             "name": _strip_fake_delimiters(display_name).strip(),
             "text": _strip_fake_delimiters(text).strip(),
-            "emoji": " ".join(allowed),
+            "emoji": _render_palette(allowed),
             "reply_to": _render_reply_to(reply_to),
         }
         system = _SLOT_RE.sub(lambda m: slot_values[m.group(1)], self._prompt_template)
@@ -510,11 +534,18 @@ class ReactionScheduler:
         if reactions_cfg.semantic and self._chooser is not None:
             rows = await self._db.recent_messages(chat_id, reactions_cfg.context_messages + 1)
             context_rows = [row for row in rows if row.tg_message_id != tg_message_id]
+            recent = (
+                await self._db.recent_reactions(reactions_cfg.max_repeat)
+                if reactions_cfg.max_repeat > 0
+                else []
+            )
             emoji = await self._chooser.choose(
                 text=text,
                 display_name=display_name,
                 context_rows=context_rows,
-                allowed=reactions_cfg.emoji,
+                allowed=palette_without_repeats(
+                    reactions_cfg.emoji, recent, reactions_cfg.max_repeat
+                ),
                 now=now,
                 reply_to=await self._reply_target(chat_id, tg_message_id),
             )
@@ -578,7 +609,7 @@ class ReactionScheduler:
         бросаем его здесь: иначе реакция ставилась бы на каждый подходящий срез."""
         if cfg.semantic and self._rng.random() >= cfg.probability:
             return None
-        return self._rng.choice(cfg.emoji)
+        return self._rng.choice(list(cfg.emoji))
 
     async def shutdown(self) -> None:
         """Отменяет все ждущие задачи. Незавершённые реакции теряются — это нормально."""
