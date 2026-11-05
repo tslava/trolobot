@@ -108,6 +108,9 @@ class OwnerAlerter:
         try:
             await self._bot.send_message(self._admin_user_id, text)
         except asyncio.CancelledError:
+            # Остановка процесса посреди отправки: слот занят на весь интервал, а тревога,
+            # возможно, не ушла — после рестарта повтор через час, не через сутки.
+            await self._db.set_state(key, str(self._clock() + _RETRY_AFTER_FAILURE_SEC))
             raise
         except Exception as exc:
             # Тревога не ушла (или неизвестно, ушла ли) — следующая попытка через час.

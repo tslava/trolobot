@@ -1615,7 +1615,7 @@ async def test_status_shows_last_provider_refusal_for_a_day(
     settings = _make_settings(monkeypatch, allowed_chat_id=OWN_CHAT_ID, admin_user_id=ADMIN_ID)
     deps, db, _, _ = _deps(settings=settings, config=config)
     now = int(NOW.timestamp())
-    db.state["llm_last_error"] = f"{now - 3600}|402"
+    db.state["llm_last_refusal"] = f"{now - 3600}|402"
     handler = _handler(deps)
 
     message = _message(chat=_private_chat(ADMIN_ID), from_user=_user(ADMIN_ID), text="/status")
@@ -1624,7 +1624,7 @@ async def test_status_shows_last_provider_refusal_for_a_day(
     expected = local_dt(now - 3600, config.persona.timezone).strftime("%H:%M %d.%m")
     assert f"последний отказ провайдера: 402 в {expected}" in sent[0]
 
-    db.state["llm_last_error"] = f"{now - 86400}|402"
+    db.state["llm_last_refusal"] = f"{now - 86400}|402"
     await handler(message)
     assert "последний отказ провайдера: нет за сутки" in sent[1]
 

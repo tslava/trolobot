@@ -185,7 +185,11 @@ async def test_hanging_telegram_does_not_block_caller() -> None:
     await asyncio.wait_for(bot.started.wait(), 1)
     # Слот занят до отправки: второй отказ не ждёт и не шлёт повтор.
     await asyncio.wait_for(alerter.provider_refused(status=402, model="m", message=""), 1)
+    assert store.state["alert_next:llm_402"] == str(NOW + 24 * 3600)
+
+    # Остановка посреди отправки: повтор через час, а не через сутки.
     await alerter.shutdown()
+    assert store.state["alert_next:llm_402"] == str(NOW + 3600)
 
 
 async def test_send_failure_retries_in_an_hour(caplog: pytest.LogCaptureFixture) -> None:

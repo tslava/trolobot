@@ -553,7 +553,7 @@ async def test_http_error_calls_refusal_hook_with_provider_message() -> None:
         }
     ]
     # Время отказа — по часам клиента, не now вызывающего (у фото это дата сообщения).
-    assert store.state["llm_last_error"] == f"{WALL_NOW}|402"
+    assert store.state["llm_last_refusal"] == f"{WALL_NOW}|402"
 
 
 async def test_refusal_hook_gets_raw_body_when_not_json() -> None:
@@ -604,7 +604,7 @@ async def test_refusal_hook_not_called_on_success_or_timeout() -> None:
         await client.aclose()
 
     assert hook.calls == []
-    assert "llm_last_error" not in store.state
+    assert "llm_last_refusal" not in store.state
 
 
 async def test_secrets_are_redacted_from_hook_and_log(caplog: pytest.LogCaptureFixture) -> None:
@@ -625,3 +625,23 @@ async def test_secrets_are_redacted_from_hook_and_log(caplog: pytest.LogCaptureF
         assert secret not in message
         assert secret not in caplog.text
     assert message.startswith("bad key ***")
+
+
+async def test_transient_error_does_not_overwrite_last_refusal() -> None:
+    store = FakeStore()
+    hook = RecordingHook()
+    client = _hooked_client(lambda _req: httpx.Response(402, json={}), store, hook)
+    try:
+        with pytest.raises(LLMError):
+            await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+    finally:
+        await client.aclose()
+    for status in (429, 503):
+        client = _hooked_client(lambda _req, s=status: httpx.Response(s, json={}), store, hook)
+        try:
+            with pytest.raises(LLMError):
+                await client.call(MESSAGES, model="m", max_tokens=50, now=NOW)
+        finally:
+            await client.aclose()
+
+    assert store.state["llm_last_refusal"] == f"{WALL_NOW}|402"

@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from trolobot.alerts import is_refusal
 from trolobot.config_models import Config
 from trolobot.timeutil import day_key
 
@@ -225,8 +226,12 @@ class LLMClient:
                 _truncate_body(_redact(response.text, self._api_key)),
             )
             await self._register_error(now, cfg)
-            # Время по часам, а не now вызывающего: /status показывает, когда отказ был.
-            await self._db.set_state("llm_last_error", f"{self._clock()}|{response.status_code}")
+            if is_refusal(response.status_code):
+                # Только отказы (402, 401…): свежий 429 или 5xx не должен затирать в /status
+                # настоящий отказ. Время по часам, а не now вызывающего (у фото — дата сообщения).
+                await self._db.set_state(
+                    "llm_last_refusal", f"{self._clock()}|{response.status_code}"
+                )
             await self._notify_refusal(response, model=model)
             raise LLMError("llm:http")
 

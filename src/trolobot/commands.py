@@ -488,7 +488,7 @@ async def _cmd_resume(message: Message, deps: _CommandsDeps, now: int, user: Use
     await _reply(message, text)
 
 
-def _llm_last_error(raw: str | None, now: int, tz: str) -> str:
+def _llm_last_refusal(raw: str | None, now: int, tz: str) -> str:
     """«402 в 13:28 26.10» за последние сутки, иначе «нет за сутки». «Ошибок подряд»
     этого не покажет: 22–26.10 дешёвые модели проходили и сбрасывали серию, пока
     основная получала 402 на каждый вызов."""
@@ -522,7 +522,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         if circuit_until > now:
             circuit_state = f"открыт до {local_dt(circuit_until, tz).strftime('%H:%M')}"
     llm_error_streak = await deps.db.get_state("llm_error_streak") or "0"
-    llm_last_error = _llm_last_error(await deps.db.get_state("llm_last_error"), now, tz)
+    llm_last_refusal = _llm_last_refusal(await deps.db.get_state("llm_last_refusal"), now, tz)
 
     ambient = int(await deps.db.get_state(day_key("ambient_count", now, tz)) or "0")
     mention = int(await deps.db.get_state(day_key("mention_count", now, tz)) or "0")
@@ -629,7 +629,7 @@ async def _cmd_status(message: Message, deps: _CommandsDeps, now: int) -> None:
         f"Паника: {'да' if panic else 'нет'}",
         f"Стоп до: {stop_until}",
         f"Предохранитель LLM: {circuit_state}, ошибок подряд: {llm_error_streak}, "
-        f"последний отказ провайдера: {llm_last_error}",
+        f"последний отказ провайдера: {llm_last_refusal}",
         f"Промпт: v{deps.prompt_store.prompt_version()}, "
         f"few-shot: v{deps.prompt_store.few_shot_version()}",
         f"Модели: main={cfg.llm.main_model or '-'}, judge={cfg.llm.judge_model or '-'}",
